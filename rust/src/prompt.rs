@@ -234,7 +234,6 @@ impl Call2Prompt {
     }
 }
 
-
 /// `2026-06-16T12:00:00Z`.
 ///
 /// Implemented with the standard library only (no `chrono`/`time` dependency),
@@ -361,7 +360,9 @@ mod tests {
         assert!(prompt.user.contains("\"threadkeeper\""));
         // The original input and the supplied research context are threaded in.
         assert!(prompt.user.contains("what do you know about me?"));
-        assert!(prompt.user.contains("retrievals: UsersKB -> prefers concise answers"));
+        assert!(prompt
+            .user
+            .contains("retrievals: UsersKB -> prefers concise answers"));
         // The supplied timestamp is injected for the model to reuse.
         assert!(prompt.user.contains("2026-06-16T12:00:00Z"));
     }

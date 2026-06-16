@@ -1,0 +1,26 @@
+#!/usr/bin/env sh
+# Pre-push hook: runs the fast quality gate locally before each push.
+#
+# Enable it once per clone with:
+#   git config core.hooksPath .githooks
+#
+# This mirrors the CI "quality" job but keeps it fast: formatting, linting,
+# and tests. The slower supply-chain audit and coverage checks run in CI.
+# Catching a `cargo fmt` mismatch here prevents the CI format check from
+# failing after the code has already been pushed.
+
+set -e
+
+# All Cargo commands run inside the rust/ folder where the project lives.
+cd "$(git rev-parse --show-toplevel)/rust"
+
+echo "pre-push: checking formatting..."
+cargo fmt --all -- --check
+
+echo "pre-push: running clippy (warnings = errors)..."
+cargo clippy --all-targets --all-features -- -D warnings
+
+echo "pre-push: running tests..."
+cargo test --all-features
+
+echo "pre-push: all checks passed."

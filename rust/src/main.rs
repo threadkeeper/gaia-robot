@@ -181,7 +181,11 @@ fn main() -> ExitCode {
         String::new()
     };
     if !dev_user_id.is_empty()
-        && writeln!(output, "User isolation: scoped to user_id \"{dev_user_id}\".").is_err()
+        && writeln!(
+            output,
+            "User isolation: scoped to user_id \"{dev_user_id}\"."
+        )
+        .is_err()
     {
         return ExitCode::FAILURE;
     }
