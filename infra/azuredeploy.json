@@ -96,7 +96,7 @@
         "minReplicas": 1,
         "maxReplicas": 3,
         "modelCapacity": 50,
-        "enableFreeTier": false
+        "enableFreeTier": true
       }
     },
     "selectedTier": "[variables('tierConfig')[parameters('tier')]]",
@@ -202,7 +202,7 @@
         "sku": {
           "name": "PerGB2018"
         },
-        "retentionInDays": 30
+        "retentionInDays": 4
       }
     },
     {

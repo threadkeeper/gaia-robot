@@ -3,9 +3,12 @@
 [![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fthreadkeeper%2Fgaia-robot%2Fmain%2Finfra%2Fazuredeploy.json)
 
 > The **Deploy to Azure** button provisions the Cosmos DB for NoSQL account with
-> vector-search and full-text-search capabilities and the `gaia` database (see
-> [infra/azuredeploy.json](infra/azuredeploy.json)). After it completes, copy the
-> `cosmosEndpoint` output into `infra/.env` and run
+> vector-search and full-text-search capabilities and the `gaia` database, an
+> Azure AI Foundry account/project with the `model-router` model, and a
+> Container App (see [infra/azuredeploy.json](infra/azuredeploy.json)). The
+> default **Free / Lite** tier has **no fixed idle cost** — see the full
+> [cost / pricing breakdown](infra/README.md#cost--pricing-breakdown). After it
+> completes, copy the `cosmosEndpoint` output into `infra/.env` and run
 > [infra/cosmos_create.py](infra/cosmos_create.py) to create the five containers.
 
 A small Rust console application, structured for **simplicity, clarity, and
