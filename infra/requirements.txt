@@ -1,5 +1,10 @@
-# Dependencies for cosmos_create.py.
+# Dependencies for cosmos_create.py and embed_worker.py.
 # Vector and full-text container policies require recent SDK versions.
 azure-cosmos>=4.9.0
 # Only needed when authenticating with Azure AD (no COSMOS_KEY set).
 azure-identity>=1.17.0
+# Embedding backfill (embed_worker.py + embeddings.py):
+# Azure OpenAI client for the Foundry text-embedding model.
+openai>=1.40
+# Async transport used by azure.cosmos.aio (the async Cosmos client).
+aiohttp>=3.9

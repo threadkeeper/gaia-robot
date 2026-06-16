@@ -142,15 +142,17 @@ mod tests {
     fn recording_changes_accumulates_the_running_balance() {
         let mut ledger = ConnectionLedger::default();
 
-        let first = ledger.record("alice", "2026-06-16T10:00:00Z", 3.9, "warm greeting");
+        // Use values that are exact in binary floating point so the running
+        // total can be compared precisely.
+        let first = ledger.record("alice", "2026-06-16T10:00:00Z", 0.5, "warm greeting");
         assert_eq!(first.previous_balance, 0.0);
-        assert_eq!(first.new_balance, 3.9);
+        assert_eq!(first.new_balance, 0.5);
 
-        let second = ledger.record("alice", "2026-06-16T11:00:00Z", 5.8, "a good chat");
-        assert_eq!(second.previous_balance, 3.9);
-        assert_eq!(second.new_balance, 9.7);
+        let second = ledger.record("alice", "2026-06-16T11:00:00Z", 0.25, "a good chat");
+        assert_eq!(second.previous_balance, 0.5);
+        assert_eq!(second.new_balance, 0.75);
 
-        assert_eq!(ledger.balance("alice"), 9.7);
+        assert_eq!(ledger.balance("alice"), 0.75);
     }
 
     #[test]
