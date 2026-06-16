@@ -1,0 +1,597 @@
+#![allow(dead_code)]
+
+//! The [`CosmosClient`] type: a tiny, dependency-light client for Gaia's Azure
+//! Cosmos DB for NoSQL containers (`GaiaKB`, `GaiaLH`, `UsersKB`, `UsersDL`,
+//! `GaiaCosmos`).
+//!
+//! Like [`crate::llm::LlmClient`], this client is **opt-in** and reuses the same
+//! dev/local switch (`GAIA_MODE=dev`/`local`). When it is not configured,
+//! [`CosmosClient::from_env`] returns `Ok(None)` and the program keeps its
+//! offline skeleton behaviour.
+//!
+//! ## Why a hand-rolled REST client?
+//!
+//! There is no first-party Azure Cosmos SDK on crates.io, and the official
+//! options pull in large async runtimes. To honour this repo's
+//! minimise-dependencies rule we talk to the Cosmos REST API directly over
+//! [`ureq`] (already a dependency) using **Azure AD bearer-token** auth:
+//!
+//! - The caller supplies an AAD access token via `COSMOS_AAD_TOKEN`, e.g.
+//!   `az account get-access-token --resource https://<account>.documents.azure.com`.
+//! - That avoids the HMAC-SHA256 master-key signing scheme, so we need **no**
+//!   crypto crates. (Data-plane item read/write works with an AAD token that has
+//!   the *Cosmos DB Built-in Data Contributor* role — see `infra` notes.)
+//!
+//! All header/URL/parsing logic lives in small pure functions so it can be unit
+//! tested without a network or a live Cosmos account.
+//!
+//! Configuration (environment, falling back to `infra/.env`):
+//! - `COSMOS_ENDPOINT` — account URL, e.g. `https://acct.documents.azure.com:443/`.
+//! - `COSMOS_AAD_TOKEN` — AAD access token for the Cosmos data plane.
+//! - `COSMOS_DATABASE` — database name (default `gaia`).
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
+
+use crate::storage::Record;
+
+/// REST API version sent in the `x-ms-version` header. `2018-12-31` covers the
+/// point reads, upserts, and single-partition parameterised queries we use.
+const API_VERSION: &str = "2018-12-31";
+
+/// Errors that can occur while configuring or calling Cosmos DB.
+#[derive(Debug)]
+pub enum CosmosError {
+    /// Cosmos was requested but no AAD token could be found.
+    MissingToken,
+    /// The HTTP request failed or returned a non-success status.
+    Http(String),
+    /// A response body could not be decoded into the expected shape.
+    Decode(String),
+}
+
+impl fmt::Display for CosmosError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CosmosError::MissingToken => write!(
+                f,
+                "no Cosmos AAD token found (set COSMOS_AAD_TOKEN or put it in infra/.env)"
+            ),
+            CosmosError::Http(msg) => write!(f, "Cosmos request failed: {msg}"),
+            CosmosError::Decode(msg) => write!(f, "could not decode Cosmos response: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for CosmosError {}
+
+/// A named query parameter, mirroring Cosmos's `{"name": "@p", "value": ...}`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QueryParam {
+    /// Parameter name including the leading `@`, e.g. `@userId`.
+    pub name: String,
+    /// Parameter value; any JSON scalar Cosmos accepts.
+    pub value: serde_json::Value,
+}
+
+impl QueryParam {
+    /// Create a query parameter from a name and any JSON-convertible value.
+    pub fn new(name: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+}
+
+/// A minimal, immutable client bound to one Cosmos account + database.
+///
+/// Construct with [`CosmosClient::from_env`] and call [`CosmosClient::query`],
+/// [`CosmosClient::upsert`], or [`CosmosClient::get`]. Cheap to clone; holds no
+/// network state of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CosmosClient {
+    /// Account URL, always normalised to end with a single `/`.
+    endpoint: String,
+    /// Database name, e.g. `gaia`.
+    database: String,
+    /// AAD access token for the Cosmos data plane.
+    token: String,
+}
+
+impl CosmosClient {
+    /// Build a client directly from its parts (used by [`from_env`] and tests).
+    ///
+    /// The endpoint is normalised to end with exactly one `/` so URL building is
+    /// simple and predictable.
+    ///
+    /// [`from_env`]: CosmosClient::from_env
+    pub fn new(
+        endpoint: impl Into<String>,
+        database: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Self {
+        let mut endpoint = endpoint.into();
+        if !endpoint.ends_with('/') {
+            endpoint.push('/');
+        }
+        Self {
+            endpoint,
+            database: database.into(),
+            token: token.into(),
+        }
+    }
+
+    /// Build a client from the environment, or `Ok(None)` when Cosmos is not in
+    /// use for this run.
+    ///
+    /// Returns:
+    /// - `Ok(None)` when dev/local mode is off, or `COSMOS_ENDPOINT` is unset
+    ///   (the program then stays fully offline).
+    /// - `Ok(Some(client))` when dev mode is on and an endpoint + token resolve.
+    /// - `Err(CosmosError::MissingToken)` when an endpoint is set but no token.
+    pub fn from_env() -> Result<Option<Self>, CosmosError> {
+        if !dev_mode_enabled() {
+            return Ok(None);
+        }
+
+        let endpoint = match resolve_env("COSMOS_ENDPOINT") {
+            Some(value) if !value.is_empty() => value,
+            // No endpoint configured: Cosmos simply isn't part of this run.
+            _ => return Ok(None),
+        };
+
+        let token = resolve_env("COSMOS_AAD_TOKEN")
+            .filter(|token| !token.is_empty())
+            .ok_or(CosmosError::MissingToken)?;
+
+        let database = resolve_env("COSMOS_DATABASE")
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "gaia".to_string());
+
+        Ok(Some(Self::new(endpoint, database, token)))
+    }
+
+    /// The database this client targets.
+    pub fn database(&self) -> &str {
+        &self.database
+    }
+
+    /// The (normalised) account endpoint this client targets.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Run a parameterised SQL query against a single logical partition.
+    ///
+    /// `partition_value` is the entity/userId that scopes the query to one
+    /// partition (cheap and avoids a cross-partition fan-out). The returned
+    /// documents are deserialized into [`Record`]s.
+    pub fn query(
+        &self,
+        container: &str,
+        partition_value: &str,
+        query: &str,
+        params: &[QueryParam],
+    ) -> Result<Vec<Record>, CosmosError> {
+        let url = docs_url(&self.endpoint, &self.database, container);
+        let body = serde_json::to_vec(&QueryBody {
+            query,
+            parameters: params,
+        })
+        .map_err(|e| CosmosError::Decode(e.to_string()))?;
+
+        let response = ureq::post(&url)
+            .set("Authorization", &aad_auth_header(&self.token))
+            .set("x-ms-date", &now_rfc1123())
+            .set("x-ms-version", API_VERSION)
+            .set("x-ms-documentdb-isquery", "true")
+            .set("Content-Type", "application/query+json")
+            .set(
+                "x-ms-documentdb-partitionkey",
+                &partition_key_header(partition_value),
+            )
+            .set("x-ms-documentdb-query-enablecrosspartition", "false")
+            .send_bytes(&body)
+            .map_err(map_ureq_error)?;
+
+        let text = response
+            .into_string()
+            .map_err(|e| CosmosError::Http(e.to_string()))?;
+
+        parse_documents(&text)
+    }
+
+    /// Upsert (insert-or-replace) one [`Record`] into a container.
+    ///
+    /// `partition_value` must equal the record's business key (entity/userId);
+    /// Cosmos enforces that the document's partition field matches this header.
+    pub fn upsert(
+        &self,
+        container: &str,
+        partition_value: &str,
+        record: &Record,
+    ) -> Result<(), CosmosError> {
+        let url = docs_url(&self.endpoint, &self.database, container);
+        let body = serde_json::to_vec(record).map_err(|e| CosmosError::Decode(e.to_string()))?;
+
+        ureq::post(&url)
+            .set("Authorization", &aad_auth_header(&self.token))
+            .set("x-ms-date", &now_rfc1123())
+            .set("x-ms-version", API_VERSION)
+            .set("x-ms-documentdb-is-upsert", "true")
+            .set(
+                "x-ms-documentdb-partitionkey",
+                &partition_key_header(partition_value),
+            )
+            .set("Content-Type", "application/json")
+            .send_bytes(&body)
+            .map_err(map_ureq_error)?;
+
+        Ok(())
+    }
+
+    /// Point-read a single document by id within a partition.
+    ///
+    /// Returns `Ok(None)` when the document does not exist (HTTP 404) rather than
+    /// treating a miss as an error.
+    pub fn get(
+        &self,
+        container: &str,
+        partition_value: &str,
+        id: &str,
+    ) -> Result<Option<Record>, CosmosError> {
+        let url = format!(
+            "{}{}",
+            docs_url(&self.endpoint, &self.database, container),
+            format_args!("/{id}"),
+        );
+
+        let result = ureq::get(&url)
+            .set("Authorization", &aad_auth_header(&self.token))
+            .set("x-ms-date", &now_rfc1123())
+            .set("x-ms-version", API_VERSION)
+            .set(
+                "x-ms-documentdb-partitionkey",
+                &partition_key_header(partition_value),
+            )
+            .call();
+
+        match result {
+            Ok(response) => {
+                let text = response
+                    .into_string()
+                    .map_err(|e| CosmosError::Http(e.to_string()))?;
+                let record =
+                    serde_json::from_str(&text).map_err(|e| CosmosError::Decode(e.to_string()))?;
+                Ok(Some(record))
+            }
+            // A missing document is a normal "not found", not a failure.
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(err) => Err(map_ureq_error(err)),
+        }
+    }
+}
+
+// --- Pure helpers (no network) ----------------------------------------------
+
+/// The Cosmos `docs` collection URL for one container.
+fn docs_url(endpoint: &str, database: &str, container: &str) -> String {
+    // `endpoint` is guaranteed to end with '/' by `CosmosClient::new`.
+    format!("{endpoint}dbs/{database}/colls/{container}/docs")
+}
+
+/// Build the `Authorization` header for Azure AD bearer-token auth.
+///
+/// Cosmos expects the URL-encoded string `type=aad&ver=1.0&sig=<token>`. AAD
+/// access tokens are URL-safe (base64url segments joined by `.`), so only the
+/// fixed prefix needs percent-encoding — which we can hard-code.
+fn aad_auth_header(token: &str) -> String {
+    format!("type%3Daad%26ver%3D1.0%26sig%3D{token}")
+}
+
+/// Build the `x-ms-documentdb-partitionkey` header value, e.g. `["user-1"]`.
+///
+/// Serialising through `serde_json` correctly escapes any quotes/backslashes in
+/// the partition value.
+fn partition_key_header(value: &str) -> String {
+    // A single-element JSON array of the partition value.
+    serde_json::Value::Array(vec![serde_json::Value::String(value.to_string())]).to_string()
+}
+
+/// Parse a Cosmos query response body (`{"Documents": [...]}`) into records.
+fn parse_documents(body: &str) -> Result<Vec<Record>, CosmosError> {
+    let parsed: DocumentsResponse =
+        serde_json::from_str(body).map_err(|e| CosmosError::Decode(e.to_string()))?;
+    Ok(parsed.documents)
+}
+
+/// Current time as an RFC 1123 GMT string for the `x-ms-date` header.
+fn now_rfc1123() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    rfc1123(secs)
+}
+
+/// Format seconds-since-Unix-epoch as `Tue, 16 Jun 2026 12:00:00 GMT`.
+///
+/// Implemented with std only (no `chrono`/`time`) to avoid a dependency. Uses
+/// Howard Hinnant's civil-from-days algorithm for the calendar date.
+fn rfc1123(secs_since_epoch: u64) -> String {
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    let days = (secs_since_epoch / 86_400) as i64;
+    let secs_of_day = secs_since_epoch % 86_400;
+    let hour = secs_of_day / 3_600;
+    let minute = (secs_of_day % 3_600) / 60;
+    let second = secs_of_day % 60;
+
+    // 1970-01-01 (day 0) was a Thursday; 0 = Sunday. `days` is always >= 0.
+    let weekday = ((days % 7) + 4) % 7;
+    let (year, month, day) = civil_from_days(days);
+
+    format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        WEEKDAYS[weekday as usize],
+        day,
+        MONTHS[(month - 1) as usize],
+        year,
+        hour,
+        minute,
+        second,
+    )
+}
+
+/// Convert a day count since 1970-01-01 into a `(year, month, day)` triple.
+///
+/// This is Howard Hinnant's well-known `civil_from_days` algorithm; the magic
+/// constants come from the proleptic Gregorian calendar's 400-year cycle.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // day of era, [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year, [0, 365]
+    let mp = (5 * doy + 2) / 153; // month index, [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// Convert a `ureq` error into a [`CosmosError`], keeping the HTTP body so
+/// failures (auth, missing container, RBAC) are easy to diagnose.
+fn map_ureq_error(err: ureq::Error) -> CosmosError {
+    match err {
+        ureq::Error::Status(code, response) => {
+            let body = response.into_string().unwrap_or_default();
+            CosmosError::Http(format!("HTTP {code}: {body}"))
+        }
+        ureq::Error::Transport(transport) => CosmosError::Http(transport.to_string()),
+    }
+}
+
+/// Whether dev/local mode is enabled via `GAIA_MODE` (shared with the LLM path).
+fn dev_mode_enabled() -> bool {
+    match std::env::var("GAIA_MODE") {
+        Ok(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            value == "dev" || value == "local"
+        }
+        Err(_) => false,
+    }
+}
+
+/// Resolve a config value from the process environment, falling back to the
+/// local `infra/.env` file (the same convenience the LLM client offers).
+fn resolve_env(key: &str) -> Option<String> {
+    if let Ok(value) = std::env::var(key) {
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    env_from_files(key)
+}
+
+/// Look for `key` in the candidate `.env` file locations.
+fn env_from_files(key: &str) -> Option<String> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(path) = std::env::var("GAIA_ENV_FILE") {
+        candidates.push(PathBuf::from(path));
+    }
+    candidates.push(PathBuf::from("infra/.env"));
+    candidates.push(PathBuf::from("../infra/.env"));
+
+    for path in candidates {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Some(value) = parse_dotenv(&contents).get(key) {
+                let value = value.trim().to_string();
+                if !value.is_empty() {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse a minimal `.env` file into key/value pairs (mirrors `llm.rs`).
+fn parse_dotenv(contents: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_string();
+        let value = strip_quotes(value.trim()).to_string();
+        if !key.is_empty() {
+            map.insert(key, value);
+        }
+    }
+    map
+}
+
+/// Remove a single matching pair of surrounding single or double quotes.
+fn strip_quotes(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
+// --- Wire types --------------------------------------------------------------
+
+/// The query request body Cosmos expects.
+#[derive(Debug, Serialize)]
+struct QueryBody<'a> {
+    query: &'a str,
+    parameters: &'a [QueryParam],
+}
+
+/// The query response envelope; only the `Documents` array matters to us.
+#[derive(Debug, serde::Deserialize)]
+struct DocumentsResponse {
+    #[serde(rename = "Documents")]
+    documents: Vec<Record>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_normalises_the_endpoint_to_end_with_a_slash() {
+        let with = CosmosClient::new("https://acct.documents.azure.com:443/", "gaia", "tok");
+        let without = CosmosClient::new("https://acct.documents.azure.com:443", "gaia", "tok");
+        assert_eq!(with.endpoint(), without.endpoint());
+        assert!(with.endpoint().ends_with('/'));
+    }
+
+    #[test]
+    fn docs_url_targets_the_collection_documents_path() {
+        let url = docs_url("https://acct.documents.azure.com:443/", "gaia", "UsersDL");
+        assert_eq!(
+            url,
+            "https://acct.documents.azure.com:443/dbs/gaia/colls/UsersDL/docs"
+        );
+    }
+
+    #[test]
+    fn aad_auth_header_wraps_the_token_in_the_expected_envelope() {
+        let header = aad_auth_header("abc.def.ghi");
+        assert_eq!(header, "type%3Daad%26ver%3D1.0%26sig%3Dabc.def.ghi");
+    }
+
+    #[test]
+    fn partition_key_header_is_a_json_array_and_escapes_quotes() {
+        assert_eq!(partition_key_header("user-1"), "[\"user-1\"]");
+        assert_eq!(partition_key_header("a\"b"), "[\"a\\\"b\"]");
+    }
+
+    #[test]
+    fn rfc1123_formats_the_unix_epoch() {
+        assert_eq!(rfc1123(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+    }
+
+    #[test]
+    fn rfc1123_formats_a_known_later_instant() {
+        // 1_700_000_000 == 2023-11-14T22:13:20Z (a Tuesday).
+        assert_eq!(rfc1123(1_700_000_000), "Tue, 14 Nov 2023 22:13:20 GMT");
+    }
+
+    #[test]
+    fn parse_documents_reads_the_documents_envelope() {
+        let body = r#"{
+            "_rid": "abc",
+            "Documents": [
+                {"id": "d1", "userId": "user-1", "date": "2026-06-16", "data": "hello"},
+                {"id": "d2", "entity": "rust", "date": "2026-06-15", "data": "world",
+                 "dataVector": [0.1, 0.2]}
+            ],
+            "_count": 2
+        }"#;
+
+        let records = parse_documents(body).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].record_id, "d1");
+        assert_eq!(records[0].user_id, "user-1");
+        assert_eq!(records[1].entity_id, "rust");
+        assert_eq!(records[1].data_vector, vec![0.1, 0.2]);
+    }
+
+    #[test]
+    fn parse_documents_rejects_a_malformed_body() {
+        assert!(matches!(
+            parse_documents("not json"),
+            Err(CosmosError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn query_param_accepts_strings_and_numbers() {
+        let text = QueryParam::new("@text", "rust");
+        let top = QueryParam::new("@top", 3_i64);
+        assert_eq!(text.value, serde_json::json!("rust"));
+        assert_eq!(top.value, serde_json::json!(3));
+    }
+
+    #[test]
+    fn strip_quotes_only_removes_matching_pairs() {
+        assert_eq!(strip_quotes("\"hello\""), "hello");
+        assert_eq!(strip_quotes("'hello'"), "hello");
+        assert_eq!(strip_quotes("\"mismatch'"), "\"mismatch'");
+        assert_eq!(strip_quotes("plain"), "plain");
+    }
+
+    #[test]
+    fn parse_dotenv_reads_keys_skips_comments_and_strips_quotes() {
+        let contents = "\
+            # a comment\n\
+            COSMOS_ENDPOINT=https://acct.documents.azure.com:443/\n\
+            \n\
+            COSMOS_DATABASE=\"gaia\"\n\
+            BROKEN LINE WITHOUT EQUALS\n";
+
+        let map = parse_dotenv(contents);
+
+        assert_eq!(
+            map.get("COSMOS_ENDPOINT").map(String::as_str),
+            Some("https://acct.documents.azure.com:443/")
+        );
+        assert_eq!(map.get("COSMOS_DATABASE").map(String::as_str), Some("gaia"));
+        assert!(!map.contains_key("BROKEN LINE WITHOUT EQUALS"));
+    }
+
+    #[test]
+    fn cosmos_error_messages_are_descriptive() {
+        assert!(CosmosError::MissingToken
+            .to_string()
+            .contains("COSMOS_AAD_TOKEN"));
+        assert!(CosmosError::Http("HTTP 403".into())
+            .to_string()
+            .contains("403"));
+        assert!(CosmosError::Decode("bad".into())
+            .to_string()
+            .contains("decode"));
+    }
+}

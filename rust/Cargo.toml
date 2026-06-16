@@ -9,8 +9,13 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-# Intentionally empty: prefer the standard library.
-# Justify and vet any crate before adding it (see copilot-instructions.md).
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Minimal blocking HTTP client (rustls TLS) used only by the dev/local LLM mode
+# to reach the GitHub Models endpoint. Chosen over reqwest to avoid pulling in an
+# async runtime and to keep the dependency tree small. HTTPS cannot be done with
+# std alone, which is why a third-party client is required here.
+ureq = "2.12"
 
 [profile.release]
 # Smaller, faster release binaries.

@@ -9,7 +9,7 @@
 > default **Free / Lite** tier has **no fixed idle cost** — see the full
 > [cost / pricing breakdown](infra/README.md#cost--pricing-breakdown). After it
 > completes, copy the `cosmosEndpoint` output into `infra/.env` and run
-> [infra/cosmos_create.py](infra/cosmos_create.py) to create the five containers.
+> [infra/cosmos_create.py](infra/cosmos_create.py) to create the six containers.
 
 A small Rust console application, structured for **simplicity, clarity, and
 strong supply-chain hygiene**. See [.github/copilot-instructions.md](.github/copilot-instructions.md)

@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/gaia/actions.schema.json",
+  "title": "Gaia actions.json contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "session", "actions"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user_id"],
+      "properties": {
+        "user_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requested_at": {
+          "type": "string"
+        }
+      }
+    },
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "target", "intent", "top"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "kind": { "type": "string", "const": "query" },
+          "target": {
+            "type": "string",
+            "enum": ["UsersKB", "UsersDL", "GaiaKB", "GaiaLH", "GaiaCosmos", "GaiaConnections"]
+          },
+          "user_id": { "type": ["string", "null"] },
+          "entity": { "type": ["string", "null"] },
+          "intent": { "type": "string", "minLength": 1 },
+          "top": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 3
+          },
+          "filters": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "from_date": { "type": ["string", "null"] },
+              "to_date": { "type": ["string", "null"] },
+              "text": { "type": ["string", "null"] },
+              "semantic": { "type": ["string", "null"] }
+            }
+          }
+        }
+      }
+    }
+  }
+}

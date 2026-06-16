@@ -1,25 +1,32 @@
-"""Create the five Gaia Cosmos DB containers described in the architecture diagram.
+"""Create the six Gaia Cosmos DB containers described in the architecture diagram.
 
 This is an infrastructure provisioning *script* (not part of the Rust program).
 Running it is idempotent: it creates the database and each container only if they
 do not already exist, so it is safe to re-run.
 
-It provisions five Azure Cosmos DB for NoSQL containers:
+It provisions six Azure Cosmos DB for NoSQL containers:
 
-    Container     Business key field   Business key (uniqueness)
-    -----------   ------------------   -------------------------
-    GaiaKB        entity               entity + date (yyyy-mm-dd)
-    GaiaLH        entity               entity + date (yyyy-mm-dd)
-    UsersKB       userId               userId + date (yyyy-mm-dd)
-    UsersDL       userId               userId + date (yyyy-mm-dd)
-    GaiaCosmos    entity               entity + date (yyyy-mm-dd)
+    Container         Business key field   Business key (uniqueness)
+    ---------------   ------------------   -------------------------
+    GaiaKB            entity               entity + date (yyyy-mm-dd)
+    GaiaLH            entity               entity + date (yyyy-mm-dd)
+    UsersKB           userId               userId + date (yyyy-mm-dd)
+    UsersDL           userId               userId + date (yyyy-mm-dd)
+    GaiaCosmos        entity               entity + date (yyyy-mm-dd)
+    GaiaConnections   entity               entity + timestamp (ISO 8601)
+
+``GaiaConnections`` is the emotional-bank-account *ledger*: LLM Call 1 decides
+whether each user turn grows or weakens the friendship and posts a signed change
+to a per-entity running balance. Because a ledger holds many entries per day, its
+uniqueness is per *timestamp* (a full ISO 8601 instant) rather than per day.
 
 Each container is configured with:
 
   * Partition key on the business key field (``/entity`` or ``/userId``). This
     is what lets vector and text queries be *filtered* cheaply by entity/user.
-  * A unique-key policy on ``/date`` so there is at most one record per
-    entity/user per day (the business key is therefore key-field + date).
+  * A unique-key policy on the container's uniqueness field (``/date`` for the
+    daily-snapshot containers, ``/timestamp`` for the ledger) so there is at most
+    one record per partition per that field.
   * A vector embedding policy on ``/dataVector`` -- the vector representation of
     the record's ``data`` field -- plus a DiskANN vector index on that path so
     the data can be searched by similarity.
@@ -89,14 +96,18 @@ def load_env_file(path: str = ".env") -> None:
 # --- Configuration -----------------------------------------------------------
 
 
-# The five containers from the diagram. ``key_field`` is the business/partition
+# The six containers from the diagram. ``key_field`` is the business/partition
 # key: the entity tables key on "entity", the user tables key on "userId".
+# ``unique_field`` is the path made unique *within* a partition; it is "date"
+# for the daily-snapshot containers and "timestamp" for the connections ledger
+# (a ledger needs many rows per day, so it keys on a full instant, not a day).
 @dataclass(frozen=True)
 class TableSpec:
     """Describes one Cosmos container to create."""
 
-    name: str          # container id, e.g. "GaiaKB"
-    key_field: str     # business key / partition key field, e.g. "entity"
+    name: str                  # container id, e.g. "GaiaKB"
+    key_field: str             # business key / partition key field, e.g. "entity"
+    unique_field: str = "date"  # per-partition unique path, e.g. "date" or "timestamp"
 
 
 TABLES: list[TableSpec] = [
@@ -105,6 +116,8 @@ TABLES: list[TableSpec] = [
     TableSpec(name="UsersKB", key_field="userId"),
     TableSpec(name="UsersDL", key_field="userId"),
     TableSpec(name="GaiaCosmos", key_field="entity"),
+    # Emotional-bank-account ledger: one record per (entity, timestamp).
+    TableSpec(name="GaiaConnections", key_field="entity", unique_field="timestamp"),
 ]
 
 # Path of the vector field. Every record stores the embedding of its ``data``
@@ -169,13 +182,14 @@ def build_indexing_policy(key_field: str) -> dict:
     }
 
 
-def build_unique_key_policy() -> dict:
-    """Unique-key policy enforcing one record per partition per date.
+def build_unique_key_policy(unique_field: str) -> dict:
+    """Unique-key policy enforcing one record per partition per ``unique_field``.
 
     Uniqueness is scoped to the logical partition (the entity/userId), so this
-    gives the business key: entity+date or userId+date.
+    gives the business key, e.g. entity+date, userId+date, or entity+timestamp
+    for the connections ledger.
     """
-    return {"uniqueKeys": [{"paths": ["/date"]}]}
+    return {"uniqueKeys": [{"paths": [f"/{unique_field}"]}]}
 
 
 # --- Cosmos client -----------------------------------------------------------
@@ -205,7 +219,7 @@ def create_container(database, table: TableSpec, dimensions: int, throughput: in
         indexing_policy=build_indexing_policy(table.key_field),
         vector_embedding_policy=build_vector_embedding_policy(dimensions),
         full_text_policy=build_full_text_policy(table.key_field),
-        unique_key_policy=build_unique_key_policy(),
+        unique_key_policy=build_unique_key_policy(table.unique_field),
         offer_throughput=throughput,
     )
     print(f"  done: '{table.name}'")
@@ -215,7 +229,7 @@ def create_container(database, table: TableSpec, dimensions: int, throughput: in
 
 
 def main() -> int:
-    """Provision the database and all five containers. Returns a process exit code."""
+    """Provision the database and all six containers. Returns a process exit code."""
     # 0. Load .env (if present) so local config is picked up automatically.
     load_env_file()
 

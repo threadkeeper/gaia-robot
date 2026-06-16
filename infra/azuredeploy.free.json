@@ -18,6 +18,13 @@
       "metadata": {
         "description": "Container image to run. Replace with your own image once published."
       }
+    },
+    "deployEmbeddingModel": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Set to true to also deploy the text-embedding model (requires embedding model quota)."
+      }
     }
   },
   "variables": {
@@ -37,7 +44,8 @@
         "parameters": {
           "tier": { "value": "free" },
           "location": { "value": "[parameters('location')]" },
-          "containerImage": { "value": "[parameters('containerImage')]" }
+          "containerImage": { "value": "[parameters('containerImage')]" },
+          "deployEmbeddingModel": { "value": "[parameters('deployEmbeddingModel')]" }
         }
       }
     }

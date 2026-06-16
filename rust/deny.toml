@@ -24,6 +24,11 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Zlib",
+    # CDLA-Permissive-2.0 is a permissive license used by `webpki-roots` for the
+    # bundled Mozilla CA root certificate store. It is pulled in transitively by
+    # `ureq` (rustls TLS) for the dev/local LLM HTTPS calls. The license only
+    # covers the trusted root certificate data, not code.
+    "CDLA-Permissive-2.0",
 ]
 # Require at least this confidence when guessing a license from its text.
 confidence-threshold = 0.9

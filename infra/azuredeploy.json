@@ -2,7 +2,7 @@
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
   "contentVersion": "1.0.0.0",
   "metadata": {
-    "description": "Provisions the Gaia platform: a Cosmos DB for NoSQL account (with vector + full-text search) and database, an Azure AI Foundry account/project with the 'model-router' model deployed, and a Container App (with its environment and Log Analytics workspace). The five Cosmos containers are created afterwards by infra/cosmos_create.py."
+    "description": "Provisions the Gaia platform: a Cosmos DB for NoSQL account (with vector + full-text search) and database, an Azure AI Foundry account/project with the 'model-router' and a high-performance text-embedding model deployed, and a Container App (with its environment and Log Analytics workspace). The Cosmos containers are created afterwards by infra/cosmos_create.py and their /dataVector embeddings are backfilled by infra/embed_worker.py."
   },
   "parameters": {
     "accountName": {
@@ -55,11 +55,26 @@
         "description": "Version of the Azure OpenAI 'model-router' model to deploy."
       }
     },
+    "modelRouterSku": {
+      "type": "string",
+      "defaultValue": "auto",
+      "allowedValues": [ "auto", "Standard", "GlobalStandard" ],
+      "metadata": {
+        "description": "SKU for the model-router deployment. Use 'auto' to pick a region-safe default (eastus -> Standard; other regions -> GlobalStandard)."
+      }
+    },
     "modelRouterCapacity": {
       "type": "int",
       "defaultValue": 0,
       "metadata": {
         "description": "Throughput capacity (in thousands of tokens per minute) for the model-router deployment. Leave at 0 to use the tier default (free=10, hobby=50)."
+      }
+    },
+    "deployModelRouter": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Set to true only when you have the required model quota. For testing, leave this false and use GitHub Models instead."
       }
     },
     "containerAppName": {
@@ -75,12 +90,56 @@
       "metadata": {
         "description": "Container image to run. Replace with your own image once published."
       }
+    },
+    "deployEmbeddingModel": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Set to true to deploy the text-embedding model used to populate Cosmos /dataVector. Requires embedding model quota in the chosen region."
+      }
+    },
+    "embeddingModel": {
+      "type": "string",
+      "defaultValue": "text-embedding-3-large",
+      "metadata": {
+        "description": "Azure OpenAI text-embedding model to deploy. 'text-embedding-3-large' is the high-performance default and supports dimension reduction via 'embeddingDimensions'."
+      }
+    },
+    "embeddingModelVersion": {
+      "type": "string",
+      "defaultValue": "1",
+      "metadata": {
+        "description": "Version of the embedding model to deploy."
+      }
+    },
+    "embeddingSku": {
+      "type": "string",
+      "defaultValue": "auto",
+      "allowedValues": [ "auto", "Standard", "GlobalStandard" ],
+      "metadata": {
+        "description": "SKU for the embedding deployment. 'auto' picks a region-safe default (eastus -> Standard; other regions -> GlobalStandard)."
+      }
+    },
+    "embeddingCapacity": {
+      "type": "int",
+      "defaultValue": 0,
+      "metadata": {
+        "description": "Throughput capacity (thousands of tokens per minute) for the embedding deployment. Leave at 0 to use the tier default (free=30, hobby=120). Raise it for higher backfill throughput."
+      }
+    },
+    "embeddingDimensions": {
+      "type": "int",
+      "defaultValue": 1536,
+      "metadata": {
+        "description": "Embedding vector length. MUST match the Cosmos /dataVector policy (COSMOS_VECTOR_DIMS, default 1536). text-embedding-3 models support reducing dimensions to this value."
+      }
     }
   },
   "variables": {
     "logAnalyticsName": "[concat('gaia-logs-', uniqueString(resourceGroup().id))]",
     "containerEnvName": "[concat('gaia-env-', uniqueString(resourceGroup().id))]",
     "modelRouterDeploymentName": "model-router",
+    "embeddingDeploymentName": "text-embedding",
     "tierConfig": {
       "free": {
         "cpu": "[json('0.25')]",
@@ -88,6 +147,7 @@
         "minReplicas": 0,
         "maxReplicas": 1,
         "modelCapacity": 10,
+        "embeddingCapacity": 30,
         "enableFreeTier": true
       },
       "hobby": {
@@ -96,11 +156,15 @@
         "minReplicas": 1,
         "maxReplicas": 3,
         "modelCapacity": 50,
-        "enableFreeTier": true
+        "embeddingCapacity": 120,
+        "enableFreeTier": false
       }
     },
     "selectedTier": "[variables('tierConfig')[parameters('tier')]]",
-    "effectiveModelCapacity": "[if(equals(parameters('modelRouterCapacity'), 0), variables('selectedTier').modelCapacity, parameters('modelRouterCapacity'))]"
+    "effectiveModelCapacity": "[if(equals(parameters('modelRouterCapacity'), 0), variables('selectedTier').modelCapacity, parameters('modelRouterCapacity'))]",
+    "effectiveModelRouterSku": "[if(equals(parameters('modelRouterSku'), 'auto'), if(equals(toLower(parameters('location')), 'eastus'), 'Standard', 'GlobalStandard'), parameters('modelRouterSku'))]",
+    "effectiveEmbeddingCapacity": "[if(equals(parameters('embeddingCapacity'), 0), variables('selectedTier').embeddingCapacity, parameters('embeddingCapacity'))]",
+    "effectiveEmbeddingSku": "[if(equals(parameters('embeddingSku'), 'auto'), if(equals(toLower(parameters('location')), 'eastus'), 'Standard', 'GlobalStandard'), parameters('embeddingSku'))]"
   },
   "resources": [
     {
@@ -176,11 +240,12 @@
       "type": "Microsoft.CognitiveServices/accounts/deployments",
       "apiVersion": "2025-04-01-preview",
       "name": "[concat(parameters('foundryName'), '/', variables('modelRouterDeploymentName'))]",
+      "condition": "[parameters('deployModelRouter')]",
       "dependsOn": [
         "[resourceId('Microsoft.CognitiveServices/accounts', parameters('foundryName'))]"
       ],
       "sku": {
-        "name": "GlobalStandard",
+        "name": "[variables('effectiveModelRouterSku')]",
         "capacity": "[variables('effectiveModelCapacity')]"
       },
       "properties": {
@@ -188,6 +253,29 @@
           "format": "OpenAI",
           "name": "model-router",
           "version": "[parameters('modelRouterVersion')]"
+        },
+        "versionUpgradeOption": "OnceNewDefaultVersionAvailable",
+        "raiPolicyName": "Microsoft.DefaultV2"
+      }
+    },
+    {
+      "type": "Microsoft.CognitiveServices/accounts/deployments",
+      "apiVersion": "2025-04-01-preview",
+      "name": "[concat(parameters('foundryName'), '/', variables('embeddingDeploymentName'))]",
+      "condition": "[parameters('deployEmbeddingModel')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.CognitiveServices/accounts', parameters('foundryName'))]",
+        "[resourceId('Microsoft.CognitiveServices/accounts/deployments', parameters('foundryName'), variables('modelRouterDeploymentName'))]"
+      ],
+      "sku": {
+        "name": "[variables('effectiveEmbeddingSku')]",
+        "capacity": "[variables('effectiveEmbeddingCapacity')]"
+      },
+      "properties": {
+        "model": {
+          "format": "OpenAI",
+          "name": "[parameters('embeddingModel')]",
+          "version": "[parameters('embeddingModelVersion')]"
         },
         "versionUpgradeOption": "OnceNewDefaultVersionAvailable",
         "raiPolicyName": "Microsoft.DefaultV2"
@@ -202,7 +290,7 @@
         "sku": {
           "name": "PerGB2018"
         },
-        "retentionInDays": 4
+        "retentionInDays": 30
       }
     },
     {
@@ -232,8 +320,7 @@
         "type": "SystemAssigned"
       },
       "dependsOn": [
-        "[resourceId('Microsoft.App/managedEnvironments', variables('containerEnvName'))]",
-        "[resourceId('Microsoft.CognitiveServices/accounts/deployments', parameters('foundryName'), variables('modelRouterDeploymentName'))]"
+        "[resourceId('Microsoft.App/managedEnvironments', variables('containerEnvName'))]"
       ],
       "properties": {
         "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('containerEnvName'))]",
@@ -268,7 +355,15 @@
                 },
                 {
                   "name": "MODEL_ROUTER_DEPLOYMENT",
-                  "value": "[variables('modelRouterDeploymentName')]"
+                  "value": "[if(parameters('deployModelRouter'), variables('modelRouterDeploymentName'), '')]"
+                },
+                {
+                  "name": "EMBEDDING_DEPLOYMENT",
+                  "value": "[if(parameters('deployEmbeddingModel'), variables('embeddingDeploymentName'), '')]"
+                },
+                {
+                  "name": "EMBEDDING_DIMENSIONS",
+                  "value": "[string(parameters('embeddingDimensions'))]"
                 }
               ]
             }
@@ -304,7 +399,15 @@
     },
     "modelRouterDeployment": {
       "type": "string",
-      "value": "[variables('modelRouterDeploymentName')]"
+      "value": "[if(parameters('deployModelRouter'), variables('modelRouterDeploymentName'), '')]"
+    },
+    "embeddingDeployment": {
+      "type": "string",
+      "value": "[if(parameters('deployEmbeddingModel'), variables('embeddingDeploymentName'), '')]"
+    },
+    "embeddingDimensions": {
+      "type": "int",
+      "value": "[parameters('embeddingDimensions')]"
     },
     "containerAppFqdn": {
       "type": "string",

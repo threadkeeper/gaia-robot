@@ -65,17 +65,15 @@ world, save humanity intelligence and people.\n\nContext from Cosmos max 100k",
         FlowStep {
             title: "LLM Call 1",
             description: "LLM Call 1\nAnalyze the question and output\n\
-actions.json {}\nanalysis.json {}\nconnection {}\nfacts.json {}\n\
-newContext.json {}",
+actions.json {}\nanalysis.json {}\nfacts.json {}\nnewContext.json {}",
         },
-        // 4. actions.json produced by LLM Call 1.
+        // 4. actions.json produced by LLM Call 1 — the read-only GET actions.
         FlowStep {
             title: "actions.json",
-            description: "actions.json\nemote / value\nsearch Web / value\n\
+            description: "actions.json\nGET\nWeb / value\n\
 users dl semantic Index name / value\nusers kb semantic Index name / value\n\
 gaia kb semantic Index name / value\ngaia lh logical Index name / value\n\
-gaia cosmos index named / value\nsend WhatsApp / value\nsend Push / value\n\
-actuate / value",
+gaia cosmos index named / value",
         },
         // 5. analysis.json produced by LLM Call 1.
         FlowStep {
@@ -104,14 +102,14 @@ intention / value",
             description: "LLM Call 2\nAnalyze the question and output\n\
 actions.json\nresponse.json",
         },
-        // 10. actions.json produced by LLM Call 2.
+        // 10. actions.json produced by LLM Call 2 — the side-effecting POST actions.
         FlowStep {
             title: "actions.json",
-            description: "actions.json\nemote / value\nsearch Web / value\n\
+            description: "actions.json\nPOST\nSearch Web / value\n\
 users dl semantic Index name / value\nusers kb semantic Index name / value\n\
 gaia kb semantic Index name / value\ngaia lh logical Index name / value\n\
 gaia cosmos index named / value\nsend WhatsApp / value\nsend Push / value\n\
-actuate / value",
+actuate / value\nconnection / value",
         },
         // 11. response.json delivered back to the user, closing the loop.
         FlowStep {
@@ -164,17 +162,36 @@ mod tests {
     fn llm_call_one_lists_its_four_json_outputs() {
         let llm_call_1 = &steps()[2];
         let description = llm_call_1.description();
+        assert!(description.contains("actions.json"));
         assert!(description.contains("analysis.json"));
-        assert!(description.contains("connection"));
         assert!(description.contains("facts.json"));
         assert!(description.contains("newContext.json"));
+        // connection moved to the LLM Call 2 POST actions, so it is not here.
+        assert!(!description.contains("connection"));
     }
 
     #[test]
-    fn actions_block_lists_its_actuators() {
-        let actions = &steps()[3];
-        let description = actions.description();
+    fn call_one_actions_are_read_only_gets() {
+        // Block 3 is the GET (pull) action list emitted by LLM Call 1.
+        let get_actions = &steps()[3];
+        let description = get_actions.description();
+        assert!(description.contains("GET"));
+        assert!(description.contains("gaia cosmos index named / value"));
+        // Side-effecting actions belong to the Call 2 POST block, not here.
+        assert!(!description.contains("send WhatsApp"));
+        assert!(!description.contains("actuate"));
+        assert!(!description.contains("connection"));
+    }
+
+    #[test]
+    fn call_two_actions_post_side_effects_including_connection() {
+        // Block 9 is the POST (push) action list emitted by LLM Call 2.
+        let post_actions = &steps()[9];
+        let description = post_actions.description();
+        assert!(description.contains("POST"));
         assert!(description.contains("send WhatsApp / value"));
+        assert!(description.contains("send Push / value"));
         assert!(description.contains("actuate / value"));
+        assert!(description.contains("connection / value"));
     }
 }
