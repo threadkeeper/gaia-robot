@@ -57,8 +57,10 @@
 // Each module holds exactly one primary type plus its tests.
 mod actions;
 mod connection;
+mod diary;
 mod flow;
 mod llm;
+mod search_history;
 mod storage;
 
 use std::io::{self, BufRead, Write};
