@@ -60,6 +60,7 @@ mod connection;
 mod diary;
 mod flow;
 mod llm;
+mod prompt;
 mod search_history;
 mod storage;
 
@@ -118,13 +119,6 @@ fn main() -> ExitCode {
     // The flow module owns the eleven blocks; `main` just drives them in order.
     let steps = flow::steps();
 
-    // The "Gaia Context" block (index 1) holds the system instructions we send
-    // to the model during the LLM steps. Capture it once up front.
-    let gaia_context = steps
-        .get(1)
-        .map(|step| step.description().to_string())
-        .unwrap_or_default();
-
     // Lock stdin/stdout once up front for efficient line-by-line interaction.
     let stdin = io::stdin();
     let mut input = stdin.lock();
@@ -176,12 +170,36 @@ fn main() -> ExitCode {
         }
     };
 
+    // In dev/local mode every read and write is scoped to a single GitHub user.
+    // Resolve that id from `GAIA_USER_ID` (env or .env, default `threadkeeper`).
+    // Both tailored prompts (Call 1 and Call 2) take this id directly and scope
+    // everything they read, write, and say to this user only. In skeleton mode
+    // there is no user id.
+    let dev_user_id = if llm_client.is_some() {
+        llm::dev_user_id()
+    } else {
+        String::new()
+    };
+    if !dev_user_id.is_empty()
+        && writeln!(output, "User isolation: scoped to user_id \"{dev_user_id}\".").is_err()
+    {
+        return ExitCode::FAILURE;
+    }
+
     // --- 4. Run the program-flow loop --------------------------------------
     // Each outer iteration walks all eleven blocks once. We reuse a single
     // input buffer across reads to avoid needless allocations. The most recent
     // user input is threaded into the LLM steps within the same pass.
     let mut line = String::new();
     let mut last_user_input = String::new();
+    // Gaia's running conversation history. It starts empty and is intended to
+    // accumulate compacted prior turns; LLM Call 1 receives it as context. We
+    // do not build it yet, so for now it is threaded through empty.
+    let conversation_history = String::new();
+    // The Response Data Context handed to LLM Call 2. It is assembled by
+    // executing LLM Call 1's read-only actions; that executor is not wired yet,
+    // so for now it is threaded through empty (Call2Prompt fills a placeholder).
+    let response_data_context = String::new();
     'flow: loop {
         for (index, step) in steps.iter().enumerate() {
             // Log the block's exact description, mirroring the diagram.
@@ -202,7 +220,46 @@ fn main() -> ExitCode {
             // request using the Gaia context and the latest user input.
             if let Some(client) = &llm_client {
                 if llm::is_llm_call(step.title()) {
-                    let rendered = match client.complete(&gaia_context, &last_user_input) {
+                    // Form the message pair for this specific call. LLM Call 1
+                    // (the pull pass) gets the tailored research prompt; LLM
+                    // Call 2 (the push pass) gets the tailored answer prompt and
+                    // the assembled Response Data Context.
+                    let (system, user) = if step.title() == "LLM Call 1" {
+                        let formed = prompt::Call1Prompt::build(
+                            &dev_user_id,
+                            &last_user_input,
+                            &conversation_history,
+                            &prompt::now_rfc3339(),
+                        );
+                        (formed.system, formed.user)
+                    } else {
+                        // The Response Data Context is assembled by executing
+                        // Call 1's actions; that executor is not wired yet, so we
+                        // pass an empty context and Call2Prompt fills a clear
+                        // placeholder. See research/ResponseDataContext.md for the
+                        // shape this will carry once the executor runs.
+                        let formed = prompt::Call2Prompt::build(
+                            &dev_user_id,
+                            &last_user_input,
+                            &response_data_context,
+                            &prompt::now_rfc3339(),
+                        );
+                        (formed.system, formed.user)
+                    };
+
+                    // Print the full request first: the complete context window
+                    // plus the (currently empty) set of attached tools / MCP
+                    // servers / skills, so nothing sent to the model is hidden.
+                    if writeln!(output, "    --- {} request being sent ---", step.title()).is_err()
+                    {
+                        return ExitCode::FAILURE;
+                    }
+                    let preview = client.request_preview(&system, &user);
+                    if write!(output, "{preview}").is_err() {
+                        return ExitCode::FAILURE;
+                    }
+
+                    let rendered = match client.complete(&system, &user) {
                         Ok(reply) => format!("[{} via {}]\n{reply}", step.title(), client.model()),
                         Err(err) => format!("[{} failed] {err}", step.title()),
                     };
@@ -338,6 +395,11 @@ fn narrate(index: usize, out: &mut impl Write) -> io::Result<()> {
             )?;
             writeln!(
                 out,
+                "    [intended] Log every web search + its results to the Gaia Search History (search_history::SearchHistory) \
+                 for audit only \u{2014} logging, no embedding.",
+            )?;
+            writeln!(
+                out,
                 "    [TODO] Deserialize into actions::ActionsFile, validate user isolation, then dispatch the reads.",
             )?;
         }
@@ -449,6 +511,10 @@ fn narrate(index: usize, out: &mut impl Write) -> io::Result<()> {
                 out,
                 "    [intended] Carry-over decays (~{:.0}%) into the next turn; hard-compact at {CONTEXT_TOKEN_CAP} tokens.",
                 CONTEXT_COMPRESSION_RATIO * 100.0,
+            )?;
+            writeln!(
+                out,
+                "    [intended] Write a diary note for this session to the Gaia Diary (diary::Diary), keyed by (wing, timestamp).",
             )?;
             writeln!(
                 out,

@@ -192,7 +192,9 @@ mod tests {
 
         assert_eq!(diary.len(), 1);
         assert_eq!(
-            diary.latest("threadkeeper").map(|entry| entry.text.as_str()),
+            diary
+                .latest("threadkeeper")
+                .map(|entry| entry.text.as_str()),
             Some("corrected version")
         );
     }
@@ -225,8 +227,7 @@ mod tests {
     fn a_diary_entry_round_trips_through_json() {
         let original = note("2026-05-03T15:21:54Z", "round trip", 7);
         let json = serde_json::to_string(&original).expect("entry should serialize");
-        let restored: DiaryEntry =
-            serde_json::from_str(&json).expect("entry should deserialize");
+        let restored: DiaryEntry = serde_json::from_str(&json).expect("entry should deserialize");
         assert_eq!(restored, original);
     }
 }

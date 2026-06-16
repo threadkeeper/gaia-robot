@@ -26,6 +26,10 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_ENDPOINT: &str = "https://models.github.ai/inference/chat/completions";
 /// Default model used for dev/local testing.
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
+/// Default GitHub user id used for user isolation in dev/local mode when
+/// `GAIA_USER_ID` is not set. Matches the `threadkeeper` exports under
+/// `migrations/`, so dev runs are scoped to that user's real data out of the box.
+const DEFAULT_USER_ID: &str = "threadkeeper";
 /// Conservative cap on response length so dev testing stays cheap and fast.
 const DEFAULT_MAX_TOKENS: u32 = 512;
 
@@ -132,6 +136,60 @@ impl LlmClient {
 
         parse_completion(&text)
     }
+
+    /// Render a human-readable preview of *exactly* what this client will send
+    /// for one chat completion, so a walk-through can see the full context
+    /// window with nothing hidden.
+    ///
+    /// The preview lists the wire parameters (endpoint, model, `max_tokens`),
+    /// the set of attached tools / functions / MCP servers / skills (currently
+    /// **none** — the dev client is a plain chat-completions call), and then the
+    /// complete, untruncated `system` and `user` message contents with rough
+    /// size estimates. The bearer token is intentionally **never** included.
+    pub fn request_preview(&self, system: &str, user: &str) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = String::new();
+
+        // Wire parameters that actually go in the request.
+        // (`let _ =` because writing to a String is infallible.)
+        let _ = writeln!(out, "    endpoint     : {}", self.endpoint);
+        let _ = writeln!(out, "    model        : {}", self.model);
+        let _ = writeln!(out, "    max_tokens   : {DEFAULT_MAX_TOKENS}");
+
+        // Attachments. The dev client is deliberately minimal: no tool/function
+        // calling, no MCP servers, no skills. We print these explicitly so the
+        // walk-through shows that nothing beyond the two messages is attached.
+        let _ = writeln!(out, "    tools        : none attached");
+        let _ = writeln!(out, "    functions    : none attached");
+        let _ = writeln!(out, "    MCP servers  : none attached");
+        let _ = writeln!(out, "    skills       : none attached");
+        let _ = writeln!(out, "    response_fmt : text (model default)");
+
+        // The full context window: both messages exactly as they will be sent.
+        let _ = writeln!(
+            out,
+            "    messages     : 2 (system + user), {} chars total / ~{} tokens",
+            system.chars().count() + user.chars().count(),
+            approx_tokens(system) + approx_tokens(user),
+        );
+        let _ = writeln!(
+            out,
+            "    --- [system] {} chars / ~{} tokens ---",
+            system.chars().count(),
+            approx_tokens(system),
+        );
+        let _ = writeln!(out, "{system}");
+        let _ = writeln!(
+            out,
+            "    --- [user] {} chars / ~{} tokens ---",
+            user.chars().count(),
+            approx_tokens(user),
+        );
+        let _ = writeln!(out, "{user}");
+
+        out
+    }
 }
 
 /// True when the given flow-block title is one of the two LLM call blocks.
@@ -140,6 +198,16 @@ impl LlmClient {
 /// when dev/local mode is enabled.
 pub fn is_llm_call(title: &str) -> bool {
     title == "LLM Call 1" || title == "LLM Call 2"
+}
+
+/// Resolve the GitHub user id used for user isolation in dev/local mode.
+///
+/// Reads `GAIA_USER_ID` from the environment or a `.env` file (same precedence
+/// as the dev token), falling back to [`DEFAULT_USER_ID`]. Every read and write
+/// in a dev turn should be scoped to this id so one user never sees another's
+/// data.
+pub fn dev_user_id() -> String {
+    value_from_env("GAIA_USER_ID").unwrap_or_else(|| DEFAULT_USER_ID.to_string())
 }
 
 /// Whether dev/local LLM mode is enabled via the `GAIA_MODE` environment var.
@@ -155,20 +223,34 @@ fn dev_mode_enabled() -> bool {
 
 /// Resolve the GitHub token from the environment, falling back to a `.env` file.
 fn resolve_token() -> Option<String> {
+    value_from_env("GITHUB_TOKEN")
+}
+
+/// Resolve a configuration value from the process environment, falling back to
+/// the same `.env` files used for the dev token.
+///
+/// Lookup order: the real process environment variable `key` first, then the
+/// candidate `.env` files (the `GAIA_ENV_FILE` override, then `infra/.env`, then
+/// `../infra/.env`). Returns `None` when `key` is absent or empty everywhere.
+///
+/// This is the shared entry point for reading dev/local configuration (the
+/// GitHub token, the dev user id, and so on) so every value honours the same
+/// precedence rules.
+pub fn value_from_env(key: &str) -> Option<String> {
     // Prefer a real process environment variable.
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        let token = token.trim().to_string();
-        if !token.is_empty() {
-            return Some(token);
+    if let Ok(value) = std::env::var(key) {
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            return Some(value);
         }
     }
 
     // Fall back to a local .env file for developer convenience.
-    token_from_env_files()
+    value_from_env_files(key)
 }
 
-/// Look for `GITHUB_TOKEN` in the candidate `.env` file locations.
-fn token_from_env_files() -> Option<String> {
+/// Look for `key` in the candidate `.env` file locations.
+fn value_from_env_files(key: &str) -> Option<String> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     // Explicit override always wins.
@@ -182,10 +264,10 @@ fn token_from_env_files() -> Option<String> {
 
     for path in candidates {
         if let Ok(contents) = std::fs::read_to_string(&path) {
-            if let Some(token) = parse_dotenv(&contents).get("GITHUB_TOKEN") {
-                let token = token.trim().to_string();
-                if !token.is_empty() {
-                    return Some(token);
+            if let Some(value) = parse_dotenv(&contents).get(key) {
+                let value = value.trim().to_string();
+                if !value.is_empty() {
+                    return Some(value);
                 }
             }
         }
@@ -237,6 +319,15 @@ fn strip_quotes(value: &str) -> &str {
         }
     }
     value
+}
+
+/// Rough token estimate for a string (~4 characters per token).
+///
+/// This is a heuristic, not a real tokenizer: it only feeds the size figures in
+/// [`LlmClient::request_preview`], mirroring the program's "approximate tokens"
+/// budgeting elsewhere in the flow.
+fn approx_tokens(text: &str) -> usize {
+    text.chars().count().div_ceil(4)
 }
 
 /// Build the chat-completions request body for one user turn.
@@ -370,6 +461,57 @@ COSMOS_ENDPOINT=https://example.documents.azure.com:443/\n\
         assert_eq!(strip_quotes("plain"), "plain");
         // Mismatched quotes are left untouched.
         assert_eq!(strip_quotes("\"hello'"), "\"hello'");
+    }
+
+    #[test]
+    fn value_from_env_reads_a_process_variable() {
+        // Use a unique key so this test never collides with another's env var.
+        let key = "GAIA_TEST_VALUE_FROM_ENV";
+        std::env::set_var(key, "  hello  ");
+        assert_eq!(value_from_env(key).as_deref(), Some("hello"));
+        std::env::remove_var(key);
+        assert_eq!(value_from_env(key), None);
+    }
+
+    #[test]
+    fn dev_user_id_honours_the_env_override() {
+        // An explicit GAIA_USER_ID takes precedence over the default.
+        std::env::set_var("GAIA_USER_ID", "someone-else");
+        assert_eq!(dev_user_id(), "someone-else");
+        std::env::remove_var("GAIA_USER_ID");
+    }
+
+    #[test]
+    fn approx_tokens_rounds_up_quarter_of_chars() {
+        assert_eq!(approx_tokens(""), 0);
+        assert_eq!(approx_tokens("a"), 1); // 1 char -> ceil(1/4) = 1
+        assert_eq!(approx_tokens("abcd"), 1); // 4 chars -> 1
+        assert_eq!(approx_tokens("abcde"), 2); // 5 chars -> ceil(5/4) = 2
+    }
+
+    #[test]
+    fn request_preview_shows_full_window_and_no_attachments() {
+        let client = LlmClient {
+            endpoint: "https://example/inference".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            token: "ghp_super_secret".to_string(),
+        };
+
+        let preview = client.request_preview("SYSTEM-CONTEXT", "USER-INPUT");
+
+        // Wire parameters are shown.
+        assert!(preview.contains("model        : gpt-4o-mini"));
+        assert!(preview.contains("max_tokens   : 512"));
+        // Attachments are explicitly none.
+        assert!(preview.contains("tools        : none attached"));
+        assert!(preview.contains("functions    : none attached"));
+        assert!(preview.contains("MCP servers  : none attached"));
+        assert!(preview.contains("skills       : none attached"));
+        // The full, untruncated message contents are present.
+        assert!(preview.contains("SYSTEM-CONTEXT"));
+        assert!(preview.contains("USER-INPUT"));
+        // The bearer token must NEVER appear in the preview.
+        assert!(!preview.contains("ghp_super_secret"));
     }
 
     #[test]

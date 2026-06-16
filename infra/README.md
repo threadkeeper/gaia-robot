@@ -17,19 +17,25 @@ Both buttons nest [azuredeploy.json](azuredeploy.json), the base ARM template
 - the **Cosmos DB for NoSQL** account (with `EnableNoSQLVectorSearch` and
   `EnableNoSQLFullTextSearch`) and the `gaia` database;
 - an **Azure AI Foundry** account and project, with the **`model-router`** model
-  deployed (SKU from `modelRouterSku`; default `auto`);
+  deployed (SKU from `modelRouterSku`; default `auto`) and, when
+  `deployEmbeddingModel` is `true`, a high-performance **`text-embedding`**
+  deployment used to populate the Cosmos `/dataVector` field;
 - a **Container App** (plus its managed environment and a Log Analytics
   workspace), pre-wired with `COSMOS_ENDPOINT`, `COSMOS_DATABASE`,
-  `FOUNDRY_ENDPOINT`, and `MODEL_ROUTER_DEPLOYMENT` environment variables.
+  `FOUNDRY_ENDPOINT`, `MODEL_ROUTER_DEPLOYMENT`, `EMBEDDING_DEPLOYMENT`, and
+  `EMBEDDING_DIMENSIONS` environment variables.
 
 Template outputs include `tier`, `cosmosEndpoint` (use it for `COSMOS_ENDPOINT`),
-`foundryEndpoint`, `modelRouterDeployment`, and `containerAppFqdn`.
+`foundryEndpoint`, `modelRouterDeployment`, `embeddingDeployment`,
+`embeddingDimensions`, and `containerAppFqdn`.
 
 Key template parameters: `tier` (default `free`), `modelRouterVersion`
 (default `2025-05-19`), `modelRouterSku` (default `auto`: uses `Standard` in
 `eastus`, `GlobalStandard` elsewhere), `modelRouterCapacity` (default `0` = use
-the tier default), `containerImage` (default a hello-world image — replace with
-your own once published).
+the tier default), `deployEmbeddingModel` (default `false`), `embeddingModel`
+(default `text-embedding-3-large`), `embeddingDimensions` (default `1536` — must
+match `COSMOS_VECTOR_DIMS`), `containerImage` (default a hello-world image —
+replace with your own once published).
 
 ## Cost / pricing breakdown
 
@@ -135,3 +141,39 @@ the template.
 | `COSMOS_VECTOR_DIMS` | no       | `1536`  | Embedding dimensions             |
 | `COSMOS_THROUGHPUT`  | no       | `400`   | RU/s per container               |
 | `GITHUB_TOKEN`       | no       | —       | GitHub token for local/dev mode  |
+
+## embed_worker.py (vector backfill)
+
+`cosmos_create.py` declares the `/dataVector` vector policy, but the migration
+scripts do not compute embeddings. `embed_worker.py` fills that gap: it scans
+**every** container for records whose `/dataVector` is missing or empty, embeds
+their `data` text with the Foundry **`text-embedding`** deployment in batches,
+and writes the vectors back with the Cosmos **patch** API — concurrently and
+idempotently (re-running only picks up whatever is still missing).
+
+The embedding logic lives in [embeddings.py](embeddings.py) as a reusable
+`EmbeddingClient` (with `embed`, `embed_one`, and a lazy `embed_if_missing`).
+
+### Run it
+
+```powershell
+cd infra
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt        # adds openai + aiohttp
+
+# .env must set COSMOS_ENDPOINT, FOUNDRY_ENDPOINT and EMBEDDING_DEPLOYMENT.
+python embed_worker.py                 # backfill every container
+python embed_worker.py --dry-run       # count only, no model calls
+python embed_worker.py --container GaiaKB --batch-size 32 --concurrency 8 --max 500
+```
+
+| Variable                   | Required | Default      | Purpose                                   |
+|----------------------------|----------|--------------|-------------------------------------------|
+| `FOUNDRY_ENDPOINT`         | yes      | —            | Foundry account endpoint                  |
+| `EMBEDDING_DEPLOYMENT`     | yes      | —            | Embedding deployment name                 |
+| `EMBEDDING_DIMENSIONS`     | no       | `1536`       | Vector length (must match the Cosmos policy) |
+| `FOUNDRY_KEY`              | no       | —            | API key (else Azure AD is used)           |
+| `AZURE_OPENAI_API_VERSION` | no       | `2024-10-21` | Azure OpenAI REST API version             |
+
+> The embedding vector length **must** equal `COSMOS_VECTOR_DIMS` (the value the
+> containers were created with), or Cosmos will reject the vector.
