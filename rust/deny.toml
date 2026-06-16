@@ -1,0 +1,46 @@
+# cargo-deny configuration.
+# Enforces the supply-chain rules from .github/copilot-instructions.md:
+# no known-vulnerable, unmaintained, yanked, or untrusted dependencies.
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+# Security advisories from the RustSec database.
+[advisories]
+# Fail on any crate with a known security vulnerability.
+# (cargo-deny v0.14+ errors on vulnerabilities/unmaintained by default.)
+yanked = "deny"
+# List specific advisory IDs here to consciously ignore them, with a comment
+# explaining why each is acceptable. Keep this list as small as possible.
+ignore = []
+
+# License policy: only allow well-known, permissive licenses.
+[licenses]
+# Crates whose license is not in this list will fail the build.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+# Require at least this confidence when guessing a license from its text.
+confidence-threshold = 0.9
+
+# Lints against the dependency graph itself.
+[bans]
+# Warn when multiple versions of the same crate are pulled in (bloats the tree).
+multiple-versions = "warn"
+# Prefer few transitive dependencies; flag wildcard version requirements.
+wildcards = "deny"
+# Add crates here that must never appear in the tree, e.g.:
+# deny = [{ name = "openssl", reason = "prefer rustls" }]
+deny = []
+
+# Only allow crates from trusted sources (crates.io by default).
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Allow-list any git sources or alternative registries explicitly here.
+allow-git = []

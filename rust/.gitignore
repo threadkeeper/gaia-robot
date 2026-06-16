@@ -1,0 +1,8 @@
+# Rust build artifacts.
+/target
+
+# Backup files from some editors.
+**/*.rs.bk
+
+# Coverage output produced by `cargo llvm-cov`.
+/lcov.info

@@ -1,0 +1,314 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Provisions the Gaia platform: a Cosmos DB for NoSQL account (with vector + full-text search) and database, an Azure AI Foundry account/project with the 'model-router' model deployed, and a Container App (with its environment and Log Analytics workspace). The five Cosmos containers are created afterwards by infra/cosmos_create.py."
+  },
+  "parameters": {
+    "accountName": {
+      "type": "string",
+      "defaultValue": "[concat('gaia-', uniqueString(resourceGroup().id))]",
+      "metadata": {
+        "description": "Globally unique Cosmos DB account name."
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region for the account."
+      }
+    },
+    "tier": {
+      "type": "string",
+      "defaultValue": "free",
+      "allowedValues": [ "free", "hobby" ],
+      "metadata": {
+        "description": "Cost tier. 'free' minimises idle cost (Cosmos free tier, scale-to-zero Container App, smallest model capacity); 'hobby' is a balanced always-on configuration. See infra/README.md for the full price breakdown."
+      }
+    },
+    "databaseName": {
+      "type": "string",
+      "defaultValue": "gaia",
+      "metadata": {
+        "description": "Name of the SQL (NoSQL) database to create. Must match COSMOS_DATABASE."
+      }
+    },
+    "foundryName": {
+      "type": "string",
+      "defaultValue": "[concat('gaia-foundry-', uniqueString(resourceGroup().id))]",
+      "metadata": {
+        "description": "Azure AI Foundry (AI Services) account name."
+      }
+    },
+    "foundryProjectName": {
+      "type": "string",
+      "defaultValue": "gaia-project",
+      "metadata": {
+        "description": "Foundry project name created under the Foundry account."
+      }
+    },
+    "modelRouterVersion": {
+      "type": "string",
+      "defaultValue": "2025-05-19",
+      "metadata": {
+        "description": "Version of the Azure OpenAI 'model-router' model to deploy."
+      }
+    },
+    "modelRouterCapacity": {
+      "type": "int",
+      "defaultValue": 0,
+      "metadata": {
+        "description": "Throughput capacity (in thousands of tokens per minute) for the model-router deployment. Leave at 0 to use the tier default (free=10, hobby=50)."
+      }
+    },
+    "containerAppName": {
+      "type": "string",
+      "defaultValue": "gaia-app",
+      "metadata": {
+        "description": "Name of the Container App."
+      }
+    },
+    "containerImage": {
+      "type": "string",
+      "defaultValue": "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest",
+      "metadata": {
+        "description": "Container image to run. Replace with your own image once published."
+      }
+    }
+  },
+  "variables": {
+    "logAnalyticsName": "[concat('gaia-logs-', uniqueString(resourceGroup().id))]",
+    "containerEnvName": "[concat('gaia-env-', uniqueString(resourceGroup().id))]",
+    "modelRouterDeploymentName": "model-router",
+    "tierConfig": {
+      "free": {
+        "cpu": "[json('0.25')]",
+        "memory": "0.5Gi",
+        "minReplicas": 0,
+        "maxReplicas": 1,
+        "modelCapacity": 10,
+        "enableFreeTier": true
+      },
+      "hobby": {
+        "cpu": "[json('0.5')]",
+        "memory": "1Gi",
+        "minReplicas": 1,
+        "maxReplicas": 3,
+        "modelCapacity": 50,
+        "enableFreeTier": false
+      }
+    },
+    "selectedTier": "[variables('tierConfig')[parameters('tier')]]",
+    "effectiveModelCapacity": "[if(equals(parameters('modelRouterCapacity'), 0), variables('selectedTier').modelCapacity, parameters('modelRouterCapacity'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.DocumentDB/databaseAccounts",
+      "apiVersion": "2024-11-15",
+      "name": "[parameters('accountName')]",
+      "location": "[parameters('location')]",
+      "kind": "GlobalDocumentDB",
+      "properties": {
+        "databaseAccountOfferType": "Standard",
+        "enableFreeTier": "[variables('selectedTier').enableFreeTier]",
+        "consistencyPolicy": {
+          "defaultConsistencyLevel": "Session"
+        },
+        "locations": [
+          {
+            "locationName": "[parameters('location')]",
+            "failoverPriority": 0,
+            "isZoneRedundant": false
+          }
+        ],
+        "capabilities": [
+          { "name": "EnableNoSQLVectorSearch" },
+          { "name": "EnableNoSQLFullTextSearch" }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.DocumentDB/databaseAccounts/sqlDatabases",
+      "apiVersion": "2024-11-15",
+      "name": "[concat(parameters('accountName'), '/', parameters('databaseName'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('accountName'))]"
+      ],
+      "properties": {
+        "resource": {
+          "id": "[parameters('databaseName')]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.CognitiveServices/accounts",
+      "apiVersion": "2025-04-01-preview",
+      "name": "[parameters('foundryName')]",
+      "location": "[parameters('location')]",
+      "kind": "AIServices",
+      "sku": {
+        "name": "S0"
+      },
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "allowProjectManagement": true,
+        "customSubDomainName": "[parameters('foundryName')]",
+        "publicNetworkAccess": "Enabled"
+      }
+    },
+    {
+      "type": "Microsoft.CognitiveServices/accounts/projects",
+      "apiVersion": "2025-04-01-preview",
+      "name": "[concat(parameters('foundryName'), '/', parameters('foundryProjectName'))]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.CognitiveServices/accounts', parameters('foundryName'))]"
+      ],
+      "properties": {}
+    },
+    {
+      "type": "Microsoft.CognitiveServices/accounts/deployments",
+      "apiVersion": "2025-04-01-preview",
+      "name": "[concat(parameters('foundryName'), '/', variables('modelRouterDeploymentName'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.CognitiveServices/accounts', parameters('foundryName'))]"
+      ],
+      "sku": {
+        "name": "GlobalStandard",
+        "capacity": "[variables('effectiveModelCapacity')]"
+      },
+      "properties": {
+        "model": {
+          "format": "OpenAI",
+          "name": "model-router",
+          "version": "[parameters('modelRouterVersion')]"
+        },
+        "versionUpgradeOption": "OnceNewDefaultVersionAvailable",
+        "raiPolicyName": "Microsoft.DefaultV2"
+      }
+    },
+    {
+      "type": "Microsoft.OperationalInsights/workspaces",
+      "apiVersion": "2023-09-01",
+      "name": "[variables('logAnalyticsName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "sku": {
+          "name": "PerGB2018"
+        },
+        "retentionInDays": 30
+      }
+    },
+    {
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('containerEnvName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName'))]"
+      ],
+      "properties": {
+        "appLogsConfiguration": {
+          "destination": "log-analytics",
+          "logAnalyticsConfiguration": {
+            "customerId": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName')), '2023-09-01').customerId]",
+            "sharedKey": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName')), '2023-09-01').primarySharedKey]"
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2024-03-01",
+      "name": "[parameters('containerAppName')]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.App/managedEnvironments', variables('containerEnvName'))]",
+        "[resourceId('Microsoft.CognitiveServices/accounts/deployments', parameters('foundryName'), variables('modelRouterDeploymentName'))]"
+      ],
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('containerEnvName'))]",
+        "configuration": {
+          "ingress": {
+            "external": true,
+            "targetPort": 80,
+            "transport": "auto"
+          }
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "[parameters('containerAppName')]",
+              "image": "[parameters('containerImage')]",
+              "resources": {
+                "cpu": "[variables('selectedTier').cpu]",
+                "memory": "[variables('selectedTier').memory]"
+              },
+              "env": [
+                {
+                  "name": "COSMOS_ENDPOINT",
+                  "value": "[reference(resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('accountName'))).documentEndpoint]"
+                },
+                {
+                  "name": "COSMOS_DATABASE",
+                  "value": "[parameters('databaseName')]"
+                },
+                {
+                  "name": "FOUNDRY_ENDPOINT",
+                  "value": "[reference(resourceId('Microsoft.CognitiveServices/accounts', parameters('foundryName'))).endpoint]"
+                },
+                {
+                  "name": "MODEL_ROUTER_DEPLOYMENT",
+                  "value": "[variables('modelRouterDeploymentName')]"
+                }
+              ]
+            }
+          ],
+          "scale": {
+            "minReplicas": "[variables('selectedTier').minReplicas]",
+            "maxReplicas": "[variables('selectedTier').maxReplicas]"
+          }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "tier": {
+      "type": "string",
+      "value": "[parameters('tier')]"
+    },
+    "cosmosEndpoint": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('accountName'))).documentEndpoint]"
+    },
+    "accountName": {
+      "type": "string",
+      "value": "[parameters('accountName')]"
+    },
+    "databaseName": {
+      "type": "string",
+      "value": "[parameters('databaseName')]"
+    },
+    "foundryEndpoint": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.CognitiveServices/accounts', parameters('foundryName'))).endpoint]"
+    },
+    "modelRouterDeployment": {
+      "type": "string",
+      "value": "[variables('modelRouterDeploymentName')]"
+    },
+    "containerAppFqdn": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName'))).configuration.ingress.fqdn]"
+    }
+  }
+}

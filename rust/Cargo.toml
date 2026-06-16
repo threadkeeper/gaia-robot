@@ -1,0 +1,19 @@
+[package]
+name = "gaia-robot"
+version = "0.1.0"
+edition = "2021"
+# Minimum supported Rust version. Bump deliberately, not accidentally.
+rust-version = "1.74"
+description = "Gaia robot console application."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# Intentionally empty: prefer the standard library.
+# Justify and vet any crate before adding it (see copilot-instructions.md).
+
+[profile.release]
+# Smaller, faster release binaries.
+lto = true
+codegen-units = 1
+strip = true

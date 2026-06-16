@@ -1,0 +1,5 @@
+# Dependencies for cosmos_create.py.
+# Vector and full-text container policies require recent SDK versions.
+azure-cosmos>=4.9.0
+# Only needed when authenticating with Azure AD (no COSMOS_KEY set).
+azure-identity>=1.17.0

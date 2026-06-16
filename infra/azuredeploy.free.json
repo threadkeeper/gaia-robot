@@ -1,0 +1,63 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Deploys the Gaia platform at the FREE / LITE tier: scale-to-zero Container App (0.25 vCPU / 0.5 GiB, 0-1 replicas) and the smallest model-router capacity (10). Lowest cost; best for trying Gaia out. This wrapper nests infra/azuredeploy.json and pins tier='free'."
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region for all resources."
+      }
+    },
+    "containerImage": {
+      "type": "string",
+      "defaultValue": "mcr.microsoft.com/azuredocs/containerapps-helloworld:latest",
+      "metadata": {
+        "description": "Container image to run. Replace with your own image once published."
+      }
+    }
+  },
+  "variables": {
+    "baseTemplateUri": "https://raw.githubusercontent.com/threadkeeper/gaia-robot/main/infra/azuredeploy.json"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2022-09-01",
+      "name": "gaia-free",
+      "properties": {
+        "mode": "Incremental",
+        "templateLink": {
+          "uri": "[variables('baseTemplateUri')]",
+          "contentVersion": "1.0.0.0"
+        },
+        "parameters": {
+          "tier": { "value": "free" },
+          "location": { "value": "[parameters('location')]" },
+          "containerImage": { "value": "[parameters('containerImage')]" }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "tier": {
+      "type": "string",
+      "value": "[reference('gaia-free').outputs.tier.value]"
+    },
+    "cosmosEndpoint": {
+      "type": "string",
+      "value": "[reference('gaia-free').outputs.cosmosEndpoint.value]"
+    },
+    "foundryEndpoint": {
+      "type": "string",
+      "value": "[reference('gaia-free').outputs.foundryEndpoint.value]"
+    },
+    "containerAppFqdn": {
+      "type": "string",
+      "value": "[reference('gaia-free').outputs.containerAppFqdn.value]"
+    }
+  }
+}

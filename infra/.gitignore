@@ -1,0 +1,4 @@
+# Local secrets and Python virtual environment — never commit these.
+.env
+.venv/
+__pycache__/

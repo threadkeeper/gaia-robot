@@ -1,0 +1,5 @@
+# Pin the toolchain so every clone and CI run builds with the same compiler.
+# Update this deliberately (and keep it in sync with Cargo.toml's rust-version).
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
