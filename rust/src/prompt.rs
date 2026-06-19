@@ -31,12 +31,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// shapes described by the flow diagram. The model is told to emit all four as a
 /// single JSON array.
 const DOCUMENT_SPEC: &str = "\
-1. actions.json - READ-ONLY research queries only (no side effects). Shape:
+1. actions.json - READ-ONLY research queries only (no side effects). Emit
+   EXACTLY SEVEN queries, with ids q1..q7, one per retrieval source, in this
+   order:
+     q1 -> Web              (public web search)
+     q2 -> UsersDL          (this user's data lake)
+     q3 -> UsersKB          (this user's knowledge base)
+     q4 -> GaiaDL           (Gaia's shared data lake)
+     q5 -> GaiaKB           (Gaia's shared knowledge base)
+     q6 -> GaiaDiary        (Gaia's diary of past sessions)
+     q7 -> GaiaConnections  (this user's emotional-bank-account ledger)
+   Shape:
    { \"version\": \"1.0\",
      \"session\": { \"user_id\": \"<this user>\", \"requested_at\": \"<use the current time given in the user message>\" },
      \"actions\": [
        { \"id\": \"q1\", \"kind\": \"query\",
-         \"target\": \"UsersKB|UsersDL|GaiaKB|GaiaLH|GaiaCosmos|GaiaConnections\",
+         \"target\": \"Web|UsersDL|UsersKB|GaiaDL|GaiaKB|GaiaDiary|GaiaConnections\",
          \"user_id\": \"<required for Users* targets, otherwise null>\",
          \"entity\": \"<subject to search for, optional>\",
          \"intent\": \"<natural-language description of what to retrieve>\",
@@ -54,17 +64,19 @@ const DOCUMENT_SPEC: &str = "\
 
 /// The retrieval tools Call 1 may target through `actions.json`.
 ///
-/// Each line names a target container (or the web), how it is partitioned, and
-/// whether a `user_id` is mandatory. `Users*` targets are per-user and must be
-/// scoped to the current user only, which is how user isolation is enforced.
+/// Each line names a target source, how it is partitioned, and whether a
+/// `user_id` is mandatory. The seven sources match the GET block of the
+/// physical architecture exactly (q1..q7). `Users*` targets are per-user and
+/// must be scoped to the current user only, which is how user isolation is
+/// enforced.
 const TOOL_SPEC: &str = "\
-- UsersDL   (semantic): this user's data lake; partition=userId; user_id REQUIRED.
-- UsersKB   (semantic): this user's knowledge base; partition=userId; user_id REQUIRED.
-- GaiaKB    (semantic): Gaia's shared knowledge base; partition=entity.
-- GaiaLH    (logical) : Gaia's logical history; partition=entity.
-- GaiaCosmos (named)  : Gaia's cosmos index; partition=entity.
-- GaiaConnections     : per-user emotional-bank-account ledger; partition=entity.
-- Web       (search)  : public web search; results are logged to the Search History.
+- Web             (search)    : public web search; results are logged to the Gaia Search History.
+- UsersDL         (data lake) : this user's data lake; partition=userId; user_id REQUIRED.
+- UsersKB         (semantic)  : this user's knowledge base; partition=userId; user_id REQUIRED.
+- GaiaDL          (data lake) : Gaia's shared data lake; partition=entity.
+- GaiaKB          (semantic)  : Gaia's shared knowledge base; partition=entity.
+- GaiaDiary       (semantic)  : Gaia's diary of past sessions; partition=entity.
+- GaiaConnections (log)       : this user's emotional-bank-account ledger; partition=entity.
 Every query defaults to top=3. Users* targets MUST set user_id to this user only.";
 
 /// The fully-formed prompt for LLM Call 1, split into the two chat messages.
@@ -324,16 +336,31 @@ mod tests {
     fn system_lists_every_retrieval_tool() {
         let prompt = Call1Prompt::build("threadkeeper", "hi", "", "2026-06-16T12:00:00Z");
 
+        // The seven sources of the physical architecture's GET block (q1..q7).
         for target in [
+            "Web",
             "UsersDL",
             "UsersKB",
+            "GaiaDL",
             "GaiaKB",
-            "GaiaLH",
-            "GaiaCosmos",
+            "GaiaDiary",
             "GaiaConnections",
-            "Web",
         ] {
             assert!(prompt.system.contains(target), "missing {target}");
+        }
+        // The retired targets must not linger in the spec.
+        assert!(!prompt.system.contains("GaiaLH"));
+        assert!(!prompt.system.contains("GaiaCosmos"));
+    }
+
+    #[test]
+    fn system_requests_exactly_seven_searches_q1_through_q7() {
+        let prompt = Call1Prompt::build("threadkeeper", "hi", "", "2026-06-16T12:00:00Z");
+
+        // Call 1 must be told to emit exactly seven queries, ids q1..q7.
+        assert!(prompt.system.contains("EXACTLY SEVEN"));
+        for id in ["q1", "q2", "q3", "q4", "q5", "q6", "q7"] {
+            assert!(prompt.system.contains(id), "missing query id {id}");
         }
     }
 

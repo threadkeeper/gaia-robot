@@ -50,9 +50,9 @@
     },
     "modelRouterVersion": {
       "type": "string",
-      "defaultValue": "2025-05-19",
+      "defaultValue": "2025-11-18",
       "metadata": {
-        "description": "Version of the Azure OpenAI 'model-router' model to deploy."
+        "description": "Version of the Azure OpenAI 'model-router' model to deploy. '2025-11-18' is the current GA version deployed in gaia-rg."
       }
     },
     "modelRouterSku": {
@@ -72,9 +72,9 @@
     },
     "deployModelRouter": {
       "type": "bool",
-      "defaultValue": false,
+      "defaultValue": true,
       "metadata": {
-        "description": "Set to true only when you have the required model quota. For testing, leave this false and use GitHub Models instead."
+        "description": "Deploy the Azure OpenAI 'model-router' chat model — the default chat model the app calls. Requires model-router quota in the chosen region. Set to false to skip it and use GitHub Models for local/dev testing instead."
       }
     },
     "containerAppName": {
@@ -132,6 +132,20 @@
       "defaultValue": 1536,
       "metadata": {
         "description": "Embedding vector length. MUST match the Cosmos /dataVector policy (COSMOS_VECTOR_DIMS, default 1536). text-embedding-3 models support reducing dimensions to this value."
+      }
+    },
+    "braveSearchApiKey": {
+      "type": "securestring",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Brave Search API subscription token used by Gaia's web-search applet (sent as the 'X-Subscription-Token' header). Injected into the Container App as the BRAVE_SEARCH_API_KEY env var. Leave empty to deploy without web search; the app simply skips searches when it is unset."
+      }
+    },
+    "braveSearchEndpoint": {
+      "type": "string",
+      "defaultValue": "https://api.search.brave.com/res/v1/web/search",
+      "metadata": {
+        "description": "Brave Web Search API endpoint the app calls. Injected as BRAVE_SEARCH_ENDPOINT. The default is the public Brave Search endpoint and rarely needs changing."
       }
     }
   },
@@ -364,6 +378,14 @@
                 {
                   "name": "EMBEDDING_DIMENSIONS",
                   "value": "[string(parameters('embeddingDimensions'))]"
+                },
+                {
+                  "name": "BRAVE_SEARCH_ENDPOINT",
+                  "value": "[parameters('braveSearchEndpoint')]"
+                },
+                {
+                  "name": "BRAVE_SEARCH_API_KEY",
+                  "value": "[parameters('braveSearchApiKey')]"
                 }
               ]
             }

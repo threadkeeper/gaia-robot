@@ -25,6 +25,13 @@
       "metadata": {
         "description": "Set to true to also deploy the text-embedding model (requires embedding model quota)."
       }
+    },
+    "braveSearchApiKey": {
+      "type": "securestring",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Brave Search API subscription token for Gaia's web-search applet. Passed through to the Container App as BRAVE_SEARCH_API_KEY. Leave empty to deploy without web search."
+      }
     }
   },
   "variables": {
@@ -45,7 +52,8 @@
           "tier": { "value": "free" },
           "location": { "value": "[parameters('location')]" },
           "containerImage": { "value": "[parameters('containerImage')]" },
-          "deployEmbeddingModel": { "value": "[parameters('deployEmbeddingModel')]" }
+          "deployEmbeddingModel": { "value": "[parameters('deployEmbeddingModel')]" },
+          "braveSearchApiKey": { "value": "[parameters('braveSearchApiKey')]" }
         }
       }
     }

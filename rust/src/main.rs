@@ -56,13 +56,21 @@
 
 // Each module holds exactly one primary type plus its tests.
 mod actions;
+mod base64;
 mod connection;
 mod diary;
+mod engine;
 mod flow;
+mod http_request;
+mod http_response;
 mod llm;
 mod prompt;
 mod search_history;
+mod server;
+mod sha1;
 mod storage;
+mod web_search;
+mod websocket;
 
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
@@ -115,6 +123,17 @@ mod context_budget {
 /// `ExitCode` rather than panicking so failures surface as a normal, testable
 /// exit status.
 fn main() -> ExitCode {
+    // --- 0. HTTP server mode (opt-in) --------------------------------------
+    // When a listen address is configured (`GAIA_HTTP_ADDR` or `GAIA_HTTP_PORT`),
+    // run the backend server instead of the interactive console. This is what the
+    // PWA front end talks to: it kicks off the same two-pass thought sequence via
+    // `engine::Engine` and returns the reply over HTTP/WebSocket. Without those
+    // vars the program keeps its default console behaviour, so the CLI tests and
+    // the hand-driven walk-through are unchanged.
+    if let Some(addr) = server::http_addr_from_env() {
+        return run_server(&addr);
+    }
+
     // --- 1. Set up the flow steps and the I/O streams ----------------------
     // The flow module owns the eleven blocks; `main` just drives them in order.
     let steps = flow::steps();
@@ -129,7 +148,7 @@ fn main() -> ExitCode {
     // `writeln!` can fail if stdout is closed; treat that as a fatal error.
     if writeln!(
         output,
-        "Gaia program flow. Press Esc then Enter at any prompt to quit.",
+        "Gaia program flow. Type 'quit' (or 'exit') then Enter at any prompt to quit.",
     )
     .is_err()
     {
@@ -190,6 +209,32 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // The web-search applet (Brave Search API). It is optional: only built when
+    // a `BRAVE_SEARCH_API_KEY` is configured (env or infra/.env). When present,
+    // LLM Call 1's `actions.json` Web action runs a real search and the query +
+    // results are appended to the Gaia Search History audit log below. In
+    // skeleton mode (no dev LLM client) we leave web search off entirely.
+    let web_search_client = if llm_client.is_some() {
+        web_search::BraveClient::from_env()
+    } else {
+        None
+    };
+    if let Some(brave) = &web_search_client {
+        if writeln!(
+            output,
+            "Web search enabled: Brave Search API at {}.",
+            brave.endpoint(),
+        )
+        .is_err()
+        {
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // Append-only audit log of every web search Gaia runs this session. Logged
+    // only — never embedded or indexed (see search_history::SearchHistory).
+    let mut search_history = search_history::SearchHistory::default();
+
     // --- 4. Run the program-flow loop --------------------------------------
     // Each outer iteration walks all eleven blocks once. We reuse a single
     // input buffer across reads to avoid needless allocations. The most recent
@@ -206,9 +251,20 @@ fn main() -> ExitCode {
     let response_data_context = String::new();
     'flow: loop {
         for (index, step) in steps.iter().enumerate() {
-            // Log the block's exact description, mirroring the diagram.
-            if writeln!(output, "\n=== {} ===", step.title()).is_err()
-                || writeln!(output, "{}", step.description()).is_err()
+            // Log the block's exact description, mirroring the diagram, with rainbow color coding.
+            let color = step_color_code(index);
+            let reset = "\x1b[0m";
+            if writeln!(
+                output,
+                "\n{}{}{} === {} ==={}",
+                color,
+                " ".repeat(0),
+                color,
+                step.title(),
+                reset
+            )
+            .is_err()
+                || writeln!(output, "{}{}{}", color, step.description(), reset).is_err()
             {
                 return ExitCode::FAILURE;
             }
@@ -254,12 +310,18 @@ fn main() -> ExitCode {
                     // Print the full request first: the complete context window
                     // plus the (currently empty) set of attached tools / MCP
                     // servers / skills, so nothing sent to the model is hidden.
+                    // Print the context window in black text on white background.
                     if writeln!(output, "    --- {} request being sent ---", step.title()).is_err()
                     {
                         return ExitCode::FAILURE;
                     }
                     let preview = client.request_preview(&system, &user);
-                    if write!(output, "{preview}").is_err() {
+                    // Print the context window in black text on a white
+                    // background. We style each line individually (see
+                    // print_black_on_white) because terminals reset the
+                    // background at every newline, so a single multiline
+                    // wrapper would only highlight the first line.
+                    if print_black_on_white(&mut output, &preview).is_err() {
                         return ExitCode::FAILURE;
                     }
 
@@ -273,12 +335,29 @@ fn main() -> ExitCode {
                 }
             }
 
+            // Block 3 is LLM Call 1's `actions.json` — the read-only GET actions,
+            // whose `Web` entry is Gaia's web search. When a Brave client is
+            // configured we actually run a search for this turn's input, print
+            // the results, and append them to the Search History audit log. The
+            // query is the user's sentence today; once the executor parses
+            // actions.json it will use the model's chosen query string instead.
+            if index == 3 {
+                if let Some(brave) = &web_search_client {
+                    let query = last_user_input.trim();
+                    if !query.is_empty()
+                        && run_web_search(brave, query, &mut search_history, &mut output).is_err()
+                    {
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+
             // The first block (User) prompts for input; every other block just
             // waits for Enter before moving to the next part of the flow.
             let prompt = if index == 0 {
                 "Your input> "
             } else {
-                "Press Enter to continue (Esc to quit)> "
+                "Press Enter to continue (type 'quit' to exit)> "
             };
             if write!(output, "{prompt}").is_err() || output.flush().is_err() {
                 return ExitCode::FAILURE;
@@ -300,8 +379,12 @@ fn main() -> ExitCode {
                 last_user_input = line.trim().to_string();
             }
 
-            // Esc anywhere in the line ends the whole loop, not just this block.
-            if line.contains(ESC) {
+            // Quitting works two ways. A bare Esc keystroke is unreliable in a
+            // line-buffered terminal (the shell's line editor swallows it), so
+            // we also accept a typed quit word. Either ends the whole loop, not
+            // just this block.
+            let trimmed = line.trim();
+            if line.contains(ESC) || is_quit_word(trimmed) {
                 break 'flow;
             }
         }
@@ -312,6 +395,86 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// Run the backend HTTP/WebSocket server, blocking until it stops.
+///
+/// Builds the turn [`engine::Engine`] from the same environment the console app
+/// uses (so dev mode, the model, and web search are configured identically),
+/// then serves the PWA front end on `addr`. Returns [`ExitCode::FAILURE`] only if
+/// the listener cannot be bound; per-connection errors are isolated inside the
+/// server and never bring it down.
+fn run_server(addr: &str) -> ExitCode {
+    // Build the engine and surface any non-fatal configuration warning (e.g. dev
+    // mode requested but the model is misconfigured) before we start serving.
+    let (engine, warning) = engine::Engine::from_env();
+    if let Some(warning) = warning {
+        eprintln!("engine configuration warning: {warning}");
+    }
+
+    let server = server::Server::new(engine);
+    match server.serve(addr) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("failed to start Gaia backend on {addr}: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run one web search through the Brave client, print the results, and append
+/// them to the Search History audit log.
+///
+/// This is the live implementation of LLM Call 1's `Web` GET action. A failed
+/// search is *non-fatal*: we print the error (so the walk-through shows what
+/// went wrong, e.g. a missing/expired key) and still log the attempt with no
+/// results, exactly as a degraded turn would. Only an I/O error writing to
+/// `out` is propagated, matching the rest of `main`.
+fn run_web_search(
+    client: &web_search::BraveClient,
+    query: &str,
+    history: &mut search_history::SearchHistory,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    writeln!(out, "    --- web search (Brave) ---")?;
+    writeln!(out, "    query   : {query}")?;
+
+    // Default result count (the executor will pass the action's `top` later).
+    let results = match client.search(query, 0) {
+        Ok(results) => results,
+        Err(err) => {
+            // Degrade gracefully: report the failure and log an empty result set
+            // so the audit trail still records that a search was attempted.
+            writeln!(out, "    error   : {err}")?;
+            Vec::new()
+        }
+    };
+
+    if results.is_empty() {
+        writeln!(out, "    results : (none)")?;
+    } else {
+        writeln!(out, "    results : {}", results.len())?;
+        for (rank, result) in results.iter().enumerate() {
+            writeln!(
+                out,
+                "      {}. {} \u{2014} {}",
+                rank + 1,
+                result.title,
+                result.url
+            )?;
+        }
+    }
+
+    // Append to the append-only audit log (logged only, never embedded).
+    history.record(prompt::now_rfc3339(), query, results);
+    writeln!(
+        out,
+        "    logged  : Search History now holds {} entr{}",
+        history.len(),
+        if history.len() == 1 { "y" } else { "ies" },
+    )?;
+
+    Ok(())
 }
 
 /// Narrate one block's *intended* runtime behaviour to `out`.
@@ -399,12 +562,13 @@ fn narrate(index: usize, out: &mut impl Write) -> io::Result<()> {
             )?;
             writeln!(
                 out,
-                "    [intended] Log every web search + its results to the Gaia Search History (search_history::SearchHistory) \
-                 for audit only \u{2014} logging, no embedding.",
+                "    [live] Web search is wired: when BRAVE_SEARCH_API_KEY is set, the Web action calls the Brave \
+                 Search API (web_search::BraveClient) and logs the query + results to the Gaia Search History \
+                 (search_history::SearchHistory) for audit only — logging, no embedding.",
             )?;
             writeln!(
                 out,
-                "    [TODO] Deserialize into actions::ActionsFile, validate user isolation, then dispatch the reads.",
+                "    [TODO] Deserialize into actions::ActionsFile, validate user isolation, then dispatch the index reads.",
             )?;
         }
         // 4. analysis.json — Call 1's read of the user.
@@ -529,4 +693,86 @@ fn narrate(index: usize, out: &mut impl Write) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Print text line-by-line in black on white background.
+///
+/// Some terminals handle multiline ANSI wrappers inconsistently. Applying the
+/// style per line makes the context-window formatting deterministic.
+fn print_black_on_white(out: &mut impl Write, text: &str) -> io::Result<()> {
+    for line in text.lines() {
+        writeln!(out, "\x1b[30;47m{line}\x1b[0m")?;
+    }
+
+    // Preserve a trailing blank line if the original text ended with '\n'.
+    if text.ends_with('\n') {
+        writeln!(out, "\x1b[30;47m\x1b[0m")?;
+    }
+
+    Ok(())
+}
+
+/// Return `true` if a line of input is a typed request to quit the flow.
+///
+/// A bare Esc keystroke is unreliable in a line-buffered terminal because the
+/// shell's line editor swallows it before the program ever sees the control
+/// character. Accepting a typed word gives the user a quit path that always
+/// works regardless of terminal mode. We compare against a small set of common
+/// quit words, case-insensitively, after trimming surrounding whitespace (the
+/// caller passes an already-trimmed slice, but we stay robust).
+fn is_quit_word(line: &str) -> bool {
+    matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "quit" | "exit" | "q"
+    )
+}
+
+/// Return the ANSI color code for a flow step's output, cycling through rainbow colors.
+///
+/// The eleven steps are colored as follows:
+/// 0. User — Red
+/// 1. Gaia Context — Orange (bright yellow)
+/// 2. LLM Call 1 — Yellow
+/// 3. actions.json (Call 1) — Green
+/// 4. analysis.json — Cyan
+/// 5. facts.json — Blue
+/// 6. newContext.json — Magenta
+/// 7. Response Data Context — Bright Red
+/// 8. LLM Call 2 — Bright Green
+/// 9. actions.json (Call 2) — Bright Cyan
+/// 10. response.json — Bright Magenta
+fn step_color_code(index: usize) -> &'static str {
+    match index {
+        0 => "\x1b[31m",  // Red
+        1 => "\x1b[93m",  // Bright Yellow (Orange)
+        2 => "\x1b[33m",  // Yellow
+        3 => "\x1b[32m",  // Green
+        4 => "\x1b[36m",  // Cyan
+        5 => "\x1b[34m",  // Blue
+        6 => "\x1b[35m",  // Magenta
+        7 => "\x1b[91m",  // Bright Red
+        8 => "\x1b[92m",  // Bright Green
+        9 => "\x1b[96m",  // Bright Cyan
+        10 => "\x1b[95m", // Bright Magenta
+        _ => "\x1b[0m",   // Default (reset) for any other index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_quit_words_case_insensitively() {
+        for word in ["quit", "QUIT", "Exit", "  q  ", "eXiT"] {
+            assert!(is_quit_word(word), "{word:?} should be a quit word");
+        }
+    }
+
+    #[test]
+    fn ordinary_input_is_not_a_quit_word() {
+        for word in ["", "hello", "quitter", "exits", "question"] {
+            assert!(!is_quit_word(word), "{word:?} should not be a quit word");
+        }
+    }
 }

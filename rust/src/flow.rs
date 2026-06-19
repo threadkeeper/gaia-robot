@@ -67,13 +67,14 @@ world, save humanity intelligence and people.\n\nContext from Cosmos max 100k",
             description: "LLM Call 1\nAnalyze the question and output\n\
 actions.json {}\nanalysis.json {}\nfacts.json {}\nnewContext.json {}",
         },
-        // 4. actions.json produced by LLM Call 1 — the read-only GET actions.
+        // 4. actions.json produced by LLM Call 1 — the seven read-only GET searches.
+        //    These mirror the diagram's GET block exactly: q1..q7, one per source.
         FlowStep {
             title: "actions.json",
             description: "actions.json\nGET\nWeb / value\n\
-users dl semantic Index name / value\nusers kb semantic Index name / value\n\
-gaia kb semantic Index name / value\ngaia lh logical Index name / value\n\
-gaia cosmos index named / value",
+users data lake Index / value\nusers kb semantic / value\n\
+gaia data lake Index / value\ngaia kb semantic / value\n\
+gaia diary semantic / value\ngaia connections log / value",
         },
         // 5. analysis.json produced by LLM Call 1.
         FlowStep {
@@ -103,13 +104,15 @@ intention / value",
 actions.json\nresponse.json",
         },
         // 10. actions.json produced by LLM Call 2 — the side-effecting POST actions.
+        //     Per the diagram: deliver messages / actuate, then UPDATE DATABASES
+        //     with write-backs mirroring the six store-backed GET sources.
         FlowStep {
             title: "actions.json",
-            description: "actions.json\nPOST\nSearch Web / value\n\
-users dl semantic Index name / value\nusers kb semantic Index name / value\n\
-gaia kb semantic Index name / value\ngaia lh logical Index name / value\n\
-gaia cosmos index named / value\nsend WhatsApp / value\nsend Push / value\n\
-actuate / value\nconnection / value",
+            description: "actions.json\nPOST\nsend WhatsApp / value\n\
+send Push / value\nactuate / value\nUPDATE DATABASES\n\
+users data lake Index / value\nusers kb semantic / value\n\
+gaia data lake Index / value\ngaia kb semantic / value\n\
+gaia diary semantic / value\ngaia connections log / value",
         },
         // 11. response.json delivered back to the user, closing the loop.
         FlowStep {
@@ -171,20 +174,34 @@ mod tests {
     }
 
     #[test]
-    fn call_one_actions_are_read_only_gets() {
-        // Block 3 is the GET (pull) action list emitted by LLM Call 1.
+    fn call_one_actions_are_the_seven_read_only_get_searches() {
+        // Block 3 is the GET (pull) action list emitted by LLM Call 1. The latest
+        // physical architecture specifies EXACTLY seven searches, q1..q7, one per
+        // retrieval source, in this order.
         let get_actions = &steps()[3];
         let description = get_actions.description();
         assert!(description.contains("GET"));
-        assert!(description.contains("gaia cosmos index named / value"));
+        for source in [
+            "Web / value",
+            "users data lake Index / value",
+            "users kb semantic / value",
+            "gaia data lake Index / value",
+            "gaia kb semantic / value",
+            "gaia diary semantic / value",
+            "gaia connections log / value",
+        ] {
+            assert!(description.contains(source), "missing GET search: {source}");
+        }
+        // The two header lines ("actions.json", "GET") are followed by exactly
+        // seven search lines — no more, no fewer.
+        assert_eq!(description.lines().skip(2).count(), 7);
         // Side-effecting actions belong to the Call 2 POST block, not here.
         assert!(!description.contains("send WhatsApp"));
         assert!(!description.contains("actuate"));
-        assert!(!description.contains("connection"));
     }
 
     #[test]
-    fn call_two_actions_post_side_effects_including_connection() {
+    fn call_two_actions_post_side_effects_then_update_databases() {
         // Block 9 is the POST (push) action list emitted by LLM Call 2.
         let post_actions = &steps()[9];
         let description = post_actions.description();
@@ -192,6 +209,10 @@ mod tests {
         assert!(description.contains("send WhatsApp / value"));
         assert!(description.contains("send Push / value"));
         assert!(description.contains("actuate / value"));
-        assert!(description.contains("connection / value"));
+        // The latest design folds the write-backs under an UPDATE DATABASES
+        // header that mirrors the store-backed retrieval sources.
+        assert!(description.contains("UPDATE DATABASES"));
+        assert!(description.contains("gaia diary semantic / value"));
+        assert!(description.contains("gaia connections log / value"));
     }
 }

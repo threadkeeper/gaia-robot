@@ -1,6 +1,7 @@
-// This contract module is fully modeled but not yet wired into `main`'s loop;
-// allow dead_code until the search-history log is written to at runtime (mirrors
-// the other not-yet-wired contract modules such as `connection` and `storage`).
+// This contract module is now wired into `main`'s loop: LLM Call 1's `Web`
+// action records each search here via `record`. Some convenience accessors
+// (`recent`, `is_empty`, ...) are still unused, so keep the module-level
+// allow to avoid dead_code churn until the executor consumes the full log.
 #![allow(dead_code)]
 
 //! The **Gaia Search History**: a simple, append-only log of Gaia's web

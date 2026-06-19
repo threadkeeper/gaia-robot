@@ -1,0 +1,6 @@
+build/
+.svelte-kit/
+package/
+dev-dist/
+package-lock.json
+*.svg

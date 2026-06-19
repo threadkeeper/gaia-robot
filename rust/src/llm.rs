@@ -1,8 +1,19 @@
 //! The [`LlmClient`] type: a minimal client for Gaia's two "LLM Call" blocks.
 //!
-//! In **dev / local mode** Gaia talks to the GitHub Models inference endpoint
-//! (`gpt-4o-mini` by default), authenticated with a GitHub token. This lets us
-//! exercise the LLM steps of the flow without provisioning any Azure resources.
+//! In **dev / local mode** Gaia talks to one of two chat-completions backends,
+//! chosen automatically from the environment:
+//!
+//! - **Azure Foundry model-router** (preferred). When `FOUNDRY_ENDPOINT` and
+//!   `MODEL_ROUTER_DEPLOYMENT` are set, the client targets the same
+//!   `model-router` deployment the deployed Container App calls, so dev and prod
+//!   exercise the identical model. Authentication uses the Foundry **API key**
+//!   from `FOUNDRY_API_KEY` by default (sent in the Azure OpenAI `api-key`
+//!   header), with an Azure AD bearer token from `FOUNDRY_AAD_TOKEN` as a
+//!   fallback (mint one with
+//!   `az account get-access-token --resource https://cognitiveservices.azure.com`).
+//! - **GitHub Models** (fallback, `gpt-4o-mini` by default). Used when Foundry
+//!   is not configured, so the LLM steps still run without any Azure resources.
+//!   Authenticated with a GitHub token.
 //!
 //! The mode is **opt-in** so the default skeleton behaviour (and the CLI tests)
 //! stay unchanged: set `GAIA_MODE=dev` (or `local`) to enable live calls.
@@ -10,11 +21,17 @@
 //! logging each block.
 //!
 //! Configuration is read from the environment, falling back to a local `.env`
-//! file for convenience (so the token in `infra/.env` "just works" in dev):
-//! - `GITHUB_TOKEN` — auth token (required when dev mode is enabled).
-//! - `GAIA_LLM_ENDPOINT` — override the chat-completions URL.
-//! - `GAIA_LLM_MODEL` — override the model name.
-//! - `GAIA_ENV_FILE` — explicit path to a `.env` file to read the token from.
+//! file for convenience (so the values in `infra/.env` "just work" in dev):
+//! - `GITHUB_TOKEN` — GitHub Models auth token (required for the fallback).
+//! - `FOUNDRY_ENDPOINT` — Foundry account endpoint, e.g.
+//!   `https://<account>.cognitiveservices.azure.com/`.
+//! - `MODEL_ROUTER_DEPLOYMENT` — the chat deployment name (e.g. `model-router`).
+//! - `FOUNDRY_API_KEY` — Foundry API key (preferred auth, `api-key` header).
+//! - `FOUNDRY_AAD_TOKEN` — Azure AD bearer token (fallback auth) for the Foundry call.
+//! - `FOUNDRY_API_VERSION` — override the Azure OpenAI data-plane API version.
+//! - `GAIA_LLM_ENDPOINT` — override the GitHub Models chat-completions URL.
+//! - `GAIA_LLM_MODEL` — override the GitHub Models model name.
+//! - `GAIA_ENV_FILE` — explicit path to a `.env` file to read values from.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -26,18 +43,26 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_ENDPOINT: &str = "https://models.github.ai/inference/chat/completions";
 /// Default model used for dev/local testing.
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
+/// Default Azure OpenAI data-plane API version used for the Foundry
+/// model-router chat call. Overridable with `FOUNDRY_API_VERSION`.
+const DEFAULT_FOUNDRY_API_VERSION: &str = "2024-10-21";
 /// Default GitHub user id used for user isolation in dev/local mode when
 /// `GAIA_USER_ID` is not set. Matches the `threadkeeper` exports under
 /// `migrations/`, so dev runs are scoped to that user's real data out of the box.
 const DEFAULT_USER_ID: &str = "threadkeeper";
-/// Conservative cap on response length so dev testing stays cheap and fast.
-const DEFAULT_MAX_TOKENS: u32 = 512;
+/// Cap on response length. Set to the model-router's maximum output token
+/// limit (32768) so we don't truncate completions; the router bills only for
+/// tokens actually produced, so a high ceiling costs nothing on short replies.
+const DEFAULT_MAX_TOKENS: u32 = 32_768;
 
 /// Errors that can occur while configuring or calling the LLM.
 #[derive(Debug)]
 pub enum LlmError {
     /// Dev mode is enabled but no GitHub token could be found.
     MissingToken,
+    /// The Foundry model-router is configured (endpoint + deployment) but no
+    /// credential (API key or Azure AD token) was found to authenticate the call.
+    MissingFoundryToken,
     /// The HTTP request failed or returned a non-success status.
     Http(String),
     /// The response body could not be decoded into the expected shape.
@@ -53,6 +78,12 @@ impl fmt::Display for LlmError {
                 f,
                 "no GitHub token found (set GITHUB_TOKEN or put it in infra/.env)"
             ),
+            LlmError::MissingFoundryToken => write!(
+                f,
+                "no Azure Foundry credential found (set FOUNDRY_API_KEY, or an \
+                 Azure AD token in FOUNDRY_AAD_TOKEN, e.g. \
+                 `az account get-access-token --resource https://cognitiveservices.azure.com`)"
+            ),
             LlmError::Http(msg) => write!(f, "LLM request failed: {msg}"),
             LlmError::Decode(msg) => write!(f, "could not decode LLM response: {msg}"),
             LlmError::EmptyResponse => write!(f, "LLM returned an empty response"),
@@ -61,6 +92,20 @@ impl fmt::Display for LlmError {
 }
 
 impl std::error::Error for LlmError {}
+
+/// How a credential is presented to the chat-completions endpoint.
+///
+/// Azure Foundry / Azure OpenAI accepts an API key in a dedicated `api-key`
+/// header, while GitHub Models (and Foundry's Azure AD fallback) use the
+/// standard `Authorization: Bearer` header. The client records which scheme its
+/// token uses so [`LlmClient::complete`] sets the correct header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthScheme {
+    /// Azure-style `api-key: <key>` header (Foundry API-key auth, the default).
+    ApiKey,
+    /// Standard `Authorization: Bearer <token>` header (GitHub Models, AAD).
+    Bearer,
+}
 
 /// A minimal, immutable client for a single chat-completions endpoint.
 ///
@@ -73,23 +118,40 @@ pub struct LlmClient {
     endpoint: String,
     /// Model name sent in the request body, e.g. `gpt-4o-mini`.
     model: String,
-    /// Bearer token used for the `Authorization` header.
+    /// Secret used to authenticate (an API key or a bearer token).
     token: String,
+    /// Which HTTP header carries [`Self::token`].
+    auth: AuthScheme,
 }
 
 impl LlmClient {
     /// Build a client from the environment, or return `Ok(None)` when dev/local
     /// LLM mode is not enabled.
     ///
+    /// When dev mode is on, the Azure Foundry model-router is preferred (so dev
+    /// and prod call the same model); it is used whenever `FOUNDRY_ENDPOINT` and
+    /// `MODEL_ROUTER_DEPLOYMENT` are configured. Otherwise the client falls back
+    /// to GitHub Models for a zero-Azure dev loop.
+    ///
     /// Returns:
     /// - `Ok(None)` when `GAIA_MODE` is not `dev`/`local` (skeleton behaviour).
-    /// - `Ok(Some(client))` when dev mode is on and a token was resolved.
-    /// - `Err(LlmError::MissingToken)` when dev mode is on but no token exists.
+    /// - `Ok(Some(client))` when dev mode is on and a backend was resolved.
+    /// - `Err(LlmError::MissingFoundryToken)` when Foundry is configured but no
+    ///   Azure AD token was found.
+    /// - `Err(LlmError::MissingToken)` when falling back to GitHub Models but no
+    ///   GitHub token exists.
     pub fn from_env() -> Result<Option<Self>, LlmError> {
         if !dev_mode_enabled() {
             return Ok(None);
         }
 
+        // Prefer the Azure Foundry model-router when it is configured. This is
+        // the same deployment the deployed Container App calls.
+        if let Some(client) = Self::foundry_from_env()? {
+            return Ok(Some(client));
+        }
+
+        // Otherwise fall back to GitHub Models (token-only dev setups).
         let token = resolve_token().ok_or(LlmError::MissingToken)?;
         let endpoint =
             std::env::var("GAIA_LLM_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
@@ -99,6 +161,39 @@ impl LlmClient {
             endpoint,
             model,
             token,
+            // GitHub Models uses the standard bearer header.
+            auth: AuthScheme::Bearer,
+        }))
+    }
+
+    /// Build a client targeting the Azure Foundry model-router, or `Ok(None)`
+    /// when Foundry is not configured for this dev run.
+    ///
+    /// Foundry is selected when both `FOUNDRY_ENDPOINT` and
+    /// `MODEL_ROUTER_DEPLOYMENT` are present. When they are, a credential is
+    /// required: the `FOUNDRY_API_KEY` is preferred (sent in the `api-key`
+    /// header), falling back to an Azure AD token in `FOUNDRY_AAD_TOKEN` (sent
+    /// as a bearer token). If neither is set the call returns
+    /// `Err(MissingFoundryToken)`. The chat-completions URL is built from the
+    /// endpoint, the deployment name, and the (overridable) API version; the
+    /// deployment name doubles as the `model` field sent in the request body.
+    fn foundry_from_env() -> Result<Option<Self>, LlmError> {
+        let api_version = value_from_env("FOUNDRY_API_VERSION")
+            .unwrap_or_else(|| DEFAULT_FOUNDRY_API_VERSION.to_string());
+
+        let config = resolve_foundry_config(
+            value_from_env("FOUNDRY_ENDPOINT"),
+            value_from_env("MODEL_ROUTER_DEPLOYMENT"),
+            api_version,
+            value_from_env("FOUNDRY_API_KEY"),
+            value_from_env("FOUNDRY_AAD_TOKEN"),
+        )?;
+
+        Ok(config.map(|(endpoint, model, token, auth)| Self {
+            endpoint,
+            model,
+            token,
+            auth,
         }))
     }
 
@@ -124,11 +219,16 @@ impl LlmClient {
         // already depend on.
         let payload = serde_json::to_vec(&body).map_err(|e| LlmError::Decode(e.to_string()))?;
 
-        let response = ureq::post(&self.endpoint)
-            .set("Authorization", &format!("Bearer {}", self.token))
-            .set("Content-Type", "application/json")
-            .send_bytes(&payload)
-            .map_err(map_ureq_error)?;
+        // Choose the authentication header based on the credential scheme:
+        // Foundry API keys go in the Azure `api-key` header, while bearer tokens
+        // (GitHub Models, Foundry AAD) use the standard `Authorization` header.
+        let request = ureq::post(&self.endpoint).set("Content-Type", "application/json");
+        let request = match self.auth {
+            AuthScheme::ApiKey => request.set("api-key", &self.token),
+            AuthScheme::Bearer => request.set("Authorization", &format!("Bearer {}", self.token)),
+        };
+
+        let response = request.send_bytes(&payload).map_err(map_ureq_error)?;
 
         let text = response
             .into_string()
@@ -198,6 +298,56 @@ impl LlmClient {
 /// when dev/local mode is enabled.
 pub fn is_llm_call(title: &str) -> bool {
     title == "LLM Call 1" || title == "LLM Call 2"
+}
+
+/// Decide the Foundry client configuration from resolved environment values.
+///
+/// Returns:
+/// - `Ok(None)` when Foundry is not configured (no endpoint or no deployment),
+///   so the caller can fall back to GitHub Models.
+/// - `Ok(Some((url, deployment, token, auth)))` when fully configured. The
+///   `api_key` is preferred (presented via the `api-key` header); an Azure AD
+///   token in `aad_token` is the fallback (presented as a bearer token).
+/// - `Err(LlmError::MissingFoundryToken)` when the endpoint and deployment are
+///   set but neither a key nor a token was found.
+///
+/// Splitting the pure decision out of [`LlmClient::foundry_from_env`] keeps the
+/// branching logic easy to test without touching the process environment.
+fn resolve_foundry_config(
+    endpoint: Option<String>,
+    deployment: Option<String>,
+    api_version: String,
+    api_key: Option<String>,
+    aad_token: Option<String>,
+) -> Result<Option<(String, String, String, AuthScheme)>, LlmError> {
+    // Foundry only kicks in when we know *where* to call and *which* deployment.
+    let (Some(endpoint), Some(deployment)) = (endpoint, deployment) else {
+        return Ok(None);
+    };
+
+    // Once Foundry is selected, a credential is mandatory: failing loudly is
+    // better than silently falling back to a different model. Prefer the API
+    // key (the default for local dev), then the Azure AD token.
+    let (token, auth) = if let Some(key) = api_key {
+        (key, AuthScheme::ApiKey)
+    } else if let Some(aad) = aad_token {
+        (aad, AuthScheme::Bearer)
+    } else {
+        return Err(LlmError::MissingFoundryToken);
+    };
+
+    let url = foundry_chat_url(&endpoint, &deployment, &api_version);
+    Ok(Some((url, deployment, token, auth)))
+}
+
+/// Build the Azure OpenAI chat-completions URL for a Foundry deployment.
+///
+/// The shape is
+/// `{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={ver}`.
+/// Any trailing slash on `endpoint` is trimmed so we never produce a double `//`.
+fn foundry_chat_url(endpoint: &str, deployment: &str, api_version: &str) -> String {
+    let base = endpoint.trim_end_matches('/');
+    format!("{base}/openai/deployments/{deployment}/chat/completions?api-version={api_version}")
 }
 
 /// Resolve the GitHub user id used for user isolation in dev/local mode.
@@ -431,6 +581,105 @@ mod tests {
     }
 
     #[test]
+    fn foundry_chat_url_builds_the_azure_openai_path() {
+        let expected = "https://acct.cognitiveservices.azure.com/openai/deployments/\
+                        model-router/chat/completions?api-version=2024-10-21";
+        // A trailing slash on the endpoint must not produce a double `//`.
+        assert_eq!(
+            foundry_chat_url(
+                "https://acct.cognitiveservices.azure.com/",
+                "model-router",
+                "2024-10-21"
+            ),
+            expected
+        );
+        // And it works identically without the trailing slash.
+        assert_eq!(
+            foundry_chat_url(
+                "https://acct.cognitiveservices.azure.com",
+                "model-router",
+                "2024-10-21"
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn resolve_foundry_config_returns_none_when_not_configured() {
+        // Missing deployment -> not configured.
+        let none_deployment = resolve_foundry_config(
+            Some("https://acct.cognitiveservices.azure.com/".to_string()),
+            None,
+            "2024-10-21".to_string(),
+            Some("key".to_string()),
+            Some("token".to_string()),
+        )
+        .unwrap();
+        assert!(none_deployment.is_none());
+
+        // Missing endpoint -> not configured.
+        let none_endpoint = resolve_foundry_config(
+            None,
+            Some("model-router".to_string()),
+            "2024-10-21".to_string(),
+            Some("key".to_string()),
+            Some("token".to_string()),
+        )
+        .unwrap();
+        assert!(none_endpoint.is_none());
+    }
+
+    #[test]
+    fn resolve_foundry_config_requires_a_credential_when_configured() {
+        let err = resolve_foundry_config(
+            Some("https://acct.cognitiveservices.azure.com/".to_string()),
+            Some("model-router".to_string()),
+            "2024-10-21".to_string(),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, LlmError::MissingFoundryToken));
+    }
+
+    #[test]
+    fn resolve_foundry_config_prefers_the_api_key() {
+        // When both are present, the API key wins and uses the `api-key` header.
+        let (url, deployment, token, auth) = resolve_foundry_config(
+            Some("https://acct.cognitiveservices.azure.com/".to_string()),
+            Some("model-router".to_string()),
+            "2024-10-21".to_string(),
+            Some("the-api-key".to_string()),
+            Some("aad-token".to_string()),
+        )
+        .unwrap()
+        .expect("fully configured Foundry should yield a config");
+
+        assert_eq!(deployment, "model-router");
+        assert_eq!(token, "the-api-key");
+        assert_eq!(auth, AuthScheme::ApiKey);
+        assert!(url.contains("/openai/deployments/model-router/chat/completions"));
+        assert!(url.contains("api-version=2024-10-21"));
+    }
+
+    #[test]
+    fn resolve_foundry_config_falls_back_to_the_aad_token() {
+        // With no API key, the Azure AD token is used as a bearer credential.
+        let (_url, _deployment, token, auth) = resolve_foundry_config(
+            Some("https://acct.cognitiveservices.azure.com/".to_string()),
+            Some("model-router".to_string()),
+            "2024-10-21".to_string(),
+            None,
+            Some("aad-token".to_string()),
+        )
+        .unwrap()
+        .expect("a token-only Foundry config should still resolve");
+
+        assert_eq!(token, "aad-token");
+        assert_eq!(auth, AuthScheme::Bearer);
+    }
+
+    #[test]
     fn parse_dotenv_reads_keys_skips_comments_and_strips_quotes() {
         let contents = "\
 # a comment\n\
@@ -495,13 +744,14 @@ COSMOS_ENDPOINT=https://example.documents.azure.com:443/\n\
             endpoint: "https://example/inference".to_string(),
             model: "gpt-4o-mini".to_string(),
             token: "ghp_super_secret".to_string(),
+            auth: AuthScheme::Bearer,
         };
 
         let preview = client.request_preview("SYSTEM-CONTEXT", "USER-INPUT");
 
         // Wire parameters are shown.
         assert!(preview.contains("model        : gpt-4o-mini"));
-        assert!(preview.contains("max_tokens   : 512"));
+        assert!(preview.contains("max_tokens   : 32768"));
         // Attachments are explicitly none.
         assert!(preview.contains("tools        : none attached"));
         assert!(preview.contains("functions    : none attached"));
