@@ -56,10 +56,13 @@
 
 // Each module holds exactly one primary type plus its tests.
 mod actions;
+mod auth;
 mod base64;
 mod connection;
+mod cosmos;
 mod diary;
 mod engine;
+mod executor;
 mod flow;
 mod http_request;
 mod http_response;
@@ -246,9 +249,45 @@ fn main() -> ExitCode {
     // do not build it yet, so for now it is threaded through empty.
     let conversation_history = String::new();
     // The Response Data Context handed to LLM Call 2. It is assembled by
-    // executing LLM Call 1's read-only actions; that executor is not wired yet,
-    // so for now it is threaded through empty (Call2Prompt fills a placeholder).
-    let response_data_context = String::new();
+    // executing LLM Call 1's read-only actions against Cosmos (see
+    // `run_pull_actions` below) and is empty until that first pull pass runs.
+    let mut response_data_context = String::new();
+
+    // The Cosmos client that executes LLM Call 1's authored read-only queries.
+    // Built only in dev/local mode and only when Cosmos is configured; without
+    // it the pull pass is skipped and Call 2 simply receives an empty context,
+    // exactly as a degraded turn would. Configuration problems are non-fatal.
+    let cosmos_client = if llm_client.is_some() {
+        match cosmos::CosmosClient::from_env() {
+            Ok(Some(client)) => {
+                if writeln!(
+                    output,
+                    "Cosmos enabled: pull queries run against {}.",
+                    client.endpoint()
+                )
+                .is_err()
+                {
+                    return ExitCode::FAILURE;
+                }
+                Some(client)
+            }
+            Ok(None) => None,
+            Err(err) => {
+                if writeln!(
+                    output,
+                    "Cosmos requested but not configured: {err}. Pull pass disabled.",
+                )
+                .is_err()
+                {
+                    return ExitCode::FAILURE;
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     'flow: loop {
         for (index, step) in steps.iter().enumerate() {
             // Log the block's exact description, mirroring the diagram, with rainbow color coding.
@@ -325,12 +364,29 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
 
-                    let rendered = match client.complete(&system, &user) {
+                    let completion = client.complete(&system, &user);
+                    let rendered = match &completion {
                         Ok(reply) => format!("[{} via {}]\n{reply}", step.title(), client.model()),
                         Err(err) => format!("[{} failed] {err}", step.title()),
                     };
                     if writeln!(output, "{rendered}").is_err() {
                         return ExitCode::FAILURE;
+                    }
+
+                    // After LLM Call 1 (the pull pass) succeeds, execute the
+                    // read-only Cosmos queries it authored and assemble the
+                    // Response Data Context that LLM Call 2 will consume. Web
+                    // actions are skipped here — they are run by the Brave applet
+                    // in block 3 below. The pull pass only runs when a Cosmos
+                    // client is configured; otherwise the context stays empty.
+                    if step.title() == "LLM Call 1" {
+                        if let (Ok(reply), Some(cosmos)) = (&completion, &cosmos_client) {
+                            let (context, log) = run_pull_actions(cosmos, reply);
+                            if writeln!(output, "{log}").is_err() {
+                                return ExitCode::FAILURE;
+                            }
+                            response_data_context = context;
+                        }
                     }
                 }
             }
@@ -412,7 +468,11 @@ fn run_server(addr: &str) -> ExitCode {
         eprintln!("engine configuration warning: {warning}");
     }
 
-    let server = server::Server::new(engine);
+    // Auth manager: live Google sign-in when GOOGLE_CLIENT_ID is set,
+    // otherwise dev-auth (Bearer dev:<name>).
+    let auth = auth::Auth::from_env();
+
+    let server = server::Server::new(engine, auth);
     match server.serve(addr) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -475,6 +535,183 @@ fn run_web_search(
     )?;
 
     Ok(())
+}
+
+/// Approximate character budget for the Response Data Context.
+///
+/// Token budgets are easiest to enforce at the character level (~4 chars per
+/// token is a safe over-estimate). We cap the assembled pull results at this
+/// many characters so the context handed to LLM Call 2 stays well within its
+/// [`context_budget::RESPONSE_DATA_CONTEXT`] token slice (requirement 3: the
+/// returned data must be small enough for Call 2 to consume comfortably).
+const RESPONSE_DATA_CONTEXT_CHAR_CAP: usize = context_budget::RESPONSE_DATA_CONTEXT * 4;
+
+/// Maximum characters of any single record's payload kept in the context.
+///
+/// Individual records are trimmed so one chatty document cannot crowd out the
+/// others; the model only needs a representative snippet to reason over.
+const RECORD_SNIPPET_CHAR_CAP: usize = 600;
+
+/// Execute LLM Call 1's authored read-only queries and assemble the Response
+/// Data Context for LLM Call 2.
+///
+/// `call1_reply` is the raw model output for Call 1 — a JSON array whose first
+/// element is the `actions.json` document. We parse it, drop the `Web` action
+/// (run separately by the Brave applet), run the remaining queries against
+/// Cosmos, and fold the results into a compact, bounded context string.
+///
+/// Returns `(context, log)`: the context handed to Call 2, and a human-readable
+/// log of what was planned and retrieved (printed during the walk-through). A
+/// failure to parse or a per-action error is captured in the log and never
+/// aborts the turn — a degraded pull simply yields a smaller context.
+fn run_pull_actions(cosmos: &cosmos::CosmosClient, call1_reply: &str) -> (String, String) {
+    let mut log = String::from("    --- executing LLM Call 1 pull queries against Cosmos ---\n");
+
+    // Parse the actions.json document out of Call 1's output.
+    let actions = match parse_actions_from_call1(call1_reply) {
+        Some(actions) => actions,
+        None => {
+            log.push_str("    could not parse actions.json from Call 1 output; skipping pull.\n");
+            return (String::new(), log);
+        }
+    };
+
+    // Keep only the Cosmos-backed actions; the Web action is handled elsewhere.
+    let cosmos_actions = cosmos_actions_of(&actions);
+    if cosmos_actions.is_empty() {
+        log.push_str("    no Cosmos pull actions in this turn.\n");
+        return (String::new(), log);
+    }
+
+    // Show the exact SQL each action will run (the authored `query` field).
+    log.push_str(&describe_authored_queries(&cosmos_actions));
+
+    // Run the queries. The executor truncates each result to the action's
+    // `top`, and the Cosmos client caps items per request, so the volume is
+    // bounded before we ever assemble the context.
+    let filtered = actions::ActionsFile {
+        version: actions.version.clone(),
+        session: actions.session.clone(),
+        actions: cosmos_actions,
+    };
+    let outcomes = executor::Executor::new(cosmos).run(&filtered);
+
+    // Fold the outcomes into a compact, bounded context plus a run log.
+    let (context, outcome_log) = summarize_pull_outcomes(&outcomes);
+    log.push_str(&outcome_log);
+    (context, log)
+}
+
+/// Select the Cosmos-backed actions from an action plan.
+///
+/// The `Web` action is dropped — it is served by the Brave applet, not Cosmos —
+/// and every remaining action is returned in order.
+fn cosmos_actions_of(actions: &actions::ActionsFile) -> Vec<actions::ActionPlan> {
+    actions
+        .actions
+        .iter()
+        .filter(|action| !action.target.eq_ignore_ascii_case("Web"))
+        .cloned()
+        .collect()
+}
+
+/// Render the exact SQL each action will run as an indented log block.
+///
+/// Each line shows the action id, its target container, and either the planned
+/// SQL or the reason no query could be planned, so the authored `query` field
+/// is visible during the walk-through.
+fn describe_authored_queries(actions: &[actions::ActionPlan]) -> String {
+    let mut log = String::new();
+    for action in actions {
+        match executor::plan_for(action) {
+            Ok(planned) => {
+                log.push_str(&format!(
+                    "    [{}] {} :: {}\n",
+                    action.id, action.target, planned.sql
+                ));
+            }
+            Err(err) => {
+                log.push_str(&format!(
+                    "    [{}] {} :: (no query: {err})\n",
+                    action.id, action.target
+                ));
+            }
+        }
+    }
+    log
+}
+
+/// Fold executed action outcomes into `(context, log)`.
+///
+/// `context` is the bounded Response Data Context for LLM Call 2 — one block per
+/// action with each record trimmed to a snippet, the whole thing capped to the
+/// budget (requirement 3). `log` mirrors what happened for the walk-through.
+fn summarize_pull_outcomes(outcomes: &[executor::ActionOutcome]) -> (String, String) {
+    let mut context = String::new();
+    let mut log = String::new();
+    for outcome in outcomes {
+        match &outcome.result {
+            Ok(records) => {
+                log.push_str(&format!(
+                    "    [{}] returned {} record(s)\n",
+                    outcome.id,
+                    records.len()
+                ));
+                context.push_str(&format!(
+                    "## {} ({} record(s))\n",
+                    outcome.id,
+                    records.len()
+                ));
+                for record in records {
+                    let snippet = truncate_chars(record.data.trim(), RECORD_SNIPPET_CHAR_CAP);
+                    context.push_str(&format!(
+                        "- {} [{}]: {}\n",
+                        record.business_key(),
+                        record.date,
+                        snippet,
+                    ));
+                }
+            }
+            Err(err) => {
+                log.push_str(&format!("    [{}] error: {err}\n", outcome.id));
+                context.push_str(&format!("## {} (error)\n{err}\n", outcome.id));
+            }
+        }
+    }
+    // Final guard: keep the whole context within its budget (requirement 3).
+    (
+        truncate_chars(&context, RESPONSE_DATA_CONTEXT_CHAR_CAP),
+        log,
+    )
+}
+
+/// Extract the `actions.json` document from LLM Call 1's raw reply.
+///
+/// Call 1 emits a JSON array of four documents; the first is `actions.json`. We
+/// locate the array by its outer brackets (tolerating any code fences or stray
+/// prose around it), parse it, and deserialize element 0 into an
+/// [`actions::ActionsFile`]. Returns `None` if anything about that shape is off,
+/// so the caller can degrade gracefully rather than fail the turn.
+fn parse_actions_from_call1(call1_reply: &str) -> Option<actions::ActionsFile> {
+    let start = call1_reply.find('[')?;
+    let end = call1_reply.rfind(']')?;
+    let json = call1_reply.get(start..=end)?;
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let first = value.as_array()?.first()?;
+    serde_json::from_value(first.clone()).ok()
+}
+
+/// Truncate `text` to at most `max` characters, appending an ellipsis marker
+/// when anything was dropped.
+///
+/// Counting and slicing by `char` keeps us on UTF-8 boundaries so we never panic
+/// on multi-byte text.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max).collect();
+    format!("{kept}…(truncated)")
 }
 
 /// Narrate one block's *intended* runtime behaviour to `out`.
@@ -774,5 +1011,174 @@ mod tests {
         for word in ["", "hello", "quitter", "exits", "question"] {
             assert!(!is_quit_word(word), "{word:?} should not be a quit word");
         }
+    }
+
+    #[test]
+    fn narrate_describes_every_flow_block() {
+        // Blocks 0..=10 each emit at least one `[intended]` narration line; the
+        // out-of-range index is a clean no-op. We capture into a buffer so the
+        // narration is exercised without a real terminal.
+        for index in 0..=10 {
+            let mut buffer = Vec::new();
+            narrate(index, &mut buffer).expect("narration writes to the buffer");
+            let text = String::from_utf8(buffer).expect("narration is valid UTF-8");
+            assert!(
+                text.contains("[intended]"),
+                "block {index} should narrate intended behaviour"
+            );
+        }
+
+        // Any index past the known blocks narrates nothing and still succeeds.
+        let mut buffer = Vec::new();
+        narrate(99, &mut buffer).expect("unknown block is a no-op");
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn step_color_code_is_distinct_per_block_and_resets_otherwise() {
+        // Each of the eleven blocks has its own colour; unknown indices reset.
+        let codes: Vec<&str> = (0..=10).map(step_color_code).collect();
+        let unique: std::collections::BTreeSet<&str> = codes.iter().copied().collect();
+        assert_eq!(unique.len(), 11, "every block colour should be distinct");
+        assert_eq!(step_color_code(42), "\x1b[0m");
+    }
+
+    #[test]
+    fn print_black_on_white_styles_each_line_and_keeps_trailing_blank() {
+        let mut buffer = Vec::new();
+        print_black_on_white(&mut buffer, "one\ntwo\n").expect("write to buffer");
+        let text = String::from_utf8(buffer).expect("styled output is UTF-8");
+        // Both content lines are styled.
+        assert!(text.contains("\x1b[30;47mone\x1b[0m"));
+        assert!(text.contains("\x1b[30;47mtwo\x1b[0m"));
+        // The trailing newline preserves one extra styled blank line.
+        assert_eq!(text.matches("\x1b[0m").count(), 3);
+    }
+
+    #[test]
+    fn truncate_chars_keeps_short_text_verbatim() {
+        // Text within the limit is returned unchanged and unmarked.
+        assert_eq!(truncate_chars("hello", 10), "hello");
+        assert_eq!(truncate_chars("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_chars_trims_long_text_on_char_boundaries() {
+        // Over-long text is cut to `max` chars with a marker appended. Using a
+        // multi-byte string proves we never split inside a UTF-8 scalar.
+        let trimmed = truncate_chars("élan vital", 4);
+        assert_eq!(trimmed, "élan…(truncated)");
+        assert_eq!(trimmed.chars().take(4).collect::<String>(), "élan");
+    }
+
+    #[test]
+    fn parse_actions_from_call1_extracts_the_first_document() {
+        // Call 1 emits an array of documents; element 0 is actions.json. We
+        // wrap it in code fences and prose to prove the bracket-scan is robust.
+        let reply = r#"Here you go:
+```json
+[
+  {"version":"1.0",
+   "session":{"user_id":"u1","requested_at":"2026-06-16T12:00:00Z"},
+   "actions":[{"id":"q1","kind":"query","target":"GaiaLH","entity":"threadkeeper",
+     "intent":"recent","top":3,
+     "query":"SELECT TOP 3 c.id FROM c WHERE c.entity = @pk","filters":{}}]},
+  {"analysis":true},{"facts":[]},{"newContext":""}
+]
+```
+thanks"#;
+
+        let parsed = parse_actions_from_call1(reply).expect("should parse actions.json");
+        assert_eq!(parsed.actions.len(), 1);
+        assert_eq!(parsed.actions[0].target, "GaiaLH");
+        assert_eq!(
+            parsed.actions[0].authored_query(),
+            Some("SELECT TOP 3 c.id FROM c WHERE c.entity = @pk")
+        );
+    }
+
+    #[test]
+    fn parse_actions_from_call1_returns_none_for_malformed_output() {
+        // No JSON array, or a first element that is not an actions document.
+        assert!(parse_actions_from_call1("no json here").is_none());
+        assert!(parse_actions_from_call1("[123, 456]").is_none());
+    }
+
+    /// Build a minimal action for the pull-helper tests.
+    fn action(id: &str, target: &str, query: Option<&str>) -> actions::ActionPlan {
+        actions::ActionPlan {
+            id: id.to_string(),
+            kind: "query".to_string(),
+            target: target.to_string(),
+            user_id: None,
+            entity: Some("threadkeeper".to_string()),
+            intent: "recent".to_string(),
+            top: 3,
+            query: query.map(str::to_string),
+            filters: actions::ActionFilters::default(),
+        }
+    }
+
+    #[test]
+    fn cosmos_actions_of_drops_the_web_action() {
+        let file = actions::ActionsFile {
+            version: "1.0".to_string(),
+            session: actions::SessionContext::default(),
+            actions: vec![
+                action("q1", "Web", None),
+                action("q2", "GaiaLH", None),
+                action("q3", "UsersDL", None),
+            ],
+        };
+
+        let kept = cosmos_actions_of(&file);
+        let ids: Vec<&str> = kept.iter().map(|a| a.id.as_str()).collect();
+        // Web is removed; the Cosmos-backed actions are kept in order.
+        assert_eq!(ids, ["q2", "q3"]);
+    }
+
+    #[test]
+    fn describe_authored_queries_shows_the_sql_per_action() {
+        let sql = "SELECT TOP 3 c.id FROM c WHERE c.entity = @pk";
+        let log = describe_authored_queries(&[action("q1", "GaiaLH", Some(sql))]);
+        assert!(log.contains("[q1] GaiaLH ::"));
+        assert!(log.contains(sql));
+    }
+
+    #[test]
+    fn summarize_pull_outcomes_formats_records_and_errors() {
+        let record = storage::Record::new(
+            "GaiaLH|threadkeeper|2026-05-10",
+            "threadkeeper",
+            "",
+            "2026-05-10",
+            storage::RecordKind::DataLake,
+            "  discussed the robot's adventures in nature  ",
+            Vec::new(),
+        );
+
+        let outcomes = vec![
+            executor::ActionOutcome {
+                id: "q1".to_string(),
+                result: Ok(vec![record]),
+            },
+            executor::ActionOutcome {
+                id: "q2".to_string(),
+                result: Err("partition not found".to_string()),
+            },
+        ];
+
+        let (context, log) = summarize_pull_outcomes(&outcomes);
+        // The successful action contributes a header, the record's business key,
+        // date, and trimmed snippet.
+        assert!(context.contains("## q1 (1 record(s))"));
+        assert!(context.contains("threadkeeper [2026-05-10]"));
+        assert!(context.contains("discussed the robot's adventures in nature"));
+        // The failed action is reported as an error block, not dropped.
+        assert!(context.contains("## q2 (error)"));
+        assert!(context.contains("partition not found"));
+        // The log mirrors both outcomes.
+        assert!(log.contains("[q1] returned 1 record(s)"));
+        assert!(log.contains("[q2] error: partition not found"));
     }
 }
