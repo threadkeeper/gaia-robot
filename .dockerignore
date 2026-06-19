@@ -1,0 +1,25 @@
+# Keep the Docker build context small and free of build outputs / secrets.
+# Only rust/ source is needed to build the backend image.
+
+# Rust build outputs (huge).
+**/target
+
+# Front-end deps and build outputs (not part of the backend image).
+web/node_modules
+web/build
+web/.svelte-kit
+
+# Git metadata.
+.git
+.github
+
+# Local environment / secrets — never ship these into an image.
+**/.env
+infra/.env
+**/*.log
+logs
+
+# Migration data exports.
+migrations/**/conversations
+migrations/**/diary
+migrations/**/kb

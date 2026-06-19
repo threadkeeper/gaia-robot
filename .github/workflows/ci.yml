@@ -98,3 +98,70 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           manifest-path: rust/Cargo.toml
+
+  # Continuous deployment: build the backend image and roll it out to the Azure
+  # Container App. Runs only on pushes to main, and only after every quality
+  # gate above has passed, so we never ship a red build.
+  deploy:
+    name: Build & Deploy to Azure
+    runs-on: ubuntu-latest
+    needs: [quality, coverage, supply-chain]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # CD steps operate on the whole repo (the Dockerfile lives at the root), not
+    # the rust/ subfolder the other jobs default to.
+    defaults:
+      run:
+        working-directory: .
+    # OIDC: request a federated token for azure/login; no client secret stored.
+    permissions:
+      id-token: write
+      contents: read
+    environment:
+      name: production
+      url: https://${{ steps.deploy.outputs.fqdn }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure containerapp CLI extension
+        run: az extension add --name containerapp --upgrade --only-show-errors
+
+      - name: Build & push image in ACR
+        # ACR Tasks builds the image server-side and pushes it, so the runner
+        # needs no Docker. Tag with the commit SHA (immutable) and latest.
+        run: |
+          az acr build \
+            --registry "${{ vars.ACR_NAME }}" \
+            --image "${{ vars.IMAGE_NAME }}:${{ github.sha }}" \
+            --image "${{ vars.IMAGE_NAME }}:latest" \
+            --file Dockerfile .
+
+      - name: Deploy image to Container App
+        id: deploy
+        run: |
+          az containerapp update \
+            --name "${{ vars.CONTAINERAPP_NAME }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --image "${{ vars.ACR_NAME }}.azurecr.io/${{ vars.IMAGE_NAME }}:${{ github.sha }}"
+          fqdn=$(az containerapp show \
+            --name "${{ vars.CONTAINERAPP_NAME }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "fqdn=$fqdn" >> "$GITHUB_OUTPUT"
+          echo "Deployed to https://$fqdn"
+
+      - name: Smoke test /healthz
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS "https://${{ steps.deploy.outputs.fqdn }}/healthz" >/dev/null; then
+              echo "healthz OK"; exit 0
+            fi
+            echo "waiting for new revision... ($i)"; sleep 5
+          done
+          echo "healthz did not become ready in time"; exit 1
