@@ -47,6 +47,8 @@ pub struct Record {
     #[serde(skip)]
     pub kind: RecordKind,
     /// The record's text payload; its embedding lives at `/dataVector`.
+    /// Defaults to empty when absent (some containers omit it).
+    #[serde(default)]
     pub data: String,
     /// The embedding of `data`, stored and DiskANN-indexed at Cosmos path
     /// `/dataVector`. Empty until an embedding has been computed.

@@ -475,13 +475,23 @@ fn wants_data_retrieval_test() -> bool {
     })
 }
 
+/// Parse an optional 1-based question number after the subcommand name.
+///
+/// Usage: `gaia-robot test-data-retrieval [N]` where N is 1–5.
+/// Returns `None` when no number is given (run all questions).
+fn parse_question_number() -> Option<usize> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // The subcommand name is args[0]; the optional question number is args[1].
+    args.get(1).and_then(|s| s.parse::<usize>().ok())
+}
+
 /// Run the data-retrieval self-test and map its result to an exit code.
 ///
 /// Builds the probe from the environment (the same dev/local configuration the
-/// rest of the program uses), runs all five questions, and returns
-/// [`ExitCode::SUCCESS`] only when every question passed. A configuration
-/// problem (no model, etc.) or any retrieval failure returns
-/// [`ExitCode::FAILURE`] so CI halts before deploying.
+/// rest of the program uses), runs all five questions (or just one when a
+/// question number is given), and returns [`ExitCode::SUCCESS`] only when every
+/// executed question passed. A configuration problem (no model, etc.) or any
+/// retrieval failure returns [`ExitCode::FAILURE`] so CI halts before deploying.
 fn run_data_retrieval_test() -> ExitCode {
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -496,7 +506,10 @@ fn run_data_retrieval_test() -> ExitCode {
         }
     };
 
-    match probe.run(&mut out) {
+    let only = parse_question_number();
+    // Write artifacts to tests/q1..q5 so humans can review the JSON files.
+    let tests_dir = std::path::Path::new("../tests");
+    match probe.run(only, Some(tests_dir), &mut out) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         // An I/O error writing the report is itself a failure.

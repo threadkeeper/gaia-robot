@@ -26,6 +26,7 @@
 //! the same `GAIA_MODE=dev` setup as the rest of the dev/local code paths.
 
 use std::io::{self, Write};
+use std::path::Path;
 
 use crate::actions::{ActionPlan, ActionsFile, SessionContext};
 use crate::cosmos::CosmosClient;
@@ -120,6 +121,55 @@ impl QuestionMetrics {
     }
 }
 
+/// Raw artifacts collected during a single probe question, written to disk for
+/// human review and debugging.
+struct ProbeArtifacts {
+    /// The raw LLM Call 1 reply, before parsing.
+    raw_reply: Option<String>,
+    /// The parsed actions.json document (element 0 of the Call 1 array).
+    actions: Option<ActionsFile>,
+    /// Per-action retrieval results keyed by `(action_id, container)`.
+    results: Vec<(String, String, Vec<serde_json::Value>)>,
+}
+
+impl ProbeArtifacts {
+    fn empty() -> Self {
+        Self {
+            raw_reply: None,
+            actions: None,
+            results: Vec::new(),
+        }
+    }
+
+    /// Write the artifacts as pretty-printed JSON files into `dir`.
+    ///
+    /// Creates the directory if it does not exist. Overwrites any existing files.
+    fn write_to(&self, dir: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+
+        if let Some(reply) = &self.raw_reply {
+            let path = dir.join("reply.json");
+            let pretty = pretty_print_reply(reply);
+            std::fs::write(&path, pretty)?;
+        }
+
+        if let Some(actions) = &self.actions {
+            let path = dir.join("actions.json");
+            let json = serde_json::to_string_pretty(actions).unwrap_or_default();
+            std::fs::write(&path, json)?;
+        }
+
+        for (action_id, container, records) in &self.results {
+            let filename = format!("{action_id}_{container}.json");
+            let path = dir.join(filename);
+            let json = serde_json::to_string_pretty(records).unwrap_or_default();
+            std::fs::write(&path, json)?;
+        }
+
+        Ok(())
+    }
+}
+
 /// Runs the data-retrieval self-test end to end.
 ///
 /// Holds the live model client (always required) plus the optional Cosmos and
@@ -163,12 +213,20 @@ impl DataRetrievalProbe {
         Ok(Self { llm, cosmos, web })
     }
 
-    /// Run all five probe questions, write a report to `out`, and return whether
-    /// the whole self-test passed.
+    /// Run probe questions, write a report to `out`, and return whether the
+    /// self-test passed.
     ///
-    /// The boolean is the gate: `true` only when every question succeeded. The
-    /// caller maps it to the process exit code.
-    pub fn run(&self, out: &mut impl Write) -> io::Result<bool> {
+    /// When `only` is `Some(n)`, run only question `n` (1-based). When `None`,
+    /// run all five. When `output_dir` is set, write pretty-printed JSON
+    /// artifacts into `output_dir/q1/`, `output_dir/q2/`, etc. The boolean is
+    /// the gate: `true` only when every executed question succeeded. The caller
+    /// maps it to the process exit code.
+    pub fn run(
+        &self,
+        only: Option<usize>,
+        output_dir: Option<&Path>,
+        out: &mut impl Write,
+    ) -> io::Result<bool> {
         writeln!(out, "Gaia data-retrieval self-test")?;
         writeln!(out, "  user_id : {PROBE_USER_ID}")?;
         writeln!(
@@ -195,11 +253,40 @@ impl DataRetrievalProbe {
         )?;
         writeln!(out)?;
 
+        // Decide which questions to run.
+        let questions: Vec<(usize, &str)> = match only {
+            Some(n) if n >= 1 && n <= PROBE_QUESTIONS.len() => {
+                vec![(n - 1, PROBE_QUESTIONS[n - 1])]
+            }
+            Some(n) => {
+                writeln!(
+                    out,
+                    "ERROR: question {n} does not exist (1–{}).",
+                    PROBE_QUESTIONS.len()
+                )?;
+                return Ok(false);
+            }
+            None => PROBE_QUESTIONS.iter().copied().enumerate().collect(),
+        };
+
         // Probe each question in turn, collecting its metrics for the summary.
-        let mut all = Vec::with_capacity(PROBE_QUESTIONS.len());
-        for (index, question) in PROBE_QUESTIONS.iter().enumerate() {
+        let mut all = Vec::with_capacity(questions.len());
+        for (index, question) in &questions {
             writeln!(out, "[{}/{}] {question}", index + 1, PROBE_QUESTIONS.len())?;
-            let metrics = self.probe_one(question);
+            let (metrics, artifacts) = self.probe_one(question);
+
+            // Write artifacts to disk when an output directory is configured.
+            if let Some(dir) = output_dir {
+                let q_dir = dir.join(format!("q{}", index + 1));
+                if let Err(err) = artifacts.write_to(&q_dir) {
+                    writeln!(
+                        out,
+                        "      - warning: could not write artifacts to {}: {err}",
+                        q_dir.display()
+                    )?;
+                }
+            }
+
             // Echo the per-question outcome immediately so a long run shows progress.
             for note in &metrics.notes {
                 writeln!(out, "      - {note}")?;
@@ -229,7 +316,10 @@ impl DataRetrievalProbe {
     /// parsed, and **every** retrieval it attempted succeeded. Any model error,
     /// parse failure, missing-but-needed client, or query error fails the
     /// question (with an explanatory note) but never aborts the other questions.
-    fn probe_one(&self, question: &str) -> QuestionMetrics {
+    ///
+    /// Returns the metrics **and** the raw artifacts so the caller can write
+    /// them to disk for human review.
+    fn probe_one(&self, question: &str) -> (QuestionMetrics, ProbeArtifacts) {
         let mut metrics = QuestionMetrics {
             question: question.to_string(),
             llm_ok: false,
@@ -244,6 +334,7 @@ impl DataRetrievalProbe {
             success: false,
             notes: Vec::new(),
         };
+        let mut artifacts = ProbeArtifacts::empty();
 
         // --- LLM Call 1: ask the model what to retrieve -------------------
         let requested_at = now_rfc3339();
@@ -252,10 +343,11 @@ impl DataRetrievalProbe {
             Ok(reply) => reply,
             Err(err) => {
                 metrics.notes.push(format!("LLM Call 1 failed: {err}"));
-                return metrics;
+                return (metrics, artifacts);
             }
         };
         metrics.llm_ok = true;
+        artifacts.raw_reply = Some(reply.clone());
 
         // --- Parse actions.json out of the reply --------------------------
         let actions = match crate::actions::parse_call1_actions(&reply) {
@@ -267,9 +359,10 @@ impl DataRetrievalProbe {
                 metrics
                     .notes
                     .push(format!("raw LLM reply:\n{}", pretty_print_reply(&reply)));
-                return metrics;
+                return (metrics, artifacts);
             }
         };
+        artifacts.actions = Some(actions.clone());
         metrics.actions_parsed = actions.actions.len();
         if actions.actions.is_empty() {
             // The model decided no data retrieval is needed (e.g. a simple
@@ -278,7 +371,7 @@ impl DataRetrievalProbe {
                 .notes
                 .push("no retrieval actions (none needed)".to_string());
             metrics.success = true;
-            return metrics;
+            return (metrics, artifacts);
         }
 
         // Split the plan into the Cosmos-backed queries and the Web searches.
@@ -298,6 +391,8 @@ impl DataRetrievalProbe {
                     // Save target names before moving actions into the plan.
                     let targets: Vec<String> =
                         cosmos_actions.iter().map(|a| a.target.clone()).collect();
+                    let action_ids: Vec<String> =
+                        cosmos_actions.iter().map(|a| a.id.clone()).collect();
                     let plan = ActionsFile {
                         version: actions.version.clone(),
                         session: SessionContext {
@@ -307,7 +402,9 @@ impl DataRetrievalProbe {
                         actions: cosmos_actions,
                     };
                     let outcomes = Executor::new(client).run(&plan);
-                    for (target, outcome) in targets.iter().zip(outcomes.iter()) {
+                    for ((target, action_id), outcome) in
+                        targets.iter().zip(action_ids.iter()).zip(outcomes.iter())
+                    {
                         match &outcome.result {
                             Ok(records) => {
                                 let rows = records.len();
@@ -315,6 +412,14 @@ impl DataRetrievalProbe {
                                 metrics.cosmos_rows += rows;
                                 metrics.cosmos_bytes += bytes;
                                 metrics.record_container(target, rows, bytes);
+                                // Collect result artifacts as generic JSON values.
+                                let values: Vec<serde_json::Value> = records
+                                    .iter()
+                                    .filter_map(|r| serde_json::to_value(r).ok())
+                                    .collect();
+                                artifacts
+                                    .results
+                                    .push((action_id.clone(), target.clone(), values));
                             }
                             Err(err) => {
                                 all_ok = false;
@@ -349,6 +454,16 @@ impl DataRetrievalProbe {
                                 metrics.web_rows += rows;
                                 metrics.web_bytes += bytes;
                                 metrics.record_container("Web", rows, bytes);
+                                // Collect Brave results as generic JSON values.
+                                let values: Vec<serde_json::Value> = results
+                                    .iter()
+                                    .filter_map(|r| serde_json::to_value(r).ok())
+                                    .collect();
+                                artifacts.results.push((
+                                    action.id.clone(),
+                                    "Web".to_string(),
+                                    values,
+                                ));
                             }
                             Err(err) => {
                                 all_ok = false;
@@ -372,7 +487,7 @@ impl DataRetrievalProbe {
         // A question is a success only when the model replied, something was
         // retrieved, and no attempted retrieval errored.
         metrics.success = metrics.llm_ok && metrics.actions_parsed > 0 && all_ok;
-        metrics
+        (metrics, artifacts)
     }
 }
 

@@ -147,6 +147,13 @@
       "metadata": {
         "description": "Brave Web Search API endpoint the app calls. Injected as BRAVE_SEARCH_ENDPOINT. The default is the public Brave Search endpoint and rarely needs changing."
       }
+    },
+    "ciServicePrincipalId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Object ID of the CI/CD service principal (e.g. the GitHub Actions OIDC app) that needs Cosmos DB data-plane access for the data-retrieval self-test. When set, the template assigns the Cosmos DB Built-in Data Contributor role to this principal. Leave empty to skip."
+      }
     }
   },
   "variables": {
@@ -217,6 +224,20 @@
         "resource": {
           "id": "[parameters('databaseName')]"
         }
+      }
+    },
+    {
+      "type": "Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments",
+      "apiVersion": "2024-11-15",
+      "name": "[concat(parameters('accountName'), '/', guid(parameters('accountName'), parameters('ciServicePrincipalId'), 'data-contributor'))]",
+      "condition": "[not(empty(parameters('ciServicePrincipalId')))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('accountName'))]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[resourceId('Microsoft.DocumentDB/databaseAccounts/sqlRoleDefinitions', parameters('accountName'), '00000000-0000-0000-0000-000000000002')]",
+        "principalId": "[parameters('ciServicePrincipalId')]",
+        "scope": "[resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('accountName'))]"
       }
     },
     {

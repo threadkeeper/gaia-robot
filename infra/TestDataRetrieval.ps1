@@ -46,6 +46,9 @@
 #>
 [CmdletBinding()]
 param(
+    ## Run only this question number (1–5). Omit to run all five.
+    [ValidateRange(1, 5)]
+    [int]$Question,
     [switch]$SkipTokens,
     [switch]$Release
 )
@@ -165,10 +168,13 @@ Write-Host ""
 
 Push-Location $rustDir
 try {
+    $subArgs = @('test-data-retrieval')
+    if ($Question) { $subArgs += $Question.ToString() }
+
     if ($Release) {
-        cargo run --release --quiet -- test-data-retrieval
+        cargo run --release --quiet -- @subArgs
     } else {
-        cargo run --quiet -- test-data-retrieval
+        cargo run --quiet -- @subArgs
     }
     $exitCode = $LASTEXITCODE
 } finally {
