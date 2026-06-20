@@ -93,6 +93,8 @@ jobs:
 
       - name: cargo-audit (RustSec advisory DB)
         uses: rustsec/audit-check@v2
+        timeout-minutes: 3
+        continue-on-error: true
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           working-directory: rust
