@@ -110,7 +110,8 @@ jobs:
   #   secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID (OIDC, as
   #            used by deploy), FOUNDRY_API_KEY, BRAVE_SEARCH_API_KEY
   #   vars:    FOUNDRY_ENDPOINT, MODEL_ROUTER_DEPLOYMENT, COSMOS_ENDPOINT
-  #            (optional: COSMOS_DATABASE, FOUNDRY_API_VERSION)
+  #            (optional: COSMOS_DATABASE, FOUNDRY_API_VERSION,
+  #                       EMBEDDING_DEPLOYMENT, EMBEDDING_DIMENSIONS)
   # The OIDC service principal also needs the Cosmos DB Built-in Data Contributor
   # role on the account so the minted AAD token can read items.
   data-retrieval-smoke:
@@ -156,6 +157,10 @@ jobs:
           GAIA_USER_ID: threadkeeper
           FOUNDRY_ENDPOINT: ${{ vars.FOUNDRY_ENDPOINT }}
           MODEL_ROUTER_DEPLOYMENT: ${{ vars.MODEL_ROUTER_DEPLOYMENT }}
+          # Semantic mode needs a query embedding deployment; default to the
+          # repo's standard deployment name if the variable is not set.
+          EMBEDDING_DEPLOYMENT: ${{ vars.EMBEDDING_DEPLOYMENT || 'text-embedding' }}
+          EMBEDDING_DIMENSIONS: ${{ vars.EMBEDDING_DIMENSIONS }}
           FOUNDRY_API_VERSION: ${{ vars.FOUNDRY_API_VERSION }}
           FOUNDRY_API_KEY: ${{ secrets.FOUNDRY_API_KEY }}
           COSMOS_ENDPOINT: ${{ vars.COSMOS_ENDPOINT }}
