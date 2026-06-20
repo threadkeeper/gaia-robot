@@ -30,6 +30,7 @@ use std::path::Path;
 
 use crate::actions::{ActionPlan, ActionsFile, SessionContext};
 use crate::cosmos::CosmosClient;
+use crate::embeddings::EmbeddingClient;
 use crate::executor::Executor;
 use crate::llm::LlmClient;
 use crate::prompt::{now_rfc3339, Call1Prompt};
@@ -45,16 +46,18 @@ const PROBE_USER_ID: &str = "threadkeeper";
 /// so the model authors a spread of retrieval actions (personal recall, durable
 /// facts, fresh web facts, and relationship/diary lookups).
 const PROBE_QUESTIONS: [&str; 5] = [
-    // 1. Very short, everyday.
-    "How are you today?",
+    // 1. Double-barrelled: GaiaKB facts + GaiaDataLake conversation recall.
+    "What do you know about Jonty's hobbies and interests and can you look up what you told \
+     me about hiking recently?",
     // 2. Medium, personal recall (UsersDataLake / GaiaDataLake territory).
     "Remind me what we talked about regarding the robot's adventures in the forest recently.",
     // 3. Long, multi-topic personal synthesis (facts + history).
     "Can you summarise everything you know about my interests in music, books, and the \
      outdoors, note how any of those have shifted over the past month, and tie that back to \
      anything specific from our recent conversations?",
-    // 4. Factual, fresh — should trigger a Web search.
-    "What are the latest developments in Mars exploration this year?",
+    // 4. Web search + GaiaKB opinion recall.
+    "What are the latest developments in Mars exploration this year, and do you believe Mars \
+     was once populated by people? Check your knowledge base for anything you know about Mars.",
     // 5. Relationship / diary lookup.
     "How has our friendship been going lately, and is there anything you noted in your diary \
      about me?",
@@ -143,9 +146,12 @@ impl ProbeArtifacts {
 
     /// Write the artifacts as pretty-printed JSON files into `dir`.
     ///
-    /// Creates the directory if it does not exist. Overwrites any existing files.
+    /// Creates the directory if it does not exist, then removes any existing
+    /// `.json` files in that folder so stale artifacts from earlier runs do not
+    /// leak into the new output.
     fn write_to(&self, dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(dir)?;
+        clear_json_files_in_dir(dir)?;
 
         if let Some(reply) = &self.raw_reply {
             let path = dir.join("reply.json");
@@ -170,6 +176,28 @@ impl ProbeArtifacts {
     }
 }
 
+/// Delete every `.json` file directly inside `dir`.
+fn clear_json_files_in_dir(dir: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let is_json = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("json"))
+            .unwrap_or(false);
+        if is_json {
+            std::fs::remove_file(path)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Runs the data-retrieval self-test end to end.
 ///
 /// Holds the live model client (always required) plus the optional Cosmos and
@@ -180,6 +208,8 @@ pub struct DataRetrievalProbe {
     llm: LlmClient,
     /// The Cosmos client, or `None` when Cosmos is not configured.
     cosmos: Option<CosmosClient>,
+    /// The embedding client used when actions choose semantic mode.
+    embedder: Option<EmbeddingClient>,
     /// The Brave web-search client, or `None` when web search is not configured.
     web: Option<BraveClient>,
 }
@@ -208,9 +238,16 @@ impl DataRetrievalProbe {
 
         let cosmos =
             CosmosClient::from_env().map_err(|err| format!("Cosmos configuration error: {err}"))?;
+        let embedder = EmbeddingClient::from_env()
+            .map_err(|err| format!("Embeddings configuration error: {err}"))?;
         let web = BraveClient::from_env();
 
-        Ok(Self { llm, cosmos, web })
+        Ok(Self {
+            llm,
+            cosmos,
+            embedder,
+            web,
+        })
     }
 
     /// Run probe questions, write a report to `out`, and return whether the
@@ -241,6 +278,15 @@ impl DataRetrievalProbe {
             match &self.cosmos {
                 Some(client) => format!("enabled ({})", client.endpoint()),
                 None => "DISABLED (set COSMOS_ENDPOINT + COSMOS_AAD_TOKEN)".to_string(),
+            }
+        )?;
+        writeln!(
+            out,
+            "  embed   : {}",
+            match &self.embedder {
+                Some(client) => format!("enabled ({})", client.endpoint()),
+                None => "DISABLED (set FOUNDRY_ENDPOINT + EMBEDDING_DEPLOYMENT + credential)"
+                    .to_string(),
             }
         )?;
         writeln!(
@@ -277,7 +323,7 @@ impl DataRetrievalProbe {
 
             // Write artifacts to disk when an output directory is configured.
             if let Some(dir) = output_dir {
-                let q_dir = dir.join(format!("q{}", index + 1));
+                let q_dir = dir.join(format!("t{}", index + 1));
                 if let Err(err) = artifacts.write_to(&q_dir) {
                     writeln!(
                         out,
@@ -307,6 +353,14 @@ impl DataRetrievalProbe {
         let pass = overall_pass(&all);
         writeln!(out)?;
         writeln!(out, "OVERALL: {}", if pass { "PASS" } else { "FAIL" })?;
+
+        // Write a markdown summary file when an output directory is configured.
+        if let Some(dir) = output_dir {
+            if let Err(err) = write_summary_md(dir, &all, pass) {
+                writeln!(out, "warning: could not write TestSummary.md: {err}")?;
+            }
+        }
+
         Ok(pass)
     }
 
@@ -401,7 +455,11 @@ impl DataRetrievalProbe {
                         },
                         actions: cosmos_actions,
                     };
-                    let outcomes = Executor::new(client).run(&plan);
+                    let outcomes = if let Some(embedder) = &self.embedder {
+                        Executor::with_embedder(client, Some(embedder.clone())).run(&plan)
+                    } else {
+                        Executor::new(client).run(&plan)
+                    };
                     for ((target, action_id), outcome) in
                         targets.iter().zip(action_ids.iter()).zip(outcomes.iter())
                     {
@@ -446,6 +504,14 @@ impl DataRetrievalProbe {
             match &self.web {
                 Some(client) => {
                     for action in &web_actions {
+                        if let Err(err) = action.validate() {
+                            all_ok = false;
+                            metrics
+                                .notes
+                                .push(format!("Web action {} failed validation: {err}", action.id));
+                            continue;
+                        }
+
                         let query = web_query_for(action, question);
                         match client.search(&query, action.effective_top()) {
                             Ok(results) => {
@@ -633,6 +699,77 @@ fn overall_pass(metrics: &[QuestionMetrics]) -> bool {
     !metrics.is_empty() && metrics.iter().all(|m| m.success)
 }
 
+/// Write a `TestSummary.md` markdown file into `dir` with a per-question table.
+fn write_summary_md(dir: &Path, metrics: &[QuestionMetrics], pass: bool) -> io::Result<()> {
+    use std::fmt::Write as _;
+
+    let mut md = String::new();
+    let _ = writeln!(md, "# Data-Retrieval Self-Test Summary\n");
+    let _ = writeln!(
+        md,
+        "**Overall: {}**\n",
+        if pass { "PASS ✅" } else { "FAIL ❌" }
+    );
+    let _ = writeln!(
+        md,
+        "| # | Question | LLM | Actions | Containers | Rows | KB | Result |"
+    );
+    let _ = writeln!(
+        md,
+        "|---|----------|-----|---------|------------|------|----|--------|"
+    );
+    for (i, m) in metrics.iter().enumerate() {
+        let containers: String = if m.container_details.is_empty() {
+            "—".to_string()
+        } else {
+            m.container_details
+                .iter()
+                .map(|(name, rows, bytes)| {
+                    format!("{name} ({rows} rows, {:.2} KB)", bytes_to_kb(*bytes))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let result = if m.success { "PASS ✅" } else { "FAIL ❌" };
+        // Truncate question for the table (first 60 chars).
+        let q_display = if m.question.len() > 60 {
+            format!("{}…", &m.question[..60])
+        } else {
+            m.question.clone()
+        };
+        let _ = writeln!(
+            md,
+            "| {} | {} | {} | {} | {} | {} | {:.2} | {} |",
+            i + 1,
+            q_display,
+            if m.llm_ok { "ok" } else { "ERR" },
+            m.actions_parsed,
+            containers,
+            m.total_rows(),
+            m.total_kb(),
+            result,
+        );
+    }
+
+    // Notes section for any failures.
+    let has_notes = metrics.iter().any(|m| !m.notes.is_empty());
+    if has_notes {
+        let _ = writeln!(md, "\n## Notes\n");
+        for (i, m) in metrics.iter().enumerate() {
+            if !m.notes.is_empty() {
+                let _ = writeln!(md, "**Q{}:**", i + 1);
+                for note in &m.notes {
+                    let _ = writeln!(md, "- {note}");
+                }
+                let _ = writeln!(md);
+            }
+        }
+    }
+
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("TestSummary.md"), md)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,7 +781,7 @@ mod tests {
             id: "q1".to_string(),
             kind: "query".to_string(),
             target: target.to_string(),
-            user_id: None,
+            user_id: Some(PROBE_USER_ID.to_string()),
             entity: Some(PROBE_USER_ID.to_string()),
             intent: intent.to_string(),
             top: 3,
@@ -754,5 +891,48 @@ mod tests {
         // One PASS row and one FAIL row.
         assert!(table.contains("PASS"));
         assert!(table.contains("FAIL"));
+    }
+
+    #[test]
+    fn write_to_clears_stale_json_files_before_writing_new_artifacts() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gaia_data_retrieval_probe_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&dir).expect("temp artifact directory should be created");
+
+        std::fs::write(dir.join("stale.json"), "{\"stale\":true}")
+            .expect("stale json should be written");
+        std::fs::write(dir.join("keep.txt"), "keep me")
+            .expect("non-json marker file should be written");
+
+        let artifacts = ProbeArtifacts {
+            raw_reply: Some("{\"message\":\"hello\"}".to_string()),
+            actions: Some(ActionsFile {
+                version: "1.0".to_string(),
+                session: SessionContext {
+                    user_id: PROBE_USER_ID.to_string(),
+                    requested_at: "2026-06-20T00:00:00Z".to_string(),
+                },
+                actions: Vec::new(),
+            }),
+            results: Vec::new(),
+        };
+
+        artifacts
+            .write_to(&dir)
+            .expect("probe artifacts should write successfully");
+
+        assert!(dir.join("reply.json").exists());
+        assert!(dir.join("actions.json").exists());
+        assert!(!dir.join("stale.json").exists());
+        assert!(dir.join("keep.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

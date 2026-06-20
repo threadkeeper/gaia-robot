@@ -8,14 +8,26 @@
 //! retrieved [`Record`]s. This is the **read** half of wiring Cosmos into the
 //! program flow; writes go straight through [`CosmosClient::upsert`].
 //!
-//! Query construction is a pure function ([`plan_to_query`]) so it is fully unit
-//! tested without a network. User-controlled values are always passed as
-//! [`QueryParam`]s (never string-interpolated) to avoid query injection; the
-//! only interpolated value is the integer `TOP` count, which the program owns.
+//! Query construction supports two retrieval modes selected per action:
+//! - `keyword` (`CONTAINS(LOWER(...))`)
+//! - `semantic` (`VectorDistance(...)` with a query-time embedding)
+//!
+//! User-controlled values are always passed as [`QueryParam`]s (never
+//! string-interpolated) to avoid query injection; only program-owned constants
+//! such as `TOP` are interpolated.
 
 use crate::actions::{ActionPlan, ActionsFile};
 use crate::cosmos::{CosmosClient, QueryParam};
+use crate::embeddings::EmbeddingClient;
 use crate::storage::Record;
+
+/// Native Cosmos vector-search options for DiskANN-backed retrieval.
+///
+/// - `bool_expr = false` in `VectorDistance` tells Cosmos to use the index.
+/// - `searchListSizeMultiplier` trades a little RU/latency for better recall.
+/// - `filterPriority` balances vector ranking against the WHERE filter.
+const VECTOR_DISTANCE_OPTIONS: &str =
+    "{distanceFunction:'Cosine',dataType:'Float32',searchListSizeMultiplier:10,filterPriority:0.75}";
 
 /// The outcome of executing one [`ActionPlan`].
 #[derive(Debug, Clone, PartialEq)]
@@ -41,12 +53,21 @@ pub struct PlannedQuery {
 #[derive(Debug, Clone)]
 pub struct Executor<'a> {
     client: &'a CosmosClient,
+    embedder: Option<EmbeddingClient>,
 }
 
 impl<'a> Executor<'a> {
     /// Create an executor that runs against `client`.
     pub fn new(client: &'a CosmosClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            embedder: None,
+        }
+    }
+
+    /// Create an executor that can run semantic queries with `embedder`.
+    pub fn with_embedder(client: &'a CosmosClient, embedder: Option<EmbeddingClient>) -> Self {
+        Self { client, embedder }
     }
 
     /// Execute every action in the plan, returning one outcome per action.
@@ -67,7 +88,7 @@ impl<'a> Executor<'a> {
     /// Validate, plan, and execute a single action.
     fn run_one(&self, action: &ActionPlan) -> Result<Vec<Record>, String> {
         action.validate().map_err(|err| err.to_string())?;
-        let planned = plan_for(action)?;
+        let planned = plan_for(action, self.embedder.as_ref())?;
         let mut records = self
             .client
             .query(
@@ -96,7 +117,10 @@ impl<'a> Executor<'a> {
 /// [`partition_for`] decides the partition value and the Cosmos client pins it
 /// with the partition-key header, so a query can never read another user's or
 /// entity's data.
-pub fn plan_for(action: &ActionPlan) -> Result<PlannedQuery, String> {
+pub fn plan_for(
+    action: &ActionPlan,
+    embedder: Option<&EmbeddingClient>,
+) -> Result<PlannedQuery, String> {
     match action.authored_query() {
         Some(sql) => {
             validate_read_only_query(sql)?;
@@ -109,13 +133,32 @@ pub fn plan_for(action: &ActionPlan) -> Result<PlannedQuery, String> {
                 params.push(QueryParam::new("@pk", partition_value.clone()));
             }
 
+            // If the authored SQL asks for a query vector placeholder, bind it
+            // from the action's semantic text at runtime.
+            if sql.contains("@queryVector") {
+                if !target_supports_semantic(&action.target) {
+                    return Err(format!(
+                        "action '{}' targets {} but semantic mode is not supported there",
+                        action.id, action.target
+                    ));
+                }
+                let semantic_text = semantic_query_text(action).ok_or_else(|| {
+                    format!(
+                        "action '{}' authored @queryVector but provided no semantic/text/intent input",
+                        action.id
+                    )
+                })?;
+                let query_vector = embed_query(embedder, semantic_text)?;
+                params.push(query_vector_param(query_vector));
+            }
+
             Ok(PlannedQuery {
                 partition_value,
                 sql: sql.to_string(),
                 params,
             })
         }
-        None => plan_to_query(action),
+        None => plan_to_query(action, embedder),
     }
 }
 
@@ -152,11 +195,36 @@ fn validate_read_only_query(sql: &str) -> Result<(), String> {
 ///
 /// The partition field follows the container family: `Users*` containers
 /// partition on `userId` (taken from `action.user_id`), everything else on
-/// `entity` (taken from `action.entity`). Optional date-range and free-text
-/// filters are appended as bound parameters. A `semantic` hint is *not* yet
-/// translated into a vector search — that needs an embedding step — so it is
-/// ignored for now.
-pub fn plan_to_query(action: &ActionPlan) -> Result<PlannedQuery, String> {
+/// `entity` (taken from `action.entity`). Optional date-range filters are
+/// appended in both retrieval modes. Text filters are used for keyword mode,
+/// while semantic mode binds a query vector and orders by `VectorDistance`.
+pub fn plan_to_query(
+    action: &ActionPlan,
+    embedder: Option<&EmbeddingClient>,
+) -> Result<PlannedQuery, String> {
+    match mode_for(action)? {
+        RetrievalMode::Keyword => plan_to_keyword_query(action),
+        RetrievalMode::Semantic => {
+            if !target_supports_semantic(&action.target) {
+                return Err(format!(
+                    "action '{}' targets {} but semantic mode is not supported there",
+                    action.id, action.target
+                ));
+            }
+            let semantic_text = semantic_query_text(action).ok_or_else(|| {
+                format!(
+                    "action '{}' requested semantic mode but provided no semantic/text/intent input",
+                    action.id
+                )
+            })?;
+            let query_vector = embed_query(embedder, semantic_text)?;
+            plan_to_semantic_query(action, query_vector)
+        }
+    }
+}
+
+/// Translate an action into a keyword query (`CONTAINS`).
+fn plan_to_keyword_query(action: &ActionPlan) -> Result<PlannedQuery, String> {
     let (partition_field, partition_value) = partition_for(action)?;
 
     let mut params: Vec<QueryParam> = vec![QueryParam::new("@key", partition_value.clone())];
@@ -176,7 +244,8 @@ pub fn plan_to_query(action: &ActionPlan) -> Result<PlannedQuery, String> {
 
     // Optional case-insensitive substring match over the record text.
     if let Some(text) = non_empty(&action.filters.text) {
-        predicates.push("CONTAINS(LOWER(c.data), @text)".to_string());
+        let text_field = keyword_text_field_for(&action.target);
+        predicates.push(format!("CONTAINS(LOWER(c.{text_field}), @text)"));
         params.push(QueryParam::new("@text", text.to_lowercase()));
     }
 
@@ -196,25 +265,147 @@ pub fn plan_to_query(action: &ActionPlan) -> Result<PlannedQuery, String> {
     })
 }
 
+/// Translate an action into a native Cosmos semantic query (`VectorDistance`).
+fn plan_to_semantic_query(
+    action: &ActionPlan,
+    query_vector: Vec<f32>,
+) -> Result<PlannedQuery, String> {
+    let (partition_field, partition_value) = partition_for(action)?;
+
+    let mut params: Vec<QueryParam> = vec![QueryParam::new("@key", partition_value.clone())];
+
+    let mut predicates = vec![format!("c.{partition_field} = @key")];
+    if let Some(from) = non_empty(&action.filters.from_date) {
+        predicates.push("c.date >= @from".to_string());
+        params.push(QueryParam::new("@from", from));
+    }
+    if let Some(to) = non_empty(&action.filters.to_date) {
+        predicates.push("c.date <= @to".to_string());
+        params.push(QueryParam::new("@to", to));
+    }
+    predicates.push("IS_DEFINED(c.dataVector)".to_string());
+    params.push(query_vector_param(query_vector));
+
+    let distance_expr =
+        format!("VectorDistance(c.dataVector, @queryVector, false, {VECTOR_DISTANCE_OPTIONS})");
+
+    let sql = format!(
+        "SELECT TOP {top} c.id, c.entity, c.userId, c.date, c.data, c.dataVector, {distance_expr} AS similarityScore \
+         FROM c WHERE {where_clause} ORDER BY {distance_expr}",
+        top = action.effective_top(),
+        where_clause = predicates.join(" AND "),
+    );
+
+    Ok(PlannedQuery {
+        partition_value,
+        sql,
+        params,
+    })
+}
+
+/// Build a query parameter for a vector embedding.
+fn query_vector_param(vector: Vec<f32>) -> QueryParam {
+    let values = vector
+        .into_iter()
+        .map(|value| serde_json::Value::from(f64::from(value)))
+        .collect::<Vec<_>>();
+    QueryParam::new("@queryVector", serde_json::Value::Array(values))
+}
+
+/// Embed query text using the configured embedder.
+fn embed_query(embedder: Option<&EmbeddingClient>, text: &str) -> Result<Vec<f32>, String> {
+    let embedder = embedder.ok_or_else(|| {
+        "semantic mode needs embeddings, but EMBEDDING_DEPLOYMENT/credentials are not configured"
+            .to_string()
+    })?;
+    embedder.embed(text).map_err(|err| err.to_string())
+}
+
+/// Supported retrieval modes for one action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetrievalMode {
+    Keyword,
+    Semantic,
+}
+
+/// Decide retrieval mode from the action filter contract.
+fn mode_for(action: &ActionPlan) -> Result<RetrievalMode, String> {
+    match non_empty(&action.filters.mode)
+        .unwrap_or("auto")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "keyword" => Ok(RetrievalMode::Keyword),
+        "semantic" => Ok(RetrievalMode::Semantic),
+        "auto" => {
+            if non_empty(&action.filters.semantic).is_some() {
+                Ok(RetrievalMode::Semantic)
+            } else {
+                Ok(RetrievalMode::Keyword)
+            }
+        }
+        other => Err(format!(
+            "unsupported filters.mode '{other}' (expected keyword|semantic|auto)"
+        )),
+    }
+}
+
+/// Resolve the semantic query text in descending preference order.
+fn semantic_query_text(action: &ActionPlan) -> Option<&str> {
+    non_empty(&action.filters.semantic)
+        .or_else(|| non_empty(&action.filters.text))
+        .or_else(|| {
+            let intent = action.intent.trim();
+            if intent.is_empty() {
+                None
+            } else {
+                Some(intent)
+            }
+        })
+}
+
+/// Return whether a target container supports semantic retrieval.
+fn target_supports_semantic(target: &str) -> bool {
+    !target.eq_ignore_ascii_case("GaiaConnections")
+}
+
+/// Return the keyword-search field for a container.
+fn keyword_text_field_for(target: &str) -> &'static str {
+    if target.eq_ignore_ascii_case("GaiaConnections") {
+        "notes"
+    } else {
+        "data"
+    }
+}
+
 /// Decide the partition field + value for an action, or explain why it can't.
 fn partition_for(action: &ActionPlan) -> Result<(&'static str, String), String> {
+    let user_id = non_empty(&action.user_id).ok_or_else(|| {
+        format!(
+            "action '{}' targets {} but has no user_id",
+            action.id, action.target
+        )
+    })?;
+
+    let entity = non_empty(&action.entity).ok_or_else(|| {
+        format!(
+            "action '{}' targets {} but has no entity",
+            action.id, action.target
+        )
+    })?;
+
+    if user_id != entity {
+        return Err(format!(
+            "action '{}' has mismatched user_id '{}' and entity '{}'",
+            action.id, user_id, entity
+        ));
+    }
+
     // `Users*` containers partition on userId; all others on entity.
     if action.target.starts_with("Users") {
-        match non_empty(&action.user_id) {
-            Some(user_id) => Ok(("userId", user_id.to_string())),
-            None => Err(format!(
-                "action '{}' targets {} but has no user_id",
-                action.id, action.target
-            )),
-        }
+        Ok(("userId", user_id.to_string()))
     } else {
-        match non_empty(&action.entity) {
-            Some(entity) => Ok(("entity", entity.to_string())),
-            None => Err(format!(
-                "action '{}' targets {} but has no entity",
-                action.id, action.target
-            )),
-        }
+        Ok(("entity", entity.to_string()))
     }
 }
 
@@ -250,8 +441,9 @@ mod tests {
     fn users_action_partitions_on_user_id_with_default_top() {
         let mut act = action("UsersKB");
         act.user_id = Some("user-1".to_string());
+        act.entity = Some("user-1".to_string());
 
-        let planned = plan_to_query(&act).unwrap();
+        let planned = plan_to_query(&act, None).unwrap();
 
         assert_eq!(planned.partition_value, "user-1");
         assert!(planned.sql.contains("SELECT TOP 3 "));
@@ -263,16 +455,18 @@ mod tests {
     #[test]
     fn gaia_action_partitions_on_entity_and_applies_filters() {
         let mut act = action("GaiaKB");
+        act.user_id = Some("rust".to_string());
         act.entity = Some("rust".to_string());
         act.top = 5;
         act.filters = ActionFilters {
             from_date: Some("2026-06-01".to_string()),
             to_date: Some("2026-06-16".to_string()),
             text: Some("Borrow Checker".to_string()),
-            semantic: Some("ignored for now".to_string()),
+            semantic: None,
+            mode: Some("keyword".to_string()),
         };
 
-        let planned = plan_to_query(&act).unwrap();
+        let planned = plan_to_query(&act, None).unwrap();
 
         assert_eq!(planned.partition_value, "rust");
         assert!(planned.sql.contains("SELECT TOP 5 "));
@@ -291,25 +485,37 @@ mod tests {
 
     #[test]
     fn users_action_without_user_id_is_an_error() {
-        let act = action("UsersDataLake");
-        let err = plan_to_query(&act).unwrap_err();
+        let mut act = action("UsersDataLake");
+        act.entity = Some("user-1".to_string());
+        let err = plan_to_query(&act, None).unwrap_err();
         assert!(err.contains("no user_id"));
     }
 
     #[test]
     fn gaia_action_without_entity_is_an_error() {
-        let act = action("GaiaDiary");
-        let err = plan_to_query(&act).unwrap_err();
+        let mut act = action("GaiaDiary");
+        act.user_id = Some("threadkeeper".to_string());
+        let err = plan_to_query(&act, None).unwrap_err();
         assert!(err.contains("no entity"));
+    }
+
+    #[test]
+    fn mismatched_user_id_and_entity_is_an_error() {
+        let mut act = action("GaiaDiary");
+        act.user_id = Some("threadkeeper".to_string());
+        act.entity = Some("jonty".to_string());
+        let err = plan_to_query(&act, None).unwrap_err();
+        assert!(err.contains("mismatched user_id"));
     }
 
     #[test]
     fn blank_filters_are_dropped() {
         let mut act = action("UsersKB");
         act.user_id = Some("user-1".to_string());
+        act.entity = Some("user-1".to_string());
         act.filters.text = Some("   ".to_string());
 
-        let planned = plan_to_query(&act).unwrap();
+        let planned = plan_to_query(&act, None).unwrap();
 
         // A whitespace-only text filter must not add a CONTAINS predicate.
         assert!(!planned.sql.contains("CONTAINS"));
@@ -319,6 +525,7 @@ mod tests {
     #[test]
     fn plan_for_prefers_the_authored_query_and_binds_the_partition() {
         let mut act = action("GaiaDiary");
+        act.user_id = Some("threadkeeper".to_string());
         act.entity = Some("threadkeeper".to_string());
         act.query = Some(
             "SELECT TOP 3 c.id, c.entity, c.date, c.data FROM c \
@@ -326,7 +533,7 @@ mod tests {
                 .to_string(),
         );
 
-        let planned = plan_for(&act).unwrap();
+        let planned = plan_for(&act, None).unwrap();
 
         // The model's exact SQL is used verbatim.
         assert!(planned.sql.contains("CONTAINS(LOWER(c.data), 'tree')"));
@@ -338,11 +545,12 @@ mod tests {
     #[test]
     fn plan_for_does_not_bind_pk_when_the_query_inlines_the_partition() {
         let mut act = action("GaiaDiary");
+        act.user_id = Some("threadkeeper".to_string());
         act.entity = Some("threadkeeper".to_string());
         // No `@pk` placeholder: the model inlined the partition value itself.
         act.query = Some("SELECT c.id, c.data FROM c WHERE c.entity = 'threadkeeper'".to_string());
 
-        let planned = plan_for(&act).unwrap();
+        let planned = plan_for(&act, None).unwrap();
 
         // Nothing to bind, but the partition value is still resolved for the header.
         assert!(planned.params.is_empty());
@@ -353,8 +561,9 @@ mod tests {
     fn plan_for_falls_back_to_the_built_query_when_none_is_authored() {
         let mut act = action("UsersKB");
         act.user_id = Some("user-1".to_string());
+        act.entity = Some("user-1".to_string());
         // No authored query -> the structured-field builder is used.
-        let planned = plan_for(&act).unwrap();
+        let planned = plan_for(&act, None).unwrap();
         assert!(planned.sql.contains("SELECT TOP 3 "));
         assert!(planned.sql.contains("c.userId = @key"));
     }
@@ -362,19 +571,83 @@ mod tests {
     #[test]
     fn an_authored_non_select_query_is_rejected() {
         let mut act = action("GaiaKB");
+        act.user_id = Some("rust".to_string());
         act.entity = Some("rust".to_string());
         // Even though Cosmos cannot run this, we reject it early and clearly.
         act.query = Some("DELETE FROM c WHERE c.entity = 'rust'".to_string());
-        let err = plan_for(&act).unwrap_err();
+        let err = plan_for(&act, None).unwrap_err();
         assert!(err.contains("SELECT"));
     }
 
     #[test]
     fn an_authored_query_with_multiple_statements_is_rejected() {
         let mut act = action("GaiaKB");
+        act.user_id = Some("rust".to_string());
         act.entity = Some("rust".to_string());
         act.query = Some("SELECT * FROM c; SELECT * FROM c".to_string());
-        let err = plan_for(&act).unwrap_err();
+        let err = plan_for(&act, None).unwrap_err();
         assert!(err.contains("single statement"));
+    }
+
+    #[test]
+    fn semantic_mode_builds_native_vectordistance_query() {
+        let mut act = action("GaiaKB");
+        act.user_id = Some("rust".to_string());
+        act.entity = Some("rust".to_string());
+        act.top = 4;
+        act.filters.mode = Some("semantic".to_string());
+        act.filters.semantic = Some("borrow checker ownership".to_string());
+
+        let planned = plan_to_semantic_query(&act, vec![0.1, 0.2, 0.3]).unwrap();
+
+        assert!(planned.sql.contains("SELECT TOP 4"));
+        assert!(planned
+            .sql
+            .contains("VectorDistance(c.dataVector, @queryVector"));
+        assert!(planned.sql.contains("searchListSizeMultiplier:10"));
+        assert!(planned
+            .sql
+            .contains("ORDER BY VectorDistance(c.dataVector, @queryVector"));
+        assert!(planned.sql.contains("IS_DEFINED(c.dataVector)"));
+        assert_eq!(planned.partition_value, "rust");
+        assert!(planned
+            .params
+            .iter()
+            .any(|param| param.name.eq("@queryVector")));
+    }
+
+    #[test]
+    fn semantic_mode_without_embedder_is_a_clear_error() {
+        let mut act = action("GaiaKB");
+        act.user_id = Some("rust".to_string());
+        act.entity = Some("rust".to_string());
+        act.filters.mode = Some("semantic".to_string());
+        act.filters.semantic = Some("lifetimes".to_string());
+
+        let err = plan_to_query(&act, None).unwrap_err();
+        assert!(err.contains("semantic mode needs embeddings"));
+    }
+
+    #[test]
+    fn gaia_connections_keyword_text_filter_targets_notes() {
+        let mut act = action("GaiaConnections");
+        act.user_id = Some("threadkeeper".to_string());
+        act.entity = Some("threadkeeper".to_string());
+        act.filters.mode = Some("keyword".to_string());
+        act.filters.text = Some("trust".to_string());
+
+        let planned = plan_to_query(&act, None).unwrap();
+        assert!(planned.sql.contains("CONTAINS(LOWER(c.notes), @text)"));
+    }
+
+    #[test]
+    fn invalid_mode_is_rejected() {
+        let mut act = action("GaiaKB");
+        act.user_id = Some("rust".to_string());
+        act.entity = Some("rust".to_string());
+        act.filters.mode = Some("hybrid".to_string());
+
+        let err = plan_to_query(&act, None).unwrap_err();
+        assert!(err.contains("keyword|semantic|auto"));
     }
 }

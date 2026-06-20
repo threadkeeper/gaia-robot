@@ -39,9 +39,15 @@ pub struct ActionPlan {
     pub kind: String,
     /// The target container, such as `UsersKB` or `GaiaKB`.
     pub target: String,
-    /// The user partition for `Users*` containers.
+    /// The user id that scopes this query.
+    ///
+    /// Strict contract: every query action must set this and it must match
+    /// [`ActionPlan::entity`].
     pub user_id: Option<String>,
-    /// The entity or subject to search for, when relevant.
+    /// The entity id this query is scoped to.
+    ///
+    /// Strict contract: every query action must set this and it must match
+    /// [`ActionPlan::user_id`].
     pub entity: Option<String>,
     /// The natural-language intent to translate into a query.
     pub intent: String,
@@ -140,6 +146,11 @@ pub struct ActionFilters {
     pub text: Option<String>,
     /// Semantic hint for similarity or vector-oriented retrieval.
     pub semantic: Option<String>,
+    /// Retrieval mode chosen by the model for this action.
+    ///
+    /// Supported values are `"keyword"`, `"semantic"`, or `"auto"`.
+    /// `None` is treated the same as `"auto"`.
+    pub mode: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -164,7 +175,7 @@ impl ActionPlan {
             .filter(|q| !q.is_empty())
     }
 
-    /// Ensure the action is runnable and user-isolated where required.
+    /// Ensure the action is runnable and user-isolated.
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.kind != "query" {
             return Err("kind must be 'query'");
@@ -178,10 +189,22 @@ impl ActionPlan {
             return Err("top must be at least 1");
         }
 
-        if matches!(self.target.as_str(), "UsersKB" | "UsersDataLake")
-            && self.user_id.as_deref().is_none()
-        {
-            return Err("Users* actions require user_id");
+        let user_id = self
+            .user_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or("all query actions require user_id")?;
+
+        let entity = self
+            .entity
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or("all query actions require entity")?;
+
+        if user_id != entity {
+            return Err("user_id must match entity");
         }
 
         Ok(())
@@ -199,7 +222,7 @@ mod tests {
             kind: "query".to_string(),
             target: "UsersKB".to_string(),
             user_id: Some("user-1".to_string()),
-            entity: None,
+            entity: Some("user-1".to_string()),
             intent: "Recent notes".to_string(),
             top: 0,
             query: None,
@@ -211,13 +234,30 @@ mod tests {
     }
 
     #[test]
-    fn users_actions_require_a_user_id() {
+    fn all_query_actions_require_a_user_id() {
         let action = ActionPlan {
             id: "q2".to_string(),
             kind: "query".to_string(),
             target: "UsersDataLake".to_string(),
             user_id: None,
-            entity: None,
+            entity: Some("user-1".to_string()),
+            intent: "Recent activity".to_string(),
+            top: 3,
+            query: None,
+            filters: ActionFilters::default(),
+        };
+
+        assert!(action.validate().is_err());
+    }
+
+    #[test]
+    fn all_query_actions_require_entity_matching_user_id() {
+        let action = ActionPlan {
+            id: "q2".to_string(),
+            kind: "query".to_string(),
+            target: "GaiaDataLake".to_string(),
+            user_id: Some("threadkeeper".to_string()),
+            entity: Some("jonty".to_string()),
             intent: "Recent activity".to_string(),
             top: 3,
             query: None,
@@ -238,7 +278,7 @@ mod tests {
                     "kind": "query",
                     "target": "UsersKB",
                     "user_id": "user-123",
-                    "entity": "notes",
+                    "entity": "user-123",
                     "intent": "Recent notes for this user",
                     "top": 3,
                     "query": "SELECT TOP 3 c.id, c.userId, c.date, c.data FROM c WHERE c.userId = @pk AND CONTAINS(LOWER(c.data), 'notes') ORDER BY c.date DESC",
@@ -271,7 +311,7 @@ mod tests {
             "version": "1.0",
             "session": {"user_id": "user-123", "requested_at": "2026-06-16T12:00:00Z"},
             "actions": [
-                {"id": "q1", "kind": "query", "target": "GaiaKB", "entity": "rust",
+                {"id": "q1", "kind": "query", "target": "GaiaKB", "user_id": "rust", "entity": "rust",
                  "intent": "x", "top": 3, "query": "   ", "filters": {}}
             ]
         }"#;
@@ -288,7 +328,7 @@ mod tests {
         let reply = "Sure!\n```json\n[\n  {\"version\":\"1.0\",\
             \"session\":{\"user_id\":\"threadkeeper\",\"requested_at\":\"2026-06-16T12:00:00Z\"},\
             \"actions\":[{\"id\":\"q1\",\"kind\":\"query\",\"target\":\"GaiaKB\",\
-            \"entity\":\"rust\",\"intent\":\"x\",\"top\":3,\"filters\":{}}]},\
+            \"user_id\":\"rust\",\"entity\":\"rust\",\"intent\":\"x\",\"top\":3,\"filters\":{}}]},\
             {\"analysis\":true},{\"facts\":[]},{\"newContext\":\"\"}\n]\n```\nthanks";
 
         let parsed = parse_call1_actions(reply).expect("should parse actions.json");
@@ -308,7 +348,7 @@ mod tests {
         // The model sometimes wraps the actions array inside a larger outer
         // array with extra metadata objects and commentary. The balanced-bracket
         // parser should grab only the first `[…]` and ignore the rest.
-        let reply = r#"[{"version":"1.0","session":{"user_id":"threadkeeper","requested_at":"2026-06-20T10:00:00Z"},"actions":[{"id":"q6","kind":"query","target":"GaiaDiary","entity":"threadkeeper","intent":"recall","top":3,"filters":{}}]},{"emotion":"curious"},{"fact":"x","value":"y"}],"extra commentary here"}]"#;
+        let reply = r#"[{"version":"1.0","session":{"user_id":"threadkeeper","requested_at":"2026-06-20T10:00:00Z"},"actions":[{"id":"q6","kind":"query","target":"GaiaDiary","user_id":"threadkeeper","entity":"threadkeeper","intent":"recall","top":3,"filters":{}}]},{"emotion":"curious"},{"fact":"x","value":"y"}],"extra commentary here"}]"#;
 
         let parsed = parse_call1_actions(reply).expect("should parse despite trailing garbage");
         assert_eq!(parsed.actions.len(), 1);

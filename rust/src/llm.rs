@@ -28,6 +28,8 @@
 //! - `MODEL_ROUTER_DEPLOYMENT` — the chat deployment name (e.g. `model-router`).
 //! - `FOUNDRY_API_KEY` — Foundry API key (preferred auth, `api-key` header).
 //! - `FOUNDRY_AAD_TOKEN` — Azure AD bearer token (fallback auth) for the Foundry call.
+//! - Managed identity (SAMI/UAMI) is auto-attempted when no key/token env var is
+//!   set and Azure identity endpoint variables are present in the environment.
 //! - `FOUNDRY_API_VERSION` — override the Azure OpenAI data-plane API version.
 //! - `GAIA_LLM_ENDPOINT` — override the GitHub Models chat-completions URL.
 //! - `GAIA_LLM_MODEL` — override the GitHub Models model name.
@@ -332,6 +334,8 @@ fn resolve_foundry_config(
         (key, AuthScheme::ApiKey)
     } else if let Some(aad) = aad_token {
         (aad, AuthScheme::Bearer)
+    } else if let Some(mi) = managed_identity_token("https://cognitiveservices.azure.com") {
+        (mi, AuthScheme::Bearer)
     } else {
         return Err(LlmError::MissingFoundryToken);
     };
@@ -397,6 +401,120 @@ pub fn value_from_env(key: &str) -> Option<String> {
 
     // Fall back to a local .env file for developer convenience.
     value_from_env_files(key)
+}
+
+/// Fetch a bearer token for `resource` from the local Azure managed identity
+/// endpoint, if one is available in this environment.
+///
+/// This is used to support cloud runtimes (for example Container Apps with
+/// system-assigned managed identity) without requiring `FOUNDRY_API_KEY` or
+/// a pre-minted `FOUNDRY_AAD_TOKEN` in environment variables.
+pub fn managed_identity_token(resource: &str) -> Option<String> {
+    let mut resources = vec![resource.to_string()];
+    if !resource.ends_with('/') {
+        resources.push(format!("{resource}/"));
+    }
+    resources.push("https://cognitiveservices.azure.com/.default".to_string());
+
+    // Newer endpoint contract used by Container Apps/App Service.
+    if let (Ok(endpoint), Ok(header)) = (
+        std::env::var("IDENTITY_ENDPOINT"),
+        std::env::var("IDENTITY_HEADER"),
+    ) {
+        for api_version in ["2019-08-01", "2017-09-01"] {
+            for resource_value in &resources {
+                let url = format!(
+                    "{}?api-version={api_version}&resource={}",
+                    endpoint,
+                    percent_encode_query_value(resource_value)
+                );
+                if let Ok(response) = ureq::get(&url).set("X-IDENTITY-HEADER", &header).call() {
+                    if let Ok(body) = response.into_string() {
+                        if let Some(token) = parse_managed_identity_access_token(&body) {
+                            return Some(token);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Legacy MSI endpoint contract.
+    if let (Ok(endpoint), Ok(secret)) = (std::env::var("MSI_ENDPOINT"), std::env::var("MSI_SECRET"))
+    {
+        for api_version in ["2019-08-01", "2017-09-01"] {
+            for resource_value in &resources {
+                let url = format!(
+                    "{}?api-version={api_version}&resource={}",
+                    endpoint,
+                    percent_encode_query_value(resource_value)
+                );
+                if let Ok(response) = ureq::get(&url).set("secret", &secret).call() {
+                    if let Ok(body) = response.into_string() {
+                        if let Some(token) = parse_managed_identity_access_token(&body) {
+                            return Some(token);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // IMDS fallback used by many Azure hosts when custom endpoint vars are not
+    // present in the process environment.
+    for resource_value in &resources {
+        let imds_url = format!(
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource={}",
+            percent_encode_query_value(resource_value)
+        );
+        if let Ok(response) = ureq::get(&imds_url).set("Metadata", "true").call() {
+            if let Ok(body) = response.into_string() {
+                if let Some(token) = parse_managed_identity_access_token(&body) {
+                    return Some(token);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Parse an access token out of a managed-identity token response body.
+fn parse_managed_identity_access_token(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value
+        .get("access_token")
+        .or_else(|| value.get("accessToken"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// Percent-encode one query-string value per RFC 3986.
+fn percent_encode_query_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for &byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(hex_digit(byte >> 4));
+                encoded.push(hex_digit(byte & 0x0f));
+            }
+        }
+    }
+    encoded
+}
+
+/// Convert a nibble to uppercase hex.
+fn hex_digit(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        _ => (b'A' + (nibble - 10)) as char,
+    }
 }
 
 /// Look for `key` in the candidate `.env` file locations.
@@ -815,5 +933,31 @@ COSMOS_ENDPOINT=https://example.documents.azure.com:443/\n\
         assert!(LlmError::Http("boom".into()).to_string().contains("boom"));
         assert!(LlmError::Decode("bad".into()).to_string().contains("bad"));
         assert!(LlmError::EmptyResponse.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn parse_managed_identity_access_token_reads_access_token_field() {
+        let body = r#"{"access_token":"abc123","expires_in":"3599"}"#;
+        assert_eq!(
+            parse_managed_identity_access_token(body),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_managed_identity_access_token_reads_access_token_camel_case_field() {
+        let body = r#"{"accessToken":"abc123"}"#;
+        assert_eq!(
+            parse_managed_identity_access_token(body),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn percent_encode_query_value_encodes_reserved_characters() {
+        assert_eq!(
+            percent_encode_query_value("https://cognitiveservices.azure.com"),
+            "https%3A%2F%2Fcognitiveservices.azure.com"
+        );
     }
 }

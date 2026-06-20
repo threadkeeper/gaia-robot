@@ -32,19 +32,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// single JSON array.
 const DOCUMENT_SPEC: &str = "\
 1. actions.json - READ-ONLY research queries only (no side effects). There are
-   SEVEN retrieval sources available, ids q1..q7, one per source, in this order:
+   FIVE retrieval sources available, ids q1..q5, one per source, in this order:
      q1 -> Web              (public web search)
-     q2 -> UsersDataLake    (this user's data lake)
-     q3 -> UsersKB          (this user's knowledge base)
-     q4 -> GaiaDataLake     (Gaia's shared data lake)
-     q5 -> GaiaKB           (Gaia's shared knowledge base)
-     q6 -> GaiaDiary        (Gaia's diary / logical history of past sessions)
-     q7 -> GaiaConnections  (this user's emotional-bank-account ledger)
+     q2 -> GaiaDataLake     (Gaia's shared data lake)
+     q3 -> GaiaKB           (Gai
+     a's shared knowledge base)
+     q4 -> GaiaDiary        (Gaia's diary / logical history of past sessions)
+     q5 -> GaiaConnections  (this user's emotional-bank-account ledger)
    You do NOT have to query every source. Emit ONLY the queries that genuinely
    help answer THIS turn - skipping a source is a valid choice, and if no
    research is warranted at all, returning an EMPTY `actions` array (doing no
    call) is a legitimate option. Keep each query you do emit matched to its
-   source id above (e.g. a GaiaDiary query stays q6).
+   source id above (e.g. a GaiaDiary query stays q4).
    For every query you emit, choose `top` deliberately from the user's input:
    return 1 row when they ask about the single latest/most-recent thing, more
    when they ask for a list, a history, or \"everything\". Default to 3 when the
@@ -55,13 +54,13 @@ const DOCUMENT_SPEC: &str = "\
      \"session\": { \"user_id\": \"<this user>\", \"requested_at\": \"<use the current time given in the user message>\" },
      \"actions\": [
        { \"id\": \"q1\", \"kind\": \"query\",
-         \"target\": \"Web|UsersDataLake|UsersKB|GaiaDataLake|GaiaKB|GaiaDiary|GaiaConnections\",
-         \"user_id\": \"<required for Users* targets, otherwise null>\",
-         \"entity\": \"<the partition value to search within: the subject for Gaia* targets, omit for Users*>\",
+         \"target\": \"Web|GaiaDataLake|GaiaKB|GaiaDiary|GaiaConnections\",
+                 \"user_id\": \"<REQUIRED for every query action: current user id>\",
+                 \"entity\": \"<REQUIRED for every query action: must equal user_id>\",
          \"intent\": \"<natural-language description of what to retrieve>\",
          \"top\": 3,
          \"query\": \"<the EXACT Cosmos DB SQL to run; see the Cosmos schema below. OMIT for the Web action.>\",
-         \"filters\": { \"from_date\": null, \"to_date\": null, \"text\": null, \"semantic\": null } }
+        \"filters\": { \"from_date\": null, \"to_date\": null, \"text\": null, \"semantic\": null, \"mode\": \"auto|keyword|semantic\" } }
      ] }
 2. analysis.json - your read of the user this turn. Shape:
    { \"emotion\": \"<value>\", \"truthfulness\": \"<value>\", \"intention\": \"<value>\" }
@@ -81,16 +80,21 @@ const DOCUMENT_SPEC: &str = "\
 /// scoped to the current user only, which is how user isolation is enforced.
 const TOOL_SPEC: &str = "\
 - Web             (search)     : public web search; results are logged to the Gaia Search History. NO query field.
-- UsersDataLake   (container)  : this user's data lake; partition=/userId; user_id REQUIRED.
-- UsersKB         (container)  : this user's knowledge base; partition=/userId; user_id REQUIRED.
-- GaiaDataLake    (container)  : Gaia's shared data lake; partition=/entity.
-- GaiaKB          (container)  : Gaia's shared knowledge base; partition=/entity.
-- GaiaDiary       (container)  : Gaia's diary / logical history of past sessions; partition=/entity.
-- GaiaConnections (container)  : this user's emotional-bank-account ledger; partition=/entity; ledger rows, NO /data field.
-Every query defaults to top=3, but pick a larger or smaller top when the user's
-input clearly implies it. You may also omit any source that does not help this
-turn - emitting fewer than seven queries (or none at all) is allowed. Users*
-targets MUST set user_id to this user only.";
+- GaiaDataLake    (container)  : Gaia's data lake, full conversation histories; partition=/entity.
+- GaiaKB          (container)  : Gaia's knowledge base, facts; partition=/entity.
+- GaiaDiary       (container)  : Gaia's diary / private inner thoughts regarding experiences; partition=/entity.
+- GaiaConnections (container)  : Per user emotional-bank-account ledger; partition=/entity; ledger rows, NO /data field.
+STRICT IDENTITY RULE: every query action MUST include both `user_id` and
+`entity`, and they MUST be exactly the same value. Runtime rejects missing
+or mismatched values.
+Every query defaults to top=3, but pick a larger or smaller top when you determine that the user's
+input requires it. You may also omit any source that does not help this
+turn - emitting fewer than five queries (or none at all) is allowed. Favor semantic over keyword retrieval when the user is asking for a concept, a meaning, or a similarity match. Favor keyword over semantic retrieval when the user is asking for an exact string, a substring, or a literal match.
+For EACH query set filters.mode to one of:
+    - keyword  -> explicit text/substring search
+    - semantic -> vector similarity search with VectorDistance
+    - auto     -> let runtime choose (semantic when filters.semantic is present,
+                                otherwise keyword).";
 
 /// The full Cosmos DB schema, so the model can author the exact `query` SQL.
 ///
@@ -106,7 +110,7 @@ All six database targets are Azure Cosmos DB for NoSQL containers in database
   - c.entity    (string)  partition key for Gaia* containers (the subject/user).
   - c.userId    (string)  partition key for Users* containers.
   - c.date      (string)  'YYYY-MM-DD' day of the record; the per-partition
-                 UNIQUE key on the snapshot containers (UsersDataLake, UsersKB,
+                 UNIQUE key on the snapshot containers (UsersDataLake, GaiaKB,
                  GaiaDataLake, GaiaKB, GaiaDiary).
   - c.timestamp (string)  ISO-8601 instant; the per-partition UNIQUE key on
                  GaiaConnections (the ledger). Order by this, not c.date, there.
@@ -128,34 +132,46 @@ Indexes available (what is cheap to query):
   - /data: keyword search with `CONTAINS(LOWER(c.data), '<lowercase term>')`
            (case-insensitive substring match).
   - /dataVector: DiskANN cosine vector index for `VectorDistance(...)` similarity
-           search - usable ONLY where embeddings exist (often not yet).
+                     search.
 
 Hard rules for every authored `query` (Web excepted):
   1. It MUST be a SINGLE read-only SELECT (no ';', no writes).
   2. It MUST filter on the partition key using the placeholder `@pk`, e.g.
-     `WHERE c.entity = @pk` (Gaia*) or `WHERE c.userId = @pk` (Users*). The
-     runtime binds @pk to the action's entity/user_id and pins that one
-     partition, so do not query across partitions.
+      `WHERE c.entity = @pk` for Gaia* targets. Runtime strictly enforces that
+      action.user_id == action.entity, binds @pk to that value, and pins one
+      partition, so do not query across partitions.
   3. It MUST start with `SELECT TOP <top>` using the action's `top` (which you
      sized from the user's input, default 3) so the result set stays small
      enough for the next reasoning step.
   4. Project only what is needed:
      `SELECT TOP 3 c.id, c.entity, c.userId, c.date, c.data`.
-  5. For keyword retrieval add `AND CONTAINS(LOWER(c.data), '<term>')`; combine
-     several terms with OR. Inline the term as a lowercase string literal.
-  6. Prefer recent first: end with `ORDER BY c.date DESC`.
-  7. GaiaConnections has NO c.data: select the ledger rows for the partition and
-     `ORDER BY c.timestamp DESC` (no CONTAINS on data).
-  8. Do NOT author a VectorDistance query unless you have reason to believe
-     embeddings exist; default to the keyword form above.
+    5. Choose retrieval mode PER query and set `filters.mode` accordingly:
+         - `keyword`: author a keyword query using `CONTAINS(LOWER(c.data), '<term>')`
+             (or `CONTAINS(LOWER(c.notes), '<term>')` for GaiaConnections).
+         - `semantic`: author a native Cosmos vector query using
+             `VectorDistance(c.dataVector, @queryVector, false, {distanceFunction:'Cosine',dataType:'Float32',searchListSizeMultiplier:10,filterPriority:0.75})`
+             and `ORDER BY` that same VectorDistance expression. Always include
+             `AND IS_DEFINED(c.dataVector)` in semantic mode. NEVER inline a literal
+             vector array; always use the placeholder `@queryVector`.
+         - `auto`: choose when either mode is acceptable; runtime will use semantic
+             if `filters.semantic` is present, else keyword.
+    6. Prefer recent first in keyword mode: end with `ORDER BY c.date DESC`.
+    7. GaiaConnections has NO c.data and NO vector retrieval path in runtime:
+         query ledger rows using c.notes (keyword) or recency-only and
+         `ORDER BY c.timestamp DESC`.
 
 Worked examples:
   - GaiaDiary (diary), entity 'threadkeeper', looking for talk of a falling tree:
     SELECT TOP 3 c.id, c.entity, c.date, c.data FROM c WHERE c.entity = @pk
     AND (CONTAINS(LOWER(c.data), 'tree') OR CONTAINS(LOWER(c.data), 'forest'))
     ORDER BY c.date DESC
-  - UsersDataLake, user 'threadkeeper', most recent data-lake entries:
-    SELECT TOP 3 c.id, c.userId, c.date, c.data FROM c WHERE c.userId = @pk
+    - GaiaKB semantic retrieval for ownership concepts:
+        SELECT TOP 3 c.id, c.entity, c.date, c.data, c.dataVector,
+        VectorDistance(c.dataVector, @queryVector, false, {distanceFunction:'Cosine',dataType:'Float32',searchListSizeMultiplier:10,filterPriority:0.75}) AS similarityScore
+        FROM c WHERE c.entity = @pk AND IS_DEFINED(c.dataVector)
+        ORDER BY VectorDistance(c.dataVector, @queryVector, false, {distanceFunction:'Cosine',dataType:'Float32',searchListSizeMultiplier:10,filterPriority:0.75})
+    - GaiaDataLake, user 'threadkeeper', most recent data-lake entries:
+        SELECT TOP 3 c.id, c.entity, c.date, c.data FROM c WHERE c.entity = @pk
     ORDER BY c.date DESC
   - GaiaConnections ledger for 'threadkeeper', latest balance changes:
     SELECT TOP 3 c.id, c.entity, c.timestamp, c.changeAmount, c.previousBalance,
@@ -240,7 +256,7 @@ const CALL2_DOCUMENT_SPEC: &str = "\
      \"actions\": [
        { \"id\": \"a1\",
          \"kind\": \"upsert|send|actuate|connection\",
-         \"target\": \"UsersKB|UsersDataLake|GaiaKB|GaiaDiary|GaiaDataLake|WhatsApp|Push|Actuator|GaiaConnections\",
+         \"target\": \"GaiaKB|UsersDataLake|GaiaKB|GaiaDiary|GaiaDataLake|WhatsApp|Push|Actuator|GaiaConnections\",
          \"user_id\": \"<required for Users* targets, otherwise null>\",
          \"payload\": { \"<effect-specific fields>\": \"<value>\" },
          \"reason\": \"<why this side effect is justified by the context>\" }
@@ -252,7 +268,7 @@ const CALL2_DOCUMENT_SPEC: &str = "\
 /// it writes a memory, sends a message, moves an actuator, or adjusts the
 /// friendship ledger. `Users*` write-backs must stay scoped to the current user.
 const CALL2_ACTION_SPEC: &str = "\
-- upsert  -> UsersKB|UsersDataLake|GaiaKB|GaiaDiary|GaiaDataLake : write/update a
+- upsert  -> GaiaKB|UsersDataLake|GaiaKB|GaiaDiary|GaiaDataLake : write/update a
              memory record. payload = { \"id\": \"<optional>\", \"entity\": \"<subject>\",
              \"data\": \"<text>\" }. Users* writes REQUIRE user_id (this user only).
 - send    -> WhatsApp|Push : deliver a message to the user. payload =
@@ -419,12 +435,10 @@ mod tests {
     fn system_lists_every_retrieval_tool() {
         let prompt = Call1Prompt::build("threadkeeper", "hi", "", "2026-06-16T12:00:00Z");
 
-        // The seven sources of the physical architecture's GET block (q1..q7),
+        // The five sources of the physical architecture's GET block (q1..q7),
         // named as the real Cosmos container ids (plus Web).
         for target in [
             "Web",
-            "UsersDataLake",
-            "UsersKB",
             "GaiaDataLake",
             "GaiaKB",
             "GaiaDiary",
@@ -498,7 +512,7 @@ mod tests {
         let prompt = Call1Prompt::build("threadkeeper", "hi", "", "2026-06-16T12:00:00Z");
 
         // Call 1 is told about all seven sources, ids q1..q7.
-        for id in ["q1", "q2", "q3", "q4", "q5", "q6", "q7"] {
+        for id in ["q1", "q2", "q3", "q4", "q5"] {
             assert!(prompt.system.contains(id), "missing query id {id}");
         }
         // But it must also be told that skipping a source - or emitting no
@@ -531,7 +545,7 @@ mod tests {
         let prompt = Call2Prompt::build(
             "threadkeeper",
             "what do you know about me?",
-            "retrievals: UsersKB -> prefers concise answers",
+            "retrievals: GaiaKB -> prefers concise answers",
             "2026-06-16T12:00:00Z",
         );
 
@@ -542,7 +556,7 @@ mod tests {
         assert!(prompt.user.contains("what do you know about me?"));
         assert!(prompt
             .user
-            .contains("retrievals: UsersKB -> prefers concise answers"));
+            .contains("retrievals: GaiaKB -> prefers concise answers"));
         // The supplied timestamp is injected for the model to reuse.
         assert!(prompt.user.contains("2026-06-16T12:00:00Z"));
     }

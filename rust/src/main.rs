@@ -61,6 +61,7 @@ mod base64;
 mod connection;
 mod cosmos;
 mod diary;
+mod embeddings;
 mod engine;
 mod executor;
 mod flow;
@@ -298,6 +299,40 @@ fn main() -> ExitCode {
         None
     };
 
+    // Optional embedding client used for semantic/vector retrieval during the
+    // pull pass. When absent, keyword mode still works and semantic actions are
+    // logged as planning/execution errors instead of crashing the turn.
+    let embedding_client = if llm_client.is_some() {
+        match embeddings::EmbeddingClient::from_env() {
+            Ok(Some(client)) => {
+                if writeln!(
+                    output,
+                    "Embeddings enabled: semantic queries use {}.",
+                    client.endpoint()
+                )
+                .is_err()
+                {
+                    return ExitCode::FAILURE;
+                }
+                Some(client)
+            }
+            Ok(None) => None,
+            Err(err) => {
+                if writeln!(
+                    output,
+                    "Embeddings requested but not configured: {err}. Semantic pull mode may fail.",
+                )
+                .is_err()
+                {
+                    return ExitCode::FAILURE;
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     'flow: loop {
         for (index, step) in steps.iter().enumerate() {
             // Log the block's exact description, mirroring the diagram, with rainbow color coding.
@@ -391,7 +426,8 @@ fn main() -> ExitCode {
                     // client is configured; otherwise the context stays empty.
                     if step.title() == "LLM Call 1" {
                         if let (Ok(reply), Some(cosmos)) = (&completion, &cosmos_client) {
-                            let (context, log) = run_pull_actions(cosmos, reply);
+                            let (context, log) =
+                                run_pull_actions(cosmos, embedding_client.as_ref(), reply);
                             if writeln!(output, "{log}").is_err() {
                                 return ExitCode::FAILURE;
                             }
@@ -507,8 +543,8 @@ fn run_data_retrieval_test() -> ExitCode {
     };
 
     let only = parse_question_number();
-    // Write artifacts to tests/q1..q5 so humans can review the JSON files.
-    let tests_dir = std::path::Path::new("../tests");
+    // Write artifacts to tests/LLM1/t1..t5 so humans can review the JSON files.
+    let tests_dir = std::path::Path::new("../tests/LLM1");
     match probe.run(only, Some(tests_dir), &mut out) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
@@ -628,7 +664,11 @@ const RECORD_SNIPPET_CHAR_CAP: usize = 600;
 /// log of what was planned and retrieved (printed during the walk-through). A
 /// failure to parse or a per-action error is captured in the log and never
 /// aborts the turn — a degraded pull simply yields a smaller context.
-fn run_pull_actions(cosmos: &cosmos::CosmosClient, call1_reply: &str) -> (String, String) {
+fn run_pull_actions(
+    cosmos: &cosmos::CosmosClient,
+    embedder: Option<&embeddings::EmbeddingClient>,
+    call1_reply: &str,
+) -> (String, String) {
     let mut log = String::from("    --- executing LLM Call 1 pull queries against Cosmos ---\n");
 
     // Parse the actions.json document out of Call 1's output.
@@ -648,7 +688,7 @@ fn run_pull_actions(cosmos: &cosmos::CosmosClient, call1_reply: &str) -> (String
     }
 
     // Show the exact SQL each action will run (the authored `query` field).
-    log.push_str(&describe_authored_queries(&cosmos_actions));
+    log.push_str(&describe_authored_queries(&cosmos_actions, embedder));
 
     // Run the queries. The executor truncates each result to the action's
     // `top`, and the Cosmos client caps items per request, so the volume is
@@ -658,7 +698,11 @@ fn run_pull_actions(cosmos: &cosmos::CosmosClient, call1_reply: &str) -> (String
         session: actions.session.clone(),
         actions: cosmos_actions,
     };
-    let outcomes = executor::Executor::new(cosmos).run(&filtered);
+    let outcomes = if let Some(embedder) = embedder {
+        executor::Executor::with_embedder(cosmos, Some(embedder.clone())).run(&filtered)
+    } else {
+        executor::Executor::new(cosmos).run(&filtered)
+    };
 
     // Fold the outcomes into a compact, bounded context plus a run log.
     let (context, outcome_log) = summarize_pull_outcomes(&outcomes);
@@ -684,10 +728,13 @@ fn cosmos_actions_of(actions: &actions::ActionsFile) -> Vec<actions::ActionPlan>
 /// Each line shows the action id, its target container, and either the planned
 /// SQL or the reason no query could be planned, so the authored `query` field
 /// is visible during the walk-through.
-fn describe_authored_queries(actions: &[actions::ActionPlan]) -> String {
+fn describe_authored_queries(
+    actions: &[actions::ActionPlan],
+    embedder: Option<&embeddings::EmbeddingClient>,
+) -> String {
     let mut log = String::new();
     for action in actions {
-        match executor::plan_for(action) {
+        match executor::plan_for(action, embedder) {
             Ok(planned) => {
                 log.push_str(&format!(
                     "    [{}] {} :: {}\n",
@@ -1169,7 +1216,7 @@ thanks"#;
             id: id.to_string(),
             kind: "query".to_string(),
             target: target.to_string(),
-            user_id: None,
+            user_id: Some("threadkeeper".to_string()),
             entity: Some("threadkeeper".to_string()),
             intent: "recent".to_string(),
             top: 3,
@@ -1199,7 +1246,7 @@ thanks"#;
     #[test]
     fn describe_authored_queries_shows_the_sql_per_action() {
         let sql = "SELECT TOP 3 c.id FROM c WHERE c.entity = @pk";
-        let log = describe_authored_queries(&[action("q1", "GaiaDiary", Some(sql))]);
+        let log = describe_authored_queries(&[action("q1", "GaiaDiary", Some(sql))], None);
         assert!(log.contains("[q1] GaiaDiary ::"));
         assert!(log.contains(sql));
     }
