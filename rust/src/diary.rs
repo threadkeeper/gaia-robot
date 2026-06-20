@@ -10,7 +10,7 @@
 //! `migrations/<date>/diary/<wing>/<day>.jsonl`. Each row is a single,
 //! timestamped journal note Gaia wrote after a session — often in MemPalace's
 //! compact "AAAK" dialect (e.g. `asked.current.time.Johannesburg|☆`). The
-//! migration loads these into the `GaiaLH` (Gaia logical-history) container
+//! migration loads these into the `GaiaDiary` (Gaia logical-history) container
 //! keyed by `entity = wing`, which is why the diary here is organised per wing.
 //!
 //! Like the connection ledger, entries are keyed by `(wing, timestamp)` — one
@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 pub struct DiaryEntry {
     /// When the note was written; part of the `(wing, timestamp)` key.
     pub timestamp: String,
-    /// The wing this diary belongs to (the GaiaLH business key), e.g.
+    /// The wing this diary belongs to (the GaiaDiary business key), e.g.
     /// `"threadkeeper"`.
     pub wing: String,
     /// The agent who wrote the note, e.g. `"Gaia"`.

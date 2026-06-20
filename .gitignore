@@ -1,2 +1,3 @@
 # Migration data (large data dumps — not tracked in git)
 migrations/
+logs/

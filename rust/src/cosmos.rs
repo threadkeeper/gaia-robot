@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 //! The [`CosmosClient`] type: a tiny, dependency-light client for Gaia's Azure
-//! Cosmos DB for NoSQL containers (`GaiaKB`, `GaiaLH`, `UsersKB`, `UsersDL`,
-//! `GaiaCosmos`).
+//! Cosmos DB for NoSQL containers (`GaiaKB`, `GaiaDiary`, `UsersKB`,
+//! `UsersDataLake`, `GaiaDataLake`).
 //!
 //! Like [`crate::llm::LlmClient`], this client is **opt-in** and reuses the same
 //! dev/local switch (`GAIA_MODE=dev`/`local`). When it is not configured,
@@ -42,6 +42,14 @@ use crate::storage::Record;
 /// REST API version sent in the `x-ms-version` header. `2018-12-31` covers the
 /// point reads, upserts, and single-partition parameterised queries we use.
 const API_VERSION: &str = "2018-12-31";
+
+/// Hard cap on the number of documents a single query response may return.
+///
+/// Sent as `x-ms-max-item-count`. Queries should already bound themselves with
+/// `TOP n`, but this guarantees that even a query that forgot its limit can
+/// never flood the in-memory Response Data Context handed to LLM Call 2. We read
+/// a single response page (no continuation), so this is an absolute ceiling.
+const MAX_ITEMS_PER_QUERY: &str = "100";
 
 /// Errors that can occur while configuring or calling Cosmos DB.
 #[derive(Debug)]
@@ -196,6 +204,7 @@ impl CosmosClient {
                 &partition_key_header(partition_value),
             )
             .set("x-ms-documentdb-query-enablecrosspartition", "false")
+            .set("x-ms-max-item-count", MAX_ITEMS_PER_QUERY)
             .send_bytes(&body)
             .map_err(map_ureq_error)?;
 
@@ -477,6 +486,10 @@ struct DocumentsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::RecordKind;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread::{self, JoinHandle};
 
     #[test]
     fn new_normalises_the_endpoint_to_end_with_a_slash() {
@@ -488,10 +501,14 @@ mod tests {
 
     #[test]
     fn docs_url_targets_the_collection_documents_path() {
-        let url = docs_url("https://acct.documents.azure.com:443/", "gaia", "UsersDL");
+        let url = docs_url(
+            "https://acct.documents.azure.com:443/",
+            "gaia",
+            "UsersDataLake",
+        );
         assert_eq!(
             url,
-            "https://acct.documents.azure.com:443/dbs/gaia/colls/UsersDL/docs"
+            "https://acct.documents.azure.com:443/dbs/gaia/colls/UsersDataLake/docs"
         );
     }
 
@@ -593,5 +610,177 @@ mod tests {
         assert!(CosmosError::Decode("bad".into())
             .to_string()
             .contains("decode"));
+    }
+
+    #[test]
+    fn rfc1123_formats_known_instants_with_std_only() {
+        // The Unix epoch itself: 1970-01-01 was a Thursday at midnight.
+        assert_eq!(rfc1123(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        // A fixed later instant exercises the civil-from-days calendar maths and
+        // the hour/minute/second split: 2026-06-16T12:34:56Z.
+        //   days = 20_620 since epoch, plus 12:34:56 within the day.
+        let secs = 20_620 * 86_400 + 12 * 3_600 + 34 * 60 + 56;
+        assert_eq!(rfc1123(secs), "Tue, 16 Jun 2026 12:34:56 GMT");
+    }
+
+    #[test]
+    fn civil_from_days_round_trips_known_dates() {
+        // Day 0 is 1970-01-01; the algorithm must agree on the epoch and on a
+        // leap-day boundary (2024-02-29 is day 19_782).
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+    }
+
+    /// Spin up a one-shot local HTTP server that replies with `status` and
+    /// `body`, returning its `http://127.0.0.1:<port>/` base URL and the join
+    /// handle. Std-only (no extra dependency): it accepts a single connection,
+    /// drains the request, and writes a fixed response.
+    fn spawn_mock_cosmos(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Read the entire request before answering. Closing a socket that
+                // still has unread bytes makes Windows send an RST, which the
+                // client reports as "connection forcibly closed" while reading the
+                // status line. Draining the request avoids that race.
+                let mut data: Vec<u8> = Vec::new();
+                let mut buf = [0u8; 1024];
+                // First, read until we have the full header block (CRLF CRLF).
+                let header_end = loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break data.len(),
+                        Ok(n) => {
+                            data.extend_from_slice(&buf[..n]);
+                            if let Some(pos) = find_subsequence(&data, b"\r\n\r\n") {
+                                break pos + 4;
+                            }
+                        }
+                        Err(_) => break data.len(),
+                    }
+                };
+                // Then read any Content-Length body so nothing is left unread.
+                let headers = String::from_utf8_lossy(&data[..header_end.min(data.len())]);
+                let content_len = headers
+                    .lines()
+                    .find_map(|line| {
+                        let lower = line.to_ascii_lowercase();
+                        lower
+                            .strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                let mut body_seen = data.len().saturating_sub(header_end);
+                while body_seen < content_len {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => body_seen += n,
+                        Err(_) => break,
+                    }
+                }
+                // Write the fixed response and close the write half cleanly.
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                // Drain until the client closes its side to dodge an RST on drop.
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// Find the first index of `needle` within `haystack`, or `None`.
+    fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    #[test]
+    fn query_sends_the_request_and_parses_the_documents_envelope() {
+        let body = r#"{"Documents":[{"id":"GaiaDiary|e|2026-05-10","entity":"e","date":"2026-05-10","data":"hello"}]}"#;
+        let (endpoint, handle) = spawn_mock_cosmos("200 OK", body);
+        let client = CosmosClient::new(endpoint, "gaia", "tok");
+
+        let records = client
+            .query(
+                "GaiaDiary",
+                "e",
+                "SELECT * FROM c WHERE c.entity = @pk",
+                &[QueryParam::new("@pk", "e")],
+            )
+            .expect("query succeeds against the mock");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].data, "hello");
+        handle.join().expect("mock server thread joins");
+    }
+
+    #[test]
+    fn query_maps_an_http_error_status_into_a_descriptive_error() {
+        let (endpoint, handle) = spawn_mock_cosmos("403 Forbidden", "{\"message\":\"denied\"}");
+        let client = CosmosClient::new(endpoint, "gaia", "tok");
+
+        let err = client
+            .query("GaiaDiary", "e", "SELECT 1", &[])
+            .expect_err("a 403 is surfaced as an error");
+        assert!(err.to_string().contains("403"), "got: {err}");
+        handle.join().expect("mock server thread joins");
+    }
+
+    #[test]
+    fn upsert_posts_the_record_and_succeeds_on_2xx() {
+        let (endpoint, handle) = spawn_mock_cosmos("201 Created", "{}");
+        let client = CosmosClient::new(endpoint, "gaia", "tok");
+        let record = Record::new(
+            "GaiaKB|e|2026-05-10",
+            "e",
+            "",
+            "2026-05-10",
+            RecordKind::KnowledgeBase,
+            "payload",
+            Vec::new(),
+        );
+
+        client
+            .upsert("GaiaKB", "e", &record)
+            .expect("upsert succeeds against the mock");
+        handle.join().expect("mock server thread joins");
+    }
+
+    #[test]
+    fn get_returns_the_record_on_200_and_none_on_404() {
+        // 200: the document is returned.
+        let doc = r#"{"id":"GaiaKB|e|2026-05-10","entity":"e","date":"2026-05-10","data":"hi"}"#;
+        let (endpoint, handle) = spawn_mock_cosmos("200 OK", doc);
+        let client = CosmosClient::new(endpoint, "gaia", "tok");
+        let found = client
+            .get("GaiaKB", "e", "GaiaKB|e|2026-05-10")
+            .expect("get succeeds");
+        assert_eq!(found.map(|r| r.data), Some("hi".to_string()));
+        handle.join().expect("mock server thread joins");
+
+        // 404: a miss is reported as Ok(None), not an error.
+        let (endpoint, handle) = spawn_mock_cosmos("404 Not Found", "");
+        let client = CosmosClient::new(endpoint, "gaia", "tok");
+        let missing = client
+            .get("GaiaKB", "e", "nope")
+            .expect("404 is not an error");
+        assert!(missing.is_none());
+        handle.join().expect("mock server thread joins");
     }
 }

@@ -48,7 +48,7 @@ replace with your own once published).
 
 | Resource | Free tier (Lite) | Pay-as-you-go cost | Notes |
 |----------|------------------|--------------------|-------|
-| **Cosmos DB for NoSQL** account | ✅ `enableFreeTier` on (both tiers) | ~$0.008 / 100 RU/s per hour + ~$0.25/GB-month | Free tier covers the **first 1,000 RU/s + 25 GB** per **subscription** (one free-tier account max). `cosmos_create.py` makes 5 containers at 400 RU/s each (2,000 RU/s) — that **exceeds** the free 1,000 RU/s, so ~1,000 RU/s is billable. Lower `COSMOS_THROUGHPUT` (e.g. 200) or use shared database throughput to stay free. |
+| **Cosmos DB for NoSQL** account | ✅ `enableFreeTier` on (both tiers) | ~$0.008 / 100 RU/s per hour + ~$0.25/GB-month | Free tier covers the **first 1,000 RU/s + 25 GB** per **subscription** (one free-tier account max). `cosmos_create.py` makes 7 containers at 400 RU/s each (2,800 RU/s) — that **exceeds** the free 1,000 RU/s, so ~1,800 RU/s is billable. Lower `COSMOS_THROUGHPUT` (e.g. 200) or use shared database throughput to stay free. |
 | **Azure AI Foundry** account (`AIServices`, S0) | ✅ No fixed/hourly fee | $0 idle | You are billed only per model token, not for the account itself. |
 | **`model-router` deployment** (`modelRouterSku`) | ⚠️ Pay-per-token (no idle cost) | Per 1K input/output tokens (varies by routed model) | Consumption-based; **cannot be made free**, but costs nothing when not called. Capacity is a rate limit (TPM), not a charge. |
 | **Container App** | ✅ Free when scaled to zero | Free monthly grant: 180K vCPU-s + 360K GiB-s + 2M requests, then ~$0.000024/vCPU-s | **Lite** uses `minReplicas: 0` → idles at $0. **Hobby** uses `minReplicas: 1` (always-on) which exceeds the free grant and costs ~$15–30/mo. |
@@ -62,18 +62,19 @@ free-tier allowances. Everything else sits within Azure's free grants.
 
 ## cosmos_create.py
 
-Provisions the six Cosmos DB for NoSQL containers from the Gaia physical
+Provisions the seven Cosmos DB for NoSQL containers from the Gaia physical
 architecture diagram. The script is idempotent (safe to re-run): it creates the
 database and each container only if they do not already exist.
 
-| Container         | Partition / business key | Business key (uniqueness) |
-|-------------------|--------------------------|---------------------------|
-| `GaiaKB`          | `entity`                 | entity + date             |
-| `GaiaLH`          | `entity`                 | entity + date             |
-| `UsersKB`         | `userId`                 | userId + date             |
-| `UsersDL`         | `userId`                 | userId + date             |
-| `GaiaCosmos`      | `entity`                 | entity + date             |
-| `GaiaConnections` | `entity`                 | entity + timestamp        |
+| Container              | Partition / business key | Business key (uniqueness) |
+|------------------------|--------------------------|---------------------------|
+| `GaiaKB`               | `entity`                 | entity + date             |
+| `GaiaDataLake`         | `entity`                 | entity + date             |
+| `UsersKB`              | `userId`                 | userId + date             |
+| `UsersDataLake`        | `userId`                 | userId + date             |
+| `GaiaDiary`            | `entity`                 | entity + date             |
+| `GaiaWebSearchHistory` | `entity`                 | entity + timestamp        |
+| `GaiaConnections`      | `entity`                 | entity + timestamp        |
 
 Each container is created with:
 
@@ -81,12 +82,21 @@ Each container is created with:
   and text queries can be filtered cheaply by entity / user.
 - **Unique-key policy** on the container's uniqueness field — `/date` for the
   daily-snapshot containers (one record per partition per `yyyy-mm-dd`), and
-  `/timestamp` for the `GaiaConnections` ledger (one record per partition per
-  ISO 8601 instant, so a single day can hold many ledger entries).
+  `/timestamp` for the `GaiaWebSearchHistory` log and `GaiaConnections` ledger
+  (one record per partition per ISO 8601 instant, so a single day can hold many
+  entries).
 - **Vector embedding policy** on `/dataVector` — the vector representation of the
-  record's `data` field — plus a **DiskANN vector index** on that path.
+  record's text content — plus a **DiskANN vector index** on that path. Every
+  container has one so all of them are similarity-searchable.
+- **Composite indexes** pairing the business key with the uniqueness field in
+  **both** orders — `(entity|userId, date)` and `(date, entity|userId)` (and the
+  `timestamp` equivalents for the log/ledger) — so queries that lead with either
+  field are served by a regular index. The default `/*` path also range-indexes
+  each field individually.
 - **Full-text index** on the entity / userId text field (the additional text
-  index), in addition to the partition-key filtering.
+  index), in addition to the partition-key filtering. The `/data` payload is also
+  full-text indexed for every container that stores one — i.e. all except the
+  `GaiaConnections` ledger and the `GaiaWebSearchHistory` log.
 
 ### Gaia Connections (emotional bank account)
 

@@ -38,7 +38,9 @@ pub struct Record {
     /// entity-partitioned containers.
     #[serde(rename = "userId", default, skip_serializing_if = "String::is_empty")]
     pub user_id: String,
-    /// The record day (`/date`); unique within a logical partition.
+    /// The record day (`/date`); unique within a logical partition. May be
+    /// absent in some containers (e.g. GaiaDiary entries without a date).
+    #[serde(default)]
     pub date: String,
     /// Logical family (KB vs DL). Derived from the container, not stored, so it
     /// is skipped during (de)serialization.
@@ -71,7 +73,7 @@ pub struct IndexSpec {
 /// Describes the logical layout of a KB or DL container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSchema {
-    /// Container name, such as `GaiaKB` or `UsersDL`.
+    /// Container name, such as `GaiaKB` or `UsersDataLake`.
     pub name: &'static str,
     /// The logical family: knowledge base or data lake.
     pub kind: RecordKind,
@@ -283,7 +285,7 @@ mod tests {
     #[test]
     fn kb_and_dl_tables_expose_standard_indexes() {
         let kb = KnowledgeBaseTable::new("GaiaKB", "entity");
-        let dl = DataLakeTable::new("UsersDL", "userId");
+        let dl = DataLakeTable::new("UsersDataLake", "userId");
 
         assert_eq!(kb.schema().kind, RecordKind::KnowledgeBase);
         assert_eq!(dl.schema().kind, RecordKind::DataLake);
@@ -351,7 +353,7 @@ mod tests {
         // A user-partitioned record should map onto the on-disk field names and
         // omit the empty/derived fields (entity, kind, metadata).
         let record = Record::new(
-            "UsersDL_user-1_2026-06-16",
+            "UsersDataLake_user-1_2026-06-16",
             "",
             "user-1",
             "2026-06-16",
@@ -362,7 +364,7 @@ mod tests {
 
         let value = serde_json::to_value(&record).unwrap();
 
-        assert_eq!(value["id"], "UsersDL_user-1_2026-06-16");
+        assert_eq!(value["id"], "UsersDataLake_user-1_2026-06-16");
         assert_eq!(value["userId"], "user-1");
         assert_eq!(value["date"], "2026-06-16");
         assert_eq!(value["data"], "hello");

@@ -36,7 +36,7 @@
           "kind": { "type": "string", "const": "query" },
           "target": {
             "type": "string",
-            "enum": ["UsersKB", "UsersDL", "GaiaKB", "GaiaLH", "GaiaCosmos", "GaiaConnections"]
+            "enum": ["Web", "UsersKB", "UsersDL", "GaiaKB", "GaiaLH", "GaiaCosmos", "GaiaConnections"]
           },
           "user_id": { "type": ["string", "null"] },
           "entity": { "type": ["string", "null"] },
@@ -45,6 +45,10 @@
             "type": "integer",
             "minimum": 1,
             "default": 3
+          },
+          "query": {
+            "type": ["string", "null"],
+            "description": "The exact single read-only Cosmos SQL the model authored for this action. The executor runs it verbatim (binding the @pk partition value); when absent or blank the executor builds a query from the structured fields instead."
           },
           "filters": {
             "type": "object",

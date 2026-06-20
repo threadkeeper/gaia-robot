@@ -1,19 +1,26 @@
-"""Create the six Gaia Cosmos DB containers described in the architecture diagram.
+"""Create the seven Gaia Cosmos DB containers described in the architecture diagram.
 
 This is an infrastructure provisioning *script* (not part of the Rust program).
 Running it is idempotent: it creates the database and each container only if they
 do not already exist, so it is safe to re-run.
 
-It provisions six Azure Cosmos DB for NoSQL containers:
+It provisions seven Azure Cosmos DB for NoSQL containers:
 
-    Container         Business key field   Business key (uniqueness)
-    ---------------   ------------------   -------------------------
-    GaiaKB            entity               entity + date (yyyy-mm-dd)
-    GaiaLH            entity               entity + date (yyyy-mm-dd)
-    UsersKB           userId               userId + date (yyyy-mm-dd)
-    UsersDL           userId               userId + date (yyyy-mm-dd)
-    GaiaCosmos        entity               entity + date (yyyy-mm-dd)
-    GaiaConnections   entity               entity + timestamp (ISO 8601)
+    Container              Business key field   Business key (uniqueness)
+    --------------------   ------------------   -------------------------
+    GaiaKB                 entity               entity + date (yyyy-mm-dd)
+    GaiaDataLake           entity               entity + date (yyyy-mm-dd)
+    UsersKB                userId               userId + date (yyyy-mm-dd)
+    UsersDataLake          userId               userId + date (yyyy-mm-dd)
+    GaiaDiary              entity               entity + date (yyyy-mm-dd)
+    GaiaWebSearchHistory   entity               entity + timestamp (ISO 8601)
+    GaiaConnections        entity               entity + timestamp (ISO 8601)
+
+``GaiaWebSearchHistory`` is an append-only *log* of Gaia's web searches: it
+stores the search query and its results rather than a ``/data`` text payload, so
+it has a vector index (over the embedded query text) but no ``/data`` full-text
+index. Like the ledger below, it can hold many entries per day, so its
+uniqueness is per *timestamp*.
 
 ``GaiaConnections`` is the emotional-bank-account *ledger*: LLM Call 1 decides
 whether each user turn grows or weakens the friendship and posts a signed change
@@ -28,10 +35,19 @@ Each container is configured with:
     daily-snapshot containers, ``/timestamp`` for the ledger) so there is at most
     one record per partition per that field.
   * A vector embedding policy on ``/dataVector`` -- the vector representation of
-    the record's ``data`` field -- plus a DiskANN vector index on that path so
-    the data can be searched by similarity.
+    the record's text content -- plus a DiskANN vector index on that path so
+    every container can be searched by similarity.
+  * Two composite (regular) indexes pairing the business key with the
+    uniqueness field in *both* orders -- ``(entity|userId, date)`` and
+    ``(date, entity|userId)`` for the daily-snapshot containers (and the
+    ``timestamp`` equivalents for the log/ledger) -- so queries that lead with
+    either field are served by a regular index. The default ``/*`` included path
+    also range-indexes each field individually.
   * A full-text index on the business key field so the entity/userId text can be
-    searched in addition to being filtered.
+    searched in addition to being filtered, plus a full-text index on ``/data``
+    (the text payload) for every container that stores one -- i.e. all except
+    the ``GaiaConnections`` ledger and the ``GaiaWebSearchHistory`` log -- so the
+    content itself is keyword/full-text searchable.
 
 Prerequisites (control-plane, done once, not by this data-plane script):
   * An Azure Cosmos DB for NoSQL account.
@@ -96,11 +112,11 @@ def load_env_file(path: str = ".env") -> None:
 # --- Configuration -----------------------------------------------------------
 
 
-# The six containers from the diagram. ``key_field`` is the business/partition
+# The seven containers from the diagram. ``key_field`` is the business/partition
 # key: the entity tables key on "entity", the user tables key on "userId".
 # ``unique_field`` is the path made unique *within* a partition; it is "date"
-# for the daily-snapshot containers and "timestamp" for the connections ledger
-# (a ledger needs many rows per day, so it keys on a full instant, not a day).
+# for the daily-snapshot containers and "timestamp" for the log/ledger
+# (which need many rows per day, so they key on a full instant, not a day).
 @dataclass(frozen=True)
 class TableSpec:
     """Describes one Cosmos container to create."""
@@ -108,20 +124,38 @@ class TableSpec:
     name: str                  # container id, e.g. "GaiaKB"
     key_field: str             # business key / partition key field, e.g. "entity"
     unique_field: str = "date"  # per-partition unique path, e.g. "date" or "timestamp"
+    has_data: bool = True       # whether the container stores a "/data" text payload
 
 
 TABLES: list[TableSpec] = [
     TableSpec(name="GaiaKB", key_field="entity"),
-    TableSpec(name="GaiaLH", key_field="entity"),
+    TableSpec(name="GaiaDataLake", key_field="entity"),
     TableSpec(name="UsersKB", key_field="userId"),
-    TableSpec(name="UsersDL", key_field="userId"),
-    TableSpec(name="GaiaCosmos", key_field="entity"),
-    # Emotional-bank-account ledger: one record per (entity, timestamp).
-    TableSpec(name="GaiaConnections", key_field="entity", unique_field="timestamp"),
+    TableSpec(name="UsersDataLake", key_field="userId"),
+    TableSpec(name="GaiaDiary", key_field="entity"),
+    # Append-only log of Gaia's web searches. It stores the query and results
+    # rather than a "/data" text payload, so it has a vector index over its
+    # embedded query text but no "/data" full-text index. Many searches happen
+    # per day, so uniqueness is per timestamp.
+    TableSpec(
+        name="GaiaWebSearchHistory",
+        key_field="entity",
+        unique_field="timestamp",
+        has_data=False,
+    ),
+    # Emotional-bank-account ledger: one record per (entity, timestamp). It
+    # records signed deltas and notes, not a "/data" text payload, so it has no
+    # full-text content to index.
+    TableSpec(
+        name="GaiaConnections",
+        key_field="entity",
+        unique_field="timestamp",
+        has_data=False,
+    ),
 ]
 
-# Path of the vector field. Every record stores the embedding of its ``data``
-# field here; the container's policies declare and index this path.
+# Path of the vector field. Every container stores the embedding of its text
+# content here; the container's policies declare and index this path.
 VECTOR_PATH = "/dataVector"
 
 
@@ -146,38 +180,73 @@ def build_vector_embedding_policy(dimensions: int) -> dict:
     }
 
 
-def build_full_text_policy(key_field: str) -> dict:
-    """Full-text policy: enables text search over the entity/userId field."""
+def build_full_text_policy(key_field: str, include_data: bool = True) -> dict:
+    """Full-text policy: enables text search over the entity/userId field.
+
+    When the container stores a ``/data`` text payload (every container except
+    the connections ledger), that field is included too so the actual content --
+    not just the business key -- can be full-text searched.
+    """
+    full_text_paths = [{"path": f"/{key_field}", "language": "en-US"}]
+    if include_data:
+        full_text_paths.append({"path": "/data", "language": "en-US"})
     return {
         "defaultLanguage": "en-US",
-        "fullTextPaths": [
-            {"path": f"/{key_field}", "language": "en-US"},
-        ],
+        "fullTextPaths": full_text_paths,
     }
 
 
-def build_indexing_policy(key_field: str) -> dict:
-    """Indexing policy combining the standard, vector, and full-text indexes.
+def build_indexing_policy(
+    key_field: str, unique_field: str, include_data: bool = True
+) -> dict:
+    """Indexing policy combining the standard, vector, full-text, and composite indexes.
 
     * The vector path is excluded from normal indexing (vectors are indexed only
       by the dedicated DiskANN vector index).
-    * ``vectorIndexes`` indexes ``/dataVector`` for similarity search; combined
-      with the partition key it can be filtered by entity/userId.
-    * ``fullTextIndexes`` adds the extra text index on the entity/userId field.
+    * ``vectorIndexes`` indexes ``/dataVector`` for similarity search over the
+      record's text content; combined with the partition key it can be filtered
+      by entity/userId. Every container gets one.
+    * ``fullTextIndexes`` adds the extra text index on the entity/userId field,
+      plus the ``/data`` payload when the container stores one, so keyword and
+      full-text queries over the content are served by an index.
+    * ``compositeIndexes`` pairs the business key with the uniqueness field
+      (``date`` or ``timestamp``) in *both* orders so queries that lead with
+      either the business key or the date/timestamp are served by a regular
+      index. The default ``/*`` included path also range-indexes each field
+      individually.
     """
+    full_text_indexes = [{"path": f"/{key_field}"}]
+    if include_data:
+        full_text_indexes.append({"path": "/data"})
     return {
         "indexingMode": "consistent",
         "automatic": True,
         "includedPaths": [{"path": "/*"}],
         "excludedPaths": [
+            # Vectors are served only by the DiskANN vector index below, so keep
+            # the raw vector out of the normal range index.
             {"path": f"{VECTOR_PATH}/*"},
             {"path": '/"_etag"/?'},
         ],
         "vectorIndexes": [
             {"path": VECTOR_PATH, "type": "diskANN"},
         ],
-        "fullTextIndexes": [
-            {"path": f"/{key_field}"},
+        "fullTextIndexes": full_text_indexes,
+        "compositeIndexes": [
+            # Regular index on (entity|userId, date|timestamp): filter by the
+            # business key, range/order by the uniqueness field.
+            [
+                {"path": f"/{key_field}", "order": "ascending"},
+                {"path": f"/{unique_field}", "order": "ascending"},
+            ],
+            # The reverse order (date|timestamp, entity|userId): filter/range by
+            # the uniqueness field first, then by the business key. Cosmos
+            # composite indexes are order-sensitive, so both directions are
+            # declared to serve queries that lead with either field.
+            [
+                {"path": f"/{unique_field}", "order": "ascending"},
+                {"path": f"/{key_field}", "order": "ascending"},
+            ],
         ],
     }
 
@@ -216,9 +285,11 @@ def create_container(database, table: TableSpec, dimensions: int, throughput: in
         id=table.name,
         # Partition key = business key field -> enables cheap filtering.
         partition_key=PartitionKey(path=f"/{table.key_field}"),
-        indexing_policy=build_indexing_policy(table.key_field),
+        indexing_policy=build_indexing_policy(
+            table.key_field, table.unique_field, table.has_data
+        ),
         vector_embedding_policy=build_vector_embedding_policy(dimensions),
-        full_text_policy=build_full_text_policy(table.key_field),
+        full_text_policy=build_full_text_policy(table.key_field, table.has_data),
         unique_key_policy=build_unique_key_policy(table.unique_field),
         offer_throughput=throughput,
     )
@@ -229,7 +300,7 @@ def create_container(database, table: TableSpec, dimensions: int, throughput: in
 
 
 def main() -> int:
-    """Provision the database and all six containers. Returns a process exit code."""
+    """Provision the database and all seven containers. Returns a process exit code."""
     # 0. Load .env (if present) so local config is picked up automatically.
     load_env_file()
 

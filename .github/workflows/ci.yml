@@ -99,16 +99,80 @@ jobs:
         with:
           manifest-path: rust/Cargo.toml
 
+  # Pre-deploy data-retrieval gate: prove the live retrieval path works before we
+  # ship. Runs the `gaia-robot test-data-retrieval` self-test, which asks the
+  # model five questions as the `threadkeeper` user, parses each actions.json,
+  # and executes the resulting Cosmos queries and Brave web search. It exits
+  # non-zero on ANY failure, so a red run blocks the deploy below.
+  #
+  # Runs only on pushes to main (it needs live credentials and a real deploy is
+  # only gated there). It requires the following repository configuration:
+  #   secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID (OIDC, as
+  #            used by deploy), FOUNDRY_API_KEY, BRAVE_SEARCH_API_KEY
+  #   vars:    FOUNDRY_ENDPOINT, MODEL_ROUTER_DEPLOYMENT, COSMOS_ENDPOINT
+  #            (optional: COSMOS_DATABASE, FOUNDRY_API_VERSION)
+  # The OIDC service principal also needs the Cosmos DB Built-in Data Contributor
+  # role on the account so the minted AAD token can read items.
+  data-retrieval-smoke:
+    name: Data-Retrieval Self-Test
+    runs-on: ubuntu-latest
+    needs: [quality, supply-chain]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Mint Cosmos data-plane AAD token
+        # The token resource is the account host with no port or path, e.g.
+        # https://acct.documents.azure.com:443/ -> https://acct.documents.azure.com
+        run: |
+          host=$(echo "${{ vars.COSMOS_ENDPOINT }}" | sed -E 's#(https?://[^/:]+).*#\1#')
+          token=$(az account get-access-token --resource "$host" --query accessToken -o tsv)
+          echo "::add-mask::$token"
+          echo "COSMOS_AAD_TOKEN=$token" >> "$GITHUB_ENV"
+
+      - name: Run data-retrieval self-test
+        # A non-zero exit here fails the job and therefore blocks the deploy.
+        run: cargo run --quiet -- test-data-retrieval
+        env:
+          GAIA_MODE: dev
+          GAIA_USER_ID: threadkeeper
+          FOUNDRY_ENDPOINT: ${{ vars.FOUNDRY_ENDPOINT }}
+          MODEL_ROUTER_DEPLOYMENT: ${{ vars.MODEL_ROUTER_DEPLOYMENT }}
+          FOUNDRY_API_VERSION: ${{ vars.FOUNDRY_API_VERSION }}
+          FOUNDRY_API_KEY: ${{ secrets.FOUNDRY_API_KEY }}
+          COSMOS_ENDPOINT: ${{ vars.COSMOS_ENDPOINT }}
+          COSMOS_DATABASE: ${{ vars.COSMOS_DATABASE }}
+          BRAVE_SEARCH_API_KEY: ${{ secrets.BRAVE_SEARCH_API_KEY }}
+
   # Continuous deployment: build the backend image and roll it out to the Azure
-  # Container App. Runs only on pushes to main, and only after the two gates that
-  # actually protect production have passed: all tests (quality) and the security
-  # audit (supply-chain). The coverage job still runs on every push as a quality
-  # signal, but a coverage percentage is intentionally not allowed to block a
-  # deploy.
+  # Container App. Runs only on pushes to main, and only after the gates that
+  # actually protect production have passed: all tests (quality), the security
+  # audit (supply-chain), and the live data-retrieval self-test
+  # (data-retrieval-smoke). The coverage job still runs on every push as a
+  # quality signal, but a coverage percentage is intentionally not allowed to
+  # block a deploy.
   deploy:
     name: Build & Deploy to Azure
     runs-on: ubuntu-latest
-    needs: [quality, supply-chain]
+    needs: [quality, supply-chain, data-retrieval-smoke]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     # CD steps operate on the whole repo (the Dockerfile lives at the root), not
     # the rust/ subfolder the other jobs default to.

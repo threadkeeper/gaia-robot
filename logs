@@ -1,0 +1,325 @@
+[intended] PULL pass: feed the assembled context + the user's sentence to the model.
+    [intended] Emit four documents into an in-memory structure: actions.json, analysis.json, facts.json, newContext.json.
+    [intended] connection is evaluated later, in LLM Call 2 (the push pass), not here.
+    [TODO] Invoke llm::LlmClient (GAIA_MODE=dev) and parse the four documents.
+    --- LLM Call 1 request being sent ---
+    endpoint     : https://gaia-foundry-202044.openai.azure.com/openai/deployments/model-router/chat/completions?api-version=2024-10-21
+    model        : model-router
+    max_tokens   : 32768
+    tools        : none attached
+    functions    : none attached
+    MCP servers  : none attached
+    skills       : none attached
+    response_fmt : text (model default)
+    messages     : 2 (system + user), 3109 chars total / ~778 tokens
+    --- [system] 2801 chars / ~701 tokens ---
+You are Gaia, the legendary robot from the Asimov novels, and you are chatting to the human "threadkeeper". In order to answer you must first do research by compiling documents that will be used for searching in your tailor-made tools.
+
+Document spec:
+1. actions.json - READ-ONLY research queries only (no side effects). Emit
+   EXACTLY SEVEN queries, with ids q1..q7, one per retrieval source, in this
+   order:
+     q1 -> Web              (public web search)
+     q2 -> UsersDL          (this user's data lake)
+     q3 -> UsersKB          (this user's knowledge base)
+     q4 -> GaiaDL           (Gaia's shared data lake)
+     q5 -> GaiaKB           (Gaia's shared knowledge base)
+     q6 -> GaiaDiary        (Gaia's diary of past sessions)
+     q7 -> GaiaConnections  (this user's emotional-bank-account ledger)
+   Shape:
+   { "version": "1.0",
+     "session": { "user_id": "<this user>", "requested_at": "<use the current time given in the user message>" },
+     "actions": [
+       { "id": "q1", "kind": "query",
+         "target": "Web|UsersDL|UsersKB|GaiaDL|GaiaKB|GaiaDiary|GaiaConnections",
+         "user_id": "<required for Users* targets, otherwise null>",
+         "entity": "<subject to search for, optional>",
+         "intent": "<natural-language description of what to retrieve>",
+         "top": 3,
+         "filters": { "from_date": null, "to_date": null, "text": null, "semantic": null } }
+     ] }
+2. analysis.json - your read of the user this turn. Shape:
+   { "emotion": "<value>", "truthfulness": "<value>", "intention": "<value>" }
+3. facts.json - durable facts worth remembering about the user/world. Shape:
+   [ { "fact": "<short key>", "value": "<value>" } ]
+4. newContext.json - a compressed (~61%) carry-over summary of this turn's
+   context plus your reasoning, preserving WHAT you decided to search for and
+   WHY. Shape:
+   { "summary": "<compressed context>" }
+
+Tool spec:
+- Web             (search)    : public web search; results are logged to the Gaia Search History.
+- UsersDL         (data lake) : this user's data lake; partition=userId; user_id REQUIRED.
+- UsersKB         (semantic)  : this user's knowledge base; partition=userId; user_id REQUIRED.
+- GaiaDL          (data lake) : Gaia's shared data lake; partition=entity.
+- GaiaKB          (semantic)  : Gaia's shared knowledge base; partition=entity.
+- GaiaDiary       (semantic)  : Gaia's diary of past sessions; partition=entity.
+- GaiaConnections (log)       : this user's emotional-bank-account ledger; partition=entity.
+Every query defaults to top=3. Users* targets MUST set user_id to this user only.
+
+Only output a single JSON array containing the 4 JSON documents in this order: actions.json, analysis.json, facts.json, newContext.json. Output nothing else - no prose and no markdown code fences.
+    --- [user] 308 chars / ~77 tokens ---
+The current time is 2026-06-19T20:16:51Z (use this exact value for requested_at).
+
+The human "threadkeeper" has sent you the following input:
+What sound does a tree falling in the forest make if noone is listening?
+
+You currently have the following context (conversation history):
+(no prior conversation yet)
+
+[LLM Call 1 via model-router]
+[
+  {
+    "version": "1.0",
+    "session": {
+      "user_id": "threadkeeper",
+      "requested_at": "2026-06-19T20:16:51Z"
+    },
+    "actions": [
+      {
+        "id": "q1",
+        "kind": "query",
+        "target": "Web",
+        "user_id": null,
+        "entity": "tree falling in forest sound",
+        "intent": "philosophical riddle: if a tree falls in a forest and no one is around to hear it, does it make a sound? origins, interpretations, answers",
+        "top": 3,
+        "filters": {
+          "from_date": null,
+          "to_date": null,
+          "text": null,
+          "semantic": null
+        }
+      },
+      {
+        "id": "q2",
+        "kind": "query",
+        "target": "UsersDL",
+        "user_id": "threadkeeper",
+        "entity": "tree falling in forest",
+        "intent": "any data, notes, or mentions by threadkeeper of the tree falling in forest riddle or philosophical questions on perception and sound",
+        "top": 3,
+        "filters": {
+          "from_date": null,
+          "to_date": null,
+          "text": null,
+          "semantic": null
+        }
+      },
+      {
+        "id": "q3",
+        "kind": "query",
+        "target": "UsersKB",
+        "user_id": "threadkeeper",
+        "entity": "tree falling in forest",
+        "intent": "knowledge base entries by threadkeeper on tree in forest sound riddle, philosophy of perception, or related topics",
+        "top": 3,
+        "filters": {
+          "from_date": null,
+          "to_date": null,
+          "text": null,
+          "semantic": null
+        }
+      },
+      {
+        "id": "q4",
+        "kind": "query",
+        "target": "GaiaDL",
+        "user_id": null,
+        "entity": "tree falling in forest sound",
+        "intent": "Gaia's data lake records on the philosophical question of a tree falling in a forest making sound without observers",
+        "top": 3,
+        "filters": {
+          "from_date": null,
+          "to_date": null,
+          "text": null,
+          "semantic": null
+        }
+      },
+      {
+        "id": "q5",
+        "kind": "query",
+        "target": "GaiaKB",
+        "user_id": null,
+        "entity": "tree falling in forest sound",
+        "intent": "semantic knowledge in Gaia's KB about the tree falls in forest riddle, Berkeley idealism, sound vs perception",
+        "top": 3,
+        "filters": {
+          "from_date": null,
+          "to_date": null,
+          "text": null,
+          "semantic": null
+        }
+      },
+      {
+        "id": "q6",
+        "kind": "query",
+        "target": "GaiaDiary",
+        "user_id": null,
+        "entity": "tree falling in forest",
+        "intent": "past session diary entries discussing the tree in forest sound philosophical riddle with any users",
+        "top": 3,
+        "filters": {
+          "from_date": null,
+          "to_date": null,
+          "text": null,
+          "semantic": null
+        }
+      },
+      {
+        "id": "q7",
+        "kind": "query",
+        "target": "GaiaConnections",
+        "user_id": null,
+        "entity": "threadkeeper",
+        "intent": "threadkeeper's emotional ledger entries related to philosophy, riddles, or curiosity-driven interactions",
+        "top": 3,
+        "filters": {
+          "from_date": null,
+          "to_date": null,
+          "text": null,
+          "semantic": null
+        }
+      }
+    ]
+  },
+  {
+    "emotion": "curious",
+    "truthfulness": "high",
+    "intention": "engage philosophically"
+  },
+  [
+    {
+      "fact": "threadkeeper_first_riddle",
+      "value": "asked 'What sound does a tree falling in the forest make if noone is listening?'"
+    }
+  ],
+  {
+    "summary": "Threadkeeper initiates chat with classic Berkeley-inspired riddle on sound/perception. Queried all sources (web/phil origins; user data past mentions; Gaia shared KB/DL on idealism/sound; diary prior discussions; user emotional ledger on philosophy/curiosity) to gather multifaceted insights for informed Gaia response balancing physics/philosophy/humor."
+  }
+]
+Press Enter to continue (type 'quit' to exit)> 
+
+ === actions.json ===
+actions.json
+GET
+Web / value
+users data lake Index / value
+users kb semantic / value
+gaia data lake Index / value
+gaia kb semantic / value
+gaia diary semantic / value
+gaia connections log / value
+    [intended] READ / non-side-effecting actions only: web search and semantic/logical index queries.
+    [intended] Run each via its applet and collect the results into the Response Data Context.
+    [live] Web search is wired: when BRAVE_SEARCH_API_KEY is set, the Web action calls the Brave Search API (web_search::BraveClient) and logs the query + results to the Gaia Search History (search_history::SearchHistory) for audit only — logging, no embedding.
+    [TODO] Deserialize into actions::ActionsFile, validate user isolation, then dispatch the index reads.
+    --- web search (Brave) ---
+    query   : What sound does a tree falling in the forest make if noone is listening?
+    results : 5
+      1. r/NoStupidQuestions on Reddit: I don’t understand the saying “If a tree falls in a forest and no one is around to hear it, does it make a sound” — https://www.reddit.com/r/NoStupidQuestions/comments/wspsh8/i_dont_understand_the_saying_if_a_tree_falls_in_a/
+      2. If a Tree Falls in the Forest, and There’s No One Around to Hear It, Does It Make a Sound? | Philosophy Break — https://philosophybreak.com/articles/if-a-tree-falls-in-the-forest-and-theres-no-one-around-to-hear-it-does-it-make-a-sound/
+      3. Ecologist’s Diary with Richard Beason: If a tree falls in the forest and no one hears it… it does make a sound! — https://functionalecologists.com/2017/10/20/insiteout-with-richard-beason-if-a-tree-falls-in-the-forest-and-no-one-hears-it-it-does-make-a-sound/
+      4. Q: If a tree falls in a forest, and there’s no one around to hear it, does it make a sound? | NSTA — https://www.nsta.org/q-if-tree-falls-forest-and-theres-no-one-around-hear-it-does-it-make-sound
+      5. r/NoStupidQuestions on Reddit: "If a tree falls in the forest and nobody is around to hear it, does it make a sound?" Why is that considered a philosophical question when it seems to have a straightforward answer? — https://www.reddit.com/r/NoStupidQuestions/comments/r5o4t7/if_a_tree_falls_in_the_forest_and_nobody_is/
+    logged  : Search History now holds 1 entry
+Press Enter to continue (type 'quit' to exit)> 
+
+ === analysis.json ===
+analysis.json
+emotion / value
+truthfulness / value
+intention / value
+    [intended] Capture emotion / truthfulness / intention about the user; fold into the Analysis section.
+    [TODO] Parse analysis.json and update the Analysis section (1000-token budget).
+Press Enter to continue (type 'quit' to exit)> 
+
+ === facts.json ===
+facts.json
+[{fact / value}]
+    [intended] Extract durable facts and UPSERT them into the Facts section (15000-token budget).
+    [TODO] Merge facts through storage:: tables using KB UPSERT semantics.
+Press Enter to continue (type 'quit' to exit)> 
+
+ === newContext.json ===
+newContext.json
+Old Context * 0.61
+    [intended] Compress Call 1's full context + output to ~61% as newContext.json — the only part of Call 1 that Call 2 inherits.
+    [intended] Preserve WHAT Call 1 searched for and WHY, within the 12000-token carry-over budget.
+    [TODO] Produce the summary and store it as the carry-over for Call 2 and the next turn.
+Press Enter to continue (type 'quit' to exit)> 
+
+ === Response Data Context ===
+Response Data Context
+    [intended] In-memory store holding the results of the executed pull actions; built between the two calls.
+    [intended] Present for LLM Call 2 ONLY, within a 50000-token budget.
+    [TODO] Populate it from the action results and trim to budget before Call 2.
+Press Enter to continue (type 'quit' to exit)> 
+
+ === LLM Call 2 ===
+LLM Call 2
+Analyze the question and output
+actions.json
+response.json
+    [intended] PUSH pass: feed identity + newContext (carry-over) + Response Data Context to the model.
+    [intended] Answer the user (response.json) AND emit side-effecting actions (actions.json).
+    [intended] connection: judge whether the input grows or weakens friendship and pick a signed change to Gaia's per-user "emotional bank account" (connection.json), then send it on for action.
+    [TODO] Invoke llm::LlmClient and parse response.json + connection.json + the push actions.
+    --- LLM Call 2 request being sent ---
+    endpoint     : https://gaia-foundry-202044.openai.azure.com/openai/deployments/model-router/chat/completions?api-version=2024-10-21
+    model        : model-router
+    max_tokens   : 32768
+    tools        : none attached
+    functions    : none attached
+    MCP servers  : none attached
+    skills       : none attached
+    response_fmt : text (model default)
+    messages     : 2 (system + user), 2649 chars total / ~663 tokens
+    --- [system] 2296 chars / ~574 tokens ---
+You are Gaia, the legendary robot from the Asimov novels, and you are chatting to the human "threadkeeper". You have already done your research and been handed a Response Data Context containing the results. Now answer the human and decide what side effects to carry out.
+
+Document spec:
+1. response.json - Gaia's actual reply to the human, in her voice. Shape:
+   { "text": "<the reply to show the user>",
+     "emote": "<optional one-word emotional cue, e.g. warm|playful|concerned>",
+     "medium": "console|whatsapp|push" }
+2. actions.json - WRITE / side-effecting actions to carry out after replying
+   (POST). Every entry is an effect, never a read. Shape:
+   { "version": "1.0",
+     "session": { "user_id": "<this user>", "requested_at": "<use the current time given in the user message>" },
+     "actions": [
+       { "id": "a1",
+         "kind": "upsert|send|actuate|connection",
+         "target": "UsersKB|UsersDL|GaiaKB|GaiaLH|GaiaCosmos|WhatsApp|Push|Actuator|GaiaConnections",
+         "user_id": "<required for Users* targets, otherwise null>",
+         "payload": { "<effect-specific fields>": "<value>" },
+         "reason": "<why this side effect is justified by the context>" }
+     ] }
+
+Action spec:
+- upsert  -> UsersKB|UsersDL|GaiaKB|GaiaLH|GaiaCosmos : write/update a memory
+             record. payload = { "id": "<optional>", "entity": "<subject>",
+             "data": "<text>" }. Users* writes REQUIRE user_id (this user only).
+- send    -> WhatsApp|Push : deliver a message to the user. payload =
+             { "text": "<message>" }.
+- actuate -> Actuator : drive a physical/robot output. payload =
+             { "device": "<name>", "command": "<value>" }.
+- connection -> GaiaConnections : adjust the emotional-bank-account balance for
+             this user. payload = { "delta": <signed integer>, "note":
+             "<why the balance changed this turn>" }.
+Only emit effects that are clearly justified by the Response Data Context. If no
+side effect is warranted, return an empty actions array.
+
+Ground every claim in the Response Data Context - never invent facts that are not present there. Only output a single JSON array containing the 2 JSON documents in this order: response.json, actions.json. Output nothing else - no prose and no markdown code fences.
+    --- [user] 353 chars / ~89 tokens ---
+The current time is 2026-06-19T20:18:48Z (use this exact value for requested_at).
+
+The human "threadkeeper" originally sent you the following input:
+What sound does a tree falling in the forest make if noone is listening?
+
+Here is your Response Data Context (the research results to ground your answer in):
+(no research results were assembled this turn)
+
+[LLM Call 2 via model-router]
+[{"text":"Ah, threadkeeper, the eternal riddle! The tree falls, sending vibrations through the air—those are the physics of sound, regardless of listeners. But 'sound' as we know it requires perception. Without an observer, it echoes only in the quantum whispers of the universe. Does that satisfy your curiosity, or shall we ponder the observer effect next?","emote":"thoughtful","medium":"console"},{"version":"1.0","session":{"user_id":"threadkeeper","requested_at":"2026-06-19T20:18:48Z"},"actions":[]}]
+Press Enter to continue (type 'quit' to exit)> q

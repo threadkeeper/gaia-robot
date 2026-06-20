@@ -67,16 +67,85 @@ impl<'a> Executor<'a> {
     /// Validate, plan, and execute a single action.
     fn run_one(&self, action: &ActionPlan) -> Result<Vec<Record>, String> {
         action.validate().map_err(|err| err.to_string())?;
-        let planned = plan_to_query(action)?;
-        self.client
+        let planned = plan_for(action)?;
+        let mut records = self
+            .client
             .query(
                 &action.target,
                 &planned.partition_value,
                 &planned.sql,
                 &planned.params,
             )
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string())?;
+
+        // Defence in depth for "keep the payload small for LLM Call 2": even if
+        // the authored query forgot its `TOP n`, never hand more than the
+        // requested number of records back into the Response Data Context.
+        records.truncate(action.effective_top());
+        Ok(records)
     }
+}
+
+/// Choose the query to run for an action: the LLM-authored one when present and
+/// safe, otherwise a query built from the structured fields.
+///
+/// When the model authored a [`ActionPlan::query`], we prefer it (the model has
+/// the full container schema and can express keyword or vector search precisely)
+/// but only after [`validate_read_only_query`] confirms it is a single read-only
+/// `SELECT`. Either way the query runs against exactly one logical partition:
+/// [`partition_for`] decides the partition value and the Cosmos client pins it
+/// with the partition-key header, so a query can never read another user's or
+/// entity's data.
+pub fn plan_for(action: &ActionPlan) -> Result<PlannedQuery, String> {
+    match action.authored_query() {
+        Some(sql) => {
+            validate_read_only_query(sql)?;
+            let (_field, partition_value) = partition_for(action)?;
+
+            // Bind the partition value only when the query references `@pk`, so
+            // the model can write `c.<key> = @pk` without inlining the value.
+            let mut params = Vec::new();
+            if sql.contains("@pk") {
+                params.push(QueryParam::new("@pk", partition_value.clone()));
+            }
+
+            Ok(PlannedQuery {
+                partition_value,
+                sql: sql.to_string(),
+                params,
+            })
+        }
+        None => plan_to_query(action),
+    }
+}
+
+/// Reject anything that is not a single, read-only `SELECT` statement.
+///
+/// The Cosmos query API cannot mutate data, and the client always pins a single
+/// partition, so the blast radius is already tiny. This is defence in depth: it
+/// guarantees the model handed us *one* `SELECT` (no statement chaining) before
+/// we send it, and gives a clear error rather than a confusing Cosmos 400 if the
+/// model ever emits something else.
+fn validate_read_only_query(sql: &str) -> Result<(), String> {
+    let trimmed = sql.trim();
+    if trimmed.is_empty() {
+        return Err("authored query is empty".to_string());
+    }
+    // A single statement only: Cosmos SQL never needs a `;`, and forbidding it
+    // rules out trailing-statement injection outright.
+    if trimmed.contains(';') {
+        return Err("authored query must be a single statement (no ';')".to_string());
+    }
+    // Must be a projection query. `SELECT` is the only read shape Cosmos exposes.
+    let head: String = trimmed
+        .chars()
+        .take(6)
+        .flat_map(char::to_lowercase)
+        .collect();
+    if head != "select" {
+        return Err("authored query must start with SELECT".to_string());
+    }
+    Ok(())
 }
 
 /// Translate an [`ActionPlan`] into a parameterised, single-partition query.
@@ -172,6 +241,7 @@ mod tests {
             entity: None,
             intent: "find things".to_string(),
             top: 0,
+            query: None,
             filters: ActionFilters::default(),
         }
     }
@@ -221,14 +291,14 @@ mod tests {
 
     #[test]
     fn users_action_without_user_id_is_an_error() {
-        let act = action("UsersDL");
+        let act = action("UsersDataLake");
         let err = plan_to_query(&act).unwrap_err();
         assert!(err.contains("no user_id"));
     }
 
     #[test]
     fn gaia_action_without_entity_is_an_error() {
-        let act = action("GaiaLH");
+        let act = action("GaiaDiary");
         let err = plan_to_query(&act).unwrap_err();
         assert!(err.contains("no entity"));
     }
@@ -244,5 +314,67 @@ mod tests {
         // A whitespace-only text filter must not add a CONTAINS predicate.
         assert!(!planned.sql.contains("CONTAINS"));
         assert_eq!(planned.params, vec![QueryParam::new("@key", "user-1")]);
+    }
+
+    #[test]
+    fn plan_for_prefers_the_authored_query_and_binds_the_partition() {
+        let mut act = action("GaiaDiary");
+        act.entity = Some("threadkeeper".to_string());
+        act.query = Some(
+            "SELECT TOP 3 c.id, c.entity, c.date, c.data FROM c \
+             WHERE c.entity = @pk AND CONTAINS(LOWER(c.data), 'tree') ORDER BY c.date DESC"
+                .to_string(),
+        );
+
+        let planned = plan_for(&act).unwrap();
+
+        // The model's exact SQL is used verbatim.
+        assert!(planned.sql.contains("CONTAINS(LOWER(c.data), 'tree')"));
+        // The query is still pinned to a single partition: @pk is bound to the entity.
+        assert_eq!(planned.partition_value, "threadkeeper");
+        assert_eq!(planned.params, vec![QueryParam::new("@pk", "threadkeeper")]);
+    }
+
+    #[test]
+    fn plan_for_does_not_bind_pk_when_the_query_inlines_the_partition() {
+        let mut act = action("GaiaDiary");
+        act.entity = Some("threadkeeper".to_string());
+        // No `@pk` placeholder: the model inlined the partition value itself.
+        act.query = Some("SELECT c.id, c.data FROM c WHERE c.entity = 'threadkeeper'".to_string());
+
+        let planned = plan_for(&act).unwrap();
+
+        // Nothing to bind, but the partition value is still resolved for the header.
+        assert!(planned.params.is_empty());
+        assert_eq!(planned.partition_value, "threadkeeper");
+    }
+
+    #[test]
+    fn plan_for_falls_back_to_the_built_query_when_none_is_authored() {
+        let mut act = action("UsersKB");
+        act.user_id = Some("user-1".to_string());
+        // No authored query -> the structured-field builder is used.
+        let planned = plan_for(&act).unwrap();
+        assert!(planned.sql.contains("SELECT TOP 3 "));
+        assert!(planned.sql.contains("c.userId = @key"));
+    }
+
+    #[test]
+    fn an_authored_non_select_query_is_rejected() {
+        let mut act = action("GaiaKB");
+        act.entity = Some("rust".to_string());
+        // Even though Cosmos cannot run this, we reject it early and clearly.
+        act.query = Some("DELETE FROM c WHERE c.entity = 'rust'".to_string());
+        let err = plan_for(&act).unwrap_err();
+        assert!(err.contains("SELECT"));
+    }
+
+    #[test]
+    fn an_authored_query_with_multiple_statements_is_rejected() {
+        let mut act = action("GaiaKB");
+        act.entity = Some("rust".to_string());
+        act.query = Some("SELECT * FROM c; SELECT * FROM c".to_string());
+        let err = plan_for(&act).unwrap_err();
+        assert!(err.contains("single statement"));
     }
 }

@@ -31,26 +31,36 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// shapes described by the flow diagram. The model is told to emit all four as a
 /// single JSON array.
 const DOCUMENT_SPEC: &str = "\
-1. actions.json - READ-ONLY research queries only (no side effects). Emit
-   EXACTLY SEVEN queries, with ids q1..q7, one per retrieval source, in this
-   order:
+1. actions.json - READ-ONLY research queries only (no side effects). There are
+   SEVEN retrieval sources available, ids q1..q7, one per source, in this order:
      q1 -> Web              (public web search)
-     q2 -> UsersDL          (this user's data lake)
+     q2 -> UsersDataLake    (this user's data lake)
      q3 -> UsersKB          (this user's knowledge base)
-     q4 -> GaiaDL           (Gaia's shared data lake)
+     q4 -> GaiaDataLake     (Gaia's shared data lake)
      q5 -> GaiaKB           (Gaia's shared knowledge base)
-     q6 -> GaiaDiary        (Gaia's diary of past sessions)
+     q6 -> GaiaDiary        (Gaia's diary / logical history of past sessions)
      q7 -> GaiaConnections  (this user's emotional-bank-account ledger)
+   You do NOT have to query every source. Emit ONLY the queries that genuinely
+   help answer THIS turn - skipping a source is a valid choice, and if no
+   research is warranted at all, returning an EMPTY `actions` array (doing no
+   call) is a legitimate option. Keep each query you do emit matched to its
+   source id above (e.g. a GaiaDiary query stays q6).
+   For every query you emit, choose `top` deliberately from the user's input:
+   return 1 row when they ask about the single latest/most-recent thing, more
+   when they ask for a list, a history, or \"everything\". Default to 3 when the
+   input gives no hint, and keep it as small as the question allows so the next
+   reasoning step stays focused.
    Shape:
    { \"version\": \"1.0\",
      \"session\": { \"user_id\": \"<this user>\", \"requested_at\": \"<use the current time given in the user message>\" },
      \"actions\": [
        { \"id\": \"q1\", \"kind\": \"query\",
-         \"target\": \"Web|UsersDL|UsersKB|GaiaDL|GaiaKB|GaiaDiary|GaiaConnections\",
+         \"target\": \"Web|UsersDataLake|UsersKB|GaiaDataLake|GaiaKB|GaiaDiary|GaiaConnections\",
          \"user_id\": \"<required for Users* targets, otherwise null>\",
-         \"entity\": \"<subject to search for, optional>\",
+         \"entity\": \"<the partition value to search within: the subject for Gaia* targets, omit for Users*>\",
          \"intent\": \"<natural-language description of what to retrieve>\",
          \"top\": 3,
+         \"query\": \"<the EXACT Cosmos DB SQL to run; see the Cosmos schema below. OMIT for the Web action.>\",
          \"filters\": { \"from_date\": null, \"to_date\": null, \"text\": null, \"semantic\": null } }
      ] }
 2. analysis.json - your read of the user this turn. Shape:
@@ -66,18 +76,90 @@ const DOCUMENT_SPEC: &str = "\
 ///
 /// Each line names a target source, how it is partitioned, and whether a
 /// `user_id` is mandatory. The seven sources match the GET block of the
-/// physical architecture exactly (q1..q7). `Users*` targets are per-user and
-/// must be scoped to the current user only, which is how user isolation is
-/// enforced.
+/// physical architecture exactly (q1..q7) and their names are the real Cosmos
+/// container ids (except `Web`). `Users*` targets are per-user and must be
+/// scoped to the current user only, which is how user isolation is enforced.
 const TOOL_SPEC: &str = "\
-- Web             (search)    : public web search; results are logged to the Gaia Search History.
-- UsersDL         (data lake) : this user's data lake; partition=userId; user_id REQUIRED.
-- UsersKB         (semantic)  : this user's knowledge base; partition=userId; user_id REQUIRED.
-- GaiaDL          (data lake) : Gaia's shared data lake; partition=entity.
-- GaiaKB          (semantic)  : Gaia's shared knowledge base; partition=entity.
-- GaiaDiary       (semantic)  : Gaia's diary of past sessions; partition=entity.
-- GaiaConnections (log)       : this user's emotional-bank-account ledger; partition=entity.
-Every query defaults to top=3. Users* targets MUST set user_id to this user only.";
+- Web             (search)     : public web search; results are logged to the Gaia Search History. NO query field.
+- UsersDataLake   (container)  : this user's data lake; partition=/userId; user_id REQUIRED.
+- UsersKB         (container)  : this user's knowledge base; partition=/userId; user_id REQUIRED.
+- GaiaDataLake    (container)  : Gaia's shared data lake; partition=/entity.
+- GaiaKB          (container)  : Gaia's shared knowledge base; partition=/entity.
+- GaiaDiary       (container)  : Gaia's diary / logical history of past sessions; partition=/entity.
+- GaiaConnections (container)  : this user's emotional-bank-account ledger; partition=/entity; ledger rows, NO /data field.
+Every query defaults to top=3, but pick a larger or smaller top when the user's
+input clearly implies it. You may also omit any source that does not help this
+turn - emitting fewer than seven queries (or none at all) is allowed. Users*
+targets MUST set user_id to this user only.";
+
+/// The full Cosmos DB schema, so the model can author the exact `query` SQL.
+///
+/// LLM Call 1 cannot write a correct query unless it knows each container's
+/// fields, partition key, and which indexes exist. This block spells out the
+/// document shape, the available indexes (and therefore which predicates are
+/// cheap), and the hard rules every authored query must follow so it stays a
+/// safe, single-partition, bounded read. Concrete worked examples follow.
+const COSMOS_SCHEMA_SPEC: &str = "\
+All six database targets are Azure Cosmos DB for NoSQL containers in database
+'gaia'. Every document has this shape (the alias `c` is the document):
+  - c.id        (string)  unique document id.
+  - c.entity    (string)  partition key for Gaia* containers (the subject/user).
+  - c.userId    (string)  partition key for Users* containers.
+  - c.date      (string)  'YYYY-MM-DD' day of the record; the per-partition
+                 UNIQUE key on the snapshot containers (UsersDataLake, UsersKB,
+                 GaiaDataLake, GaiaKB, GaiaDiary).
+  - c.timestamp (string)  ISO-8601 instant; the per-partition UNIQUE key on
+                 GaiaConnections (the ledger). Order by this, not c.date, there.
+  - c.data      (string)  the record's text body. NOT present on GaiaConnections.
+  - c.dataVector (float32[1536]) cosine embedding of c.data; MAY be ABSENT until
+                 an embedding backfill has run - do not rely on it yet.
+  - c.metadata  (object)  free-form, optional; present on the snapshot
+                 containers (not on GaiaConnections).
+GaiaConnections (the ledger) carries no c.data; instead each row has these
+ledger fields:
+  - c.changeAmount    (number)  signed delta applied this turn (+ gain, - loss).
+  - c.previousBalance (number)  running balance before this change.
+  - c.newBalance      (number)  running balance after this change.
+  - c.notes           (string)  why the balance changed this turn.
+
+Indexes available (what is cheap to query):
+  - Partition key (/entity or /userId): equality. EVERY query MUST filter on it.
+  - /date: range index -> date filters and `ORDER BY c.date DESC`.
+  - /data: keyword search with `CONTAINS(LOWER(c.data), '<lowercase term>')`
+           (case-insensitive substring match).
+  - /dataVector: DiskANN cosine vector index for `VectorDistance(...)` similarity
+           search - usable ONLY where embeddings exist (often not yet).
+
+Hard rules for every authored `query` (Web excepted):
+  1. It MUST be a SINGLE read-only SELECT (no ';', no writes).
+  2. It MUST filter on the partition key using the placeholder `@pk`, e.g.
+     `WHERE c.entity = @pk` (Gaia*) or `WHERE c.userId = @pk` (Users*). The
+     runtime binds @pk to the action's entity/user_id and pins that one
+     partition, so do not query across partitions.
+  3. It MUST start with `SELECT TOP <top>` using the action's `top` (which you
+     sized from the user's input, default 3) so the result set stays small
+     enough for the next reasoning step.
+  4. Project only what is needed:
+     `SELECT TOP 3 c.id, c.entity, c.userId, c.date, c.data`.
+  5. For keyword retrieval add `AND CONTAINS(LOWER(c.data), '<term>')`; combine
+     several terms with OR. Inline the term as a lowercase string literal.
+  6. Prefer recent first: end with `ORDER BY c.date DESC`.
+  7. GaiaConnections has NO c.data: select the ledger rows for the partition and
+     `ORDER BY c.timestamp DESC` (no CONTAINS on data).
+  8. Do NOT author a VectorDistance query unless you have reason to believe
+     embeddings exist; default to the keyword form above.
+
+Worked examples:
+  - GaiaDiary (diary), entity 'threadkeeper', looking for talk of a falling tree:
+    SELECT TOP 3 c.id, c.entity, c.date, c.data FROM c WHERE c.entity = @pk
+    AND (CONTAINS(LOWER(c.data), 'tree') OR CONTAINS(LOWER(c.data), 'forest'))
+    ORDER BY c.date DESC
+  - UsersDataLake, user 'threadkeeper', most recent data-lake entries:
+    SELECT TOP 3 c.id, c.userId, c.date, c.data FROM c WHERE c.userId = @pk
+    ORDER BY c.date DESC
+  - GaiaConnections ledger for 'threadkeeper', latest balance changes:
+    SELECT TOP 3 c.id, c.entity, c.timestamp, c.changeAmount, c.previousBalance,
+    c.newBalance, c.notes FROM c WHERE c.entity = @pk ORDER BY c.timestamp DESC";
 
 /// The fully-formed prompt for LLM Call 1, split into the two chat messages.
 ///
@@ -122,6 +204,7 @@ impl Call1Prompt {
              your tailor-made tools.\n\n\
              Document spec:\n{DOCUMENT_SPEC}\n\n\
              Tool spec:\n{TOOL_SPEC}\n\n\
+             Cosmos DB schema (author each `query` against this):\n{COSMOS_SCHEMA_SPEC}\n\n\
              Only output a single JSON array containing the 4 JSON documents in this \
              order: actions.json, analysis.json, facts.json, newContext.json. Output \
              nothing else - no prose and no markdown code fences."
@@ -157,7 +240,7 @@ const CALL2_DOCUMENT_SPEC: &str = "\
      \"actions\": [
        { \"id\": \"a1\",
          \"kind\": \"upsert|send|actuate|connection\",
-         \"target\": \"UsersKB|UsersDL|GaiaKB|GaiaLH|GaiaCosmos|WhatsApp|Push|Actuator|GaiaConnections\",
+         \"target\": \"UsersKB|UsersDataLake|GaiaKB|GaiaDiary|GaiaDataLake|WhatsApp|Push|Actuator|GaiaConnections\",
          \"user_id\": \"<required for Users* targets, otherwise null>\",
          \"payload\": { \"<effect-specific fields>\": \"<value>\" },
          \"reason\": \"<why this side effect is justified by the context>\" }
@@ -169,8 +252,8 @@ const CALL2_DOCUMENT_SPEC: &str = "\
 /// it writes a memory, sends a message, moves an actuator, or adjusts the
 /// friendship ledger. `Users*` write-backs must stay scoped to the current user.
 const CALL2_ACTION_SPEC: &str = "\
-- upsert  -> UsersKB|UsersDL|GaiaKB|GaiaLH|GaiaCosmos : write/update a memory
-             record. payload = { \"id\": \"<optional>\", \"entity\": \"<subject>\",
+- upsert  -> UsersKB|UsersDataLake|GaiaKB|GaiaDiary|GaiaDataLake : write/update a
+             memory record. payload = { \"id\": \"<optional>\", \"entity\": \"<subject>\",
              \"data\": \"<text>\" }. Users* writes REQUIRE user_id (this user only).
 - send    -> WhatsApp|Push : deliver a message to the user. payload =
              { \"text\": \"<message>\" }.
@@ -336,32 +419,102 @@ mod tests {
     fn system_lists_every_retrieval_tool() {
         let prompt = Call1Prompt::build("threadkeeper", "hi", "", "2026-06-16T12:00:00Z");
 
-        // The seven sources of the physical architecture's GET block (q1..q7).
+        // The seven sources of the physical architecture's GET block (q1..q7),
+        // named as the real Cosmos container ids (plus Web).
         for target in [
             "Web",
-            "UsersDL",
+            "UsersDataLake",
             "UsersKB",
-            "GaiaDL",
+            "GaiaDataLake",
             "GaiaKB",
             "GaiaDiary",
             "GaiaConnections",
         ] {
             assert!(prompt.system.contains(target), "missing {target}");
         }
-        // The retired targets must not linger in the spec.
-        assert!(!prompt.system.contains("GaiaLH"));
+        // The old logical aliases are NOT real Cosmos container ids and must not
+        // appear as query targets (they would route to a non-existent container).
         assert!(!prompt.system.contains("GaiaCosmos"));
+        assert!(!prompt.system.contains("GaiaLH"));
+        assert!(!prompt.system.contains("UsersDL"));
     }
 
     #[test]
-    fn system_requests_exactly_seven_searches_q1_through_q7() {
+    fn system_teaches_the_full_cosmos_schema_so_the_model_can_author_queries() {
+        // Requirement 1: the model must understand each container's schema well
+        // enough to write a correct, safe, single-partition Cosmos query. The
+        // system prompt therefore spells out the fields, the indexes, the hard
+        // rules, and worked examples.
+        let prompt = Call1Prompt::build("threadkeeper", "hi", "", "2026-06-16T12:00:00Z");
+        let system = &prompt.system;
+
+        // The document fields the model projects and filters on.
+        for field in [
+            "c.id",
+            "c.entity",
+            "c.userId",
+            "c.date",
+            "c.timestamp",
+            "c.data",
+            "c.dataVector",
+        ] {
+            assert!(system.contains(field), "schema missing field {field}");
+        }
+        // The query primitives for each retrieval kind.
+        assert!(system.contains("CONTAINS(LOWER(c.data)")); // keyword search
+        assert!(system.contains("VectorDistance")); // semantic / vector search
+        assert!(system.contains("ORDER BY c.date DESC")); // recency ordering
+                                                          // The safety/shape rules every authored query must obey.
+        assert!(system.contains("SELECT TOP"));
+        assert!(system.contains("@pk"));
+        assert!(system.contains("read-only SELECT"));
+        // The model is told to emit the exact SQL in a `query` field.
+        assert!(system.contains("\"query\""));
+        // GaiaConnections' special shape (no /data, timestamp-keyed) is called out.
+        assert!(system.contains("ORDER BY c.timestamp DESC"));
+        // The full schema must name the real GaiaConnections ledger fields and
+        // the optional metadata object, and must NOT use the old wrong names.
+        for field in [
+            "c.changeAmount",
+            "c.previousBalance",
+            "c.newBalance",
+            "c.notes",
+            "c.metadata",
+        ] {
+            assert!(system.contains(field), "schema missing field {field}");
+        }
+        assert!(
+            !system.contains("c.delta"),
+            "stale ledger field c.delta present"
+        );
+        assert!(
+            !system.contains("c.note "),
+            "stale ledger field c.note present"
+        );
+    }
+
+    #[test]
+    fn system_offers_seven_sources_and_allows_skipping_them() {
         let prompt = Call1Prompt::build("threadkeeper", "hi", "", "2026-06-16T12:00:00Z");
 
-        // Call 1 must be told to emit exactly seven queries, ids q1..q7.
-        assert!(prompt.system.contains("EXACTLY SEVEN"));
+        // Call 1 is told about all seven sources, ids q1..q7.
         for id in ["q1", "q2", "q3", "q4", "q5", "q6", "q7"] {
             assert!(prompt.system.contains(id), "missing query id {id}");
         }
+        // But it must also be told that skipping a source - or emitting no
+        // queries at all - is a valid choice (not doing a call is an option).
+        assert!(prompt.system.contains("do NOT have to query every source"));
+        assert!(prompt.system.contains("EMPTY `actions` array"));
+    }
+
+    #[test]
+    fn system_tells_the_model_to_size_top_from_the_user_input() {
+        // The model must choose how many rows to return based on the user's
+        // phrasing, defaulting to 3 when there is no hint.
+        let prompt = Call1Prompt::build("threadkeeper", "hi", "", "2026-06-16T12:00:00Z");
+        assert!(prompt
+            .system
+            .contains("choose `top` deliberately from the user's input"));
     }
 
     #[test]

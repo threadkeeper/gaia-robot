@@ -72,6 +72,7 @@ mod search_history;
 mod server;
 mod sha1;
 mod storage;
+mod test_data_retrieval;
 mod web_search;
 mod websocket;
 
@@ -126,6 +127,15 @@ mod context_budget {
 /// `ExitCode` rather than panicking so failures surface as a normal, testable
 /// exit status.
 fn main() -> ExitCode {
+    // --- 0a. Data-retrieval self-test mode (opt-in via subcommand) ---------
+    // `gaia-robot test-data-retrieval` runs the five-question pull-pass probe
+    // (LLM Call 1 -> actions.json -> Cosmos + Brave) and exits non-zero on any
+    // failure, so it doubles as an on-demand check and a hard CI deploy gate.
+    // It is checked first so it never collides with server or console mode.
+    if wants_data_retrieval_test() {
+        return run_data_retrieval_test();
+    }
+
     // --- 0. HTTP server mode (opt-in) --------------------------------------
     // When a listen address is configured (`GAIA_HTTP_ADDR` or `GAIA_HTTP_PORT`),
     // run the backend server instead of the interactive console. This is what the
@@ -453,6 +463,47 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Return `true` when the program was invoked as the data-retrieval self-test.
+///
+/// Triggered by a `test-data-retrieval` (or `TestDataRetrieval`) argument so the
+/// probe can be launched as `gaia-robot test-data-retrieval`. The comparison is
+/// case-insensitive so the PowerShell wrapper name and the CLI form both work.
+fn wants_data_retrieval_test() -> bool {
+    std::env::args().skip(1).any(|arg| {
+        arg.eq_ignore_ascii_case("test-data-retrieval")
+            || arg.eq_ignore_ascii_case("testdataretrieval")
+    })
+}
+
+/// Run the data-retrieval self-test and map its result to an exit code.
+///
+/// Builds the probe from the environment (the same dev/local configuration the
+/// rest of the program uses), runs all five questions, and returns
+/// [`ExitCode::SUCCESS`] only when every question passed. A configuration
+/// problem (no model, etc.) or any retrieval failure returns
+/// [`ExitCode::FAILURE`] so CI halts before deploying.
+fn run_data_retrieval_test() -> ExitCode {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    let probe = match test_data_retrieval::DataRetrievalProbe::from_env() {
+        Ok(probe) => probe,
+        Err(err) => {
+            // A self-test that cannot even start has validated nothing, so we
+            // fail closed rather than reporting a misleading success.
+            let _ = writeln!(out, "data-retrieval self-test cannot run: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match probe.run(&mut out) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        // An I/O error writing the report is itself a failure.
+        Err(_) => ExitCode::FAILURE,
+    }
+}
+
 /// Run the backend HTTP/WebSocket server, blocking until it stops.
 ///
 /// Builds the turn [`engine::Engine`] from the same environment the console app
@@ -687,18 +738,13 @@ fn summarize_pull_outcomes(outcomes: &[executor::ActionOutcome]) -> (String, Str
 
 /// Extract the `actions.json` document from LLM Call 1's raw reply.
 ///
-/// Call 1 emits a JSON array of four documents; the first is `actions.json`. We
-/// locate the array by its outer brackets (tolerating any code fences or stray
-/// prose around it), parse it, and deserialize element 0 into an
-/// [`actions::ActionsFile`]. Returns `None` if anything about that shape is off,
+/// Call 1 emits a JSON array of four documents; the first is `actions.json`.
+/// This delegates to the shared [`actions::parse_call1_actions`] parser so the
+/// console pull pass and the data-retrieval self-test agree on exactly how Call
+/// 1 output is interpreted. Returns `None` if anything about that shape is off,
 /// so the caller can degrade gracefully rather than fail the turn.
 fn parse_actions_from_call1(call1_reply: &str) -> Option<actions::ActionsFile> {
-    let start = call1_reply.find('[')?;
-    let end = call1_reply.rfind(']')?;
-    let json = call1_reply.get(start..=end)?;
-    let value: serde_json::Value = serde_json::from_str(json).ok()?;
-    let first = value.as_array()?.first()?;
-    serde_json::from_value(first.clone()).ok()
+    actions::parse_call1_actions(call1_reply)
 }
 
 /// Truncate `text` to at most `max` characters, appending an ellipsis marker
@@ -1080,7 +1126,7 @@ mod tests {
 [
   {"version":"1.0",
    "session":{"user_id":"u1","requested_at":"2026-06-16T12:00:00Z"},
-   "actions":[{"id":"q1","kind":"query","target":"GaiaLH","entity":"threadkeeper",
+   "actions":[{"id":"q1","kind":"query","target":"GaiaDiary","entity":"threadkeeper",
      "intent":"recent","top":3,
      "query":"SELECT TOP 3 c.id FROM c WHERE c.entity = @pk","filters":{}}]},
   {"analysis":true},{"facts":[]},{"newContext":""}
@@ -1090,7 +1136,7 @@ thanks"#;
 
         let parsed = parse_actions_from_call1(reply).expect("should parse actions.json");
         assert_eq!(parsed.actions.len(), 1);
-        assert_eq!(parsed.actions[0].target, "GaiaLH");
+        assert_eq!(parsed.actions[0].target, "GaiaDiary");
         assert_eq!(
             parsed.actions[0].authored_query(),
             Some("SELECT TOP 3 c.id FROM c WHERE c.entity = @pk")
@@ -1126,8 +1172,8 @@ thanks"#;
             session: actions::SessionContext::default(),
             actions: vec![
                 action("q1", "Web", None),
-                action("q2", "GaiaLH", None),
-                action("q3", "UsersDL", None),
+                action("q2", "GaiaDiary", None),
+                action("q3", "UsersDataLake", None),
             ],
         };
 
@@ -1140,15 +1186,15 @@ thanks"#;
     #[test]
     fn describe_authored_queries_shows_the_sql_per_action() {
         let sql = "SELECT TOP 3 c.id FROM c WHERE c.entity = @pk";
-        let log = describe_authored_queries(&[action("q1", "GaiaLH", Some(sql))]);
-        assert!(log.contains("[q1] GaiaLH ::"));
+        let log = describe_authored_queries(&[action("q1", "GaiaDiary", Some(sql))]);
+        assert!(log.contains("[q1] GaiaDiary ::"));
         assert!(log.contains(sql));
     }
 
     #[test]
     fn summarize_pull_outcomes_formats_records_and_errors() {
         let record = storage::Record::new(
-            "GaiaLH|threadkeeper|2026-05-10",
+            "GaiaDiary|threadkeeper|2026-05-10",
             "threadkeeper",
             "",
             "2026-05-10",
