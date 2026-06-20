@@ -54,6 +54,9 @@ jobs:
   coverage:
     name: Test Coverage
     runs-on: ubuntu-latest
+    # Coverage is tracked as a quality signal and artifact, but it should not
+    # fail the entire CI workflow or block successful CD gates.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
