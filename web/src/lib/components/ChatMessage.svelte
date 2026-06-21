@@ -244,6 +244,17 @@
   </div>
 </div>
 
+{#if !isUser && !message.error && message.meta?.actionsSummary}
+  <!-- A second, lighter bubble summarizing the side effects Gaia performed
+       this turn (WhatsApp / Push / Edwino actuate / data-store write-backs). -->
+  <div class="row">
+    <div class="bubble actions" title="Actions Gaia performed this run">
+      <span class="actions-head">Actions this run</span>
+      <span class="actions-body">{message.meta.actionsSummary}</span>
+    </div>
+  </div>
+{/if}
+
 <style>
   .row {
     display: flex;
@@ -269,6 +280,22 @@
   }
   .bubble.err {
     border-color: var(--danger);
+  }
+  .bubble.actions {
+    background: transparent;
+    border-style: dashed;
+    box-shadow: none;
+    font-size: 0.85em;
+    opacity: 0.9;
+  }
+  .actions-head {
+    display: block;
+    font-weight: 600;
+    margin-bottom: 2px;
+    opacity: 0.7;
+  }
+  .actions-body {
+    white-space: pre-wrap;
   }
   .error-text {
     color: var(--danger);

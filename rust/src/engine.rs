@@ -54,6 +54,12 @@ pub struct TurnResult {
     /// Web-search queries run during the turn, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub searches: Option<Vec<String>>,
+    /// A short, human-readable summary of the side effects LLM Call 2 planned
+    /// this turn (WhatsApp / Push / Edwino actuate / store write-backs). The
+    /// front end renders it as an extra "actions performed" bubble. Omitted when
+    /// the turn planned no actions (e.g. skeleton mode or a Call 2 failure).
+    #[serde(rename = "actionsSummary", skip_serializing_if = "Option::is_none")]
+    pub actions_summary: Option<String>,
 }
 
 /// Runs Gaia turns. Holds the (optional) model and web-search clients plus the
@@ -195,6 +201,7 @@ impl Engine {
                 attention: 0.0,
                 thought_id,
                 searches: None,
+                actions_summary: None,
             };
         };
 
@@ -233,6 +240,8 @@ impl Engine {
                 } else {
                     Some(searches)
                 },
+                // Audit Call 2's actions.json and surface a short summary bubble.
+                actions_summary: summarize_call2_actions(&call2_raw),
             },
             Err(err) => TurnResult {
                 reply: format!("Sorry, I could not complete my reply: {err}"),
@@ -245,6 +254,7 @@ impl Engine {
                 } else {
                     Some(searches)
                 },
+                actions_summary: None,
             },
         }
     }
@@ -396,6 +406,27 @@ fn web_query_for(action: &ActionPlan, input: &str) -> String {
     input.trim().to_string()
 }
 
+/// Summarize the side effects LLM Call 2 planned in its `actions.json`.
+///
+/// Call 2 emits `[response.json, actions.json]`; this reads the second document,
+/// audits it with the exact same classifier the push-pass self-test uses
+/// ([`crate::data_execution::audit_actions`]), and renders a short multi-line
+/// summary ([`crate::data_execution::summarize_actions`]). Returns `None` when
+/// the reply has no parseable actions document or planned nothing actionable, so
+/// the [`TurnResult::actions_summary`] field is simply omitted.
+fn summarize_call2_actions(raw: &str) -> Option<String> {
+    let cleaned = strip_code_fences(raw.trim());
+    let documents = crate::actions::extract_call1_array(cleaned)?;
+    let actions = documents.get(1)?;
+    let audit = crate::data_execution::audit_actions(actions);
+    let summary = crate::data_execution::summarize_actions(&audit);
+    if summary.trim().is_empty() {
+        None
+    } else {
+        Some(summary)
+    }
+}
+
 /// Pull Gaia's reply text out of LLM Call 2's raw output.
 ///
 /// Call 2 is asked to emit `[response.json, actions.json]`. We try to honour
@@ -495,6 +526,31 @@ mod tests {
     #[test]
     fn falls_back_to_raw_text_when_not_json() {
         assert_eq!(extract_reply_text("just words"), "just words");
+    }
+
+    #[test]
+    fn summarizes_call2_actions_from_the_second_document() {
+        // A well-formed [response.json, actions.json] reply yields a summary that
+        // names each planned side effect.
+        let raw = r#"[
+          { "text": "Hello" },
+          { "actions": [
+            { "id": "a1", "kind": "send", "target": "WhatsApp",
+              "to_name": "Jonty", "message": "Hi", "urgency": 0.7 },
+            { "id": "a4", "kind": "upsert", "target": "GaiaDiary", "payload": {} }
+          ] }
+        ]"#;
+        let summary = summarize_call2_actions(raw).expect("a summary");
+        assert!(summary.contains("WhatsApp to Jonty: sent"));
+        assert!(summary.contains("Saved to: GaiaDiary"));
+    }
+
+    #[test]
+    fn summarizes_call2_actions_returns_none_without_actions() {
+        // Only response.json present (no second element): nothing to summarize.
+        assert!(summarize_call2_actions(r#"[{ "text": "Hi" }]"#).is_none());
+        // Not parseable as a JSON array at all.
+        assert!(summarize_call2_actions("just words").is_none());
     }
 
     #[test]

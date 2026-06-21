@@ -100,6 +100,7 @@ function createConversation() {
             thoughtId: result.thoughtId,
             searches: result.searches,
             actions: result.actions,
+            actionsSummary: result.actionsSummary,
             routerRounds: result.routerRounds,
             debug: result.debug,
             flow: result.flow

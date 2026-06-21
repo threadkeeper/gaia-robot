@@ -1,3 +1,7 @@
-# Test output from data-retrieval self-test (regenerated on each run)
+# Test output from the data-retrieval / data-execution self-tests
+# (regenerated on each run).
 LLM1/
-LLM2/
+LLM2/*
+
+# Keep the authored push-pass spec — it is a contract document, not output.
+!LLM2/DataExecutionSpec.md

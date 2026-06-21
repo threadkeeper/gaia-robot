@@ -110,6 +110,8 @@ export interface ReplyResult {
   searches?: string[];
   /** Action phase outcomes (SEND_MESSAGE, SEND_PUSH, ADD_STM, ADD_LTM, ADD_KB). */
   actions?: ActionTile[];
+  /** Short summary of the side effects Gaia planned this turn (WhatsApp / Push / Edwino / store writes). */
+  actionsSummary?: string;
   /** Router rounds with per-round skill usage and readiness. */
   routerRounds?: RouterRound[];
   /** Per-tool diagnostics (web search query/results/errors). */
@@ -129,6 +131,8 @@ export interface ReplyMeta {
   thoughtId: string;
   searches?: string[];
   actions?: ActionTile[];
+  /** Short summary of the side effects Gaia planned this turn. */
+  actionsSummary?: string;
   routerRounds?: RouterRound[];
   debug?: DebugEntry[];
   flow?: OperationEvent[];

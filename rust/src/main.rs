@@ -60,6 +60,7 @@ mod auth;
 mod base64;
 mod connection;
 mod cosmos;
+mod data_execution;
 mod diary;
 mod embeddings;
 mod engine;
@@ -136,6 +137,16 @@ fn main() -> ExitCode {
     // It is checked first so it never collides with server or console mode.
     if wants_data_retrieval_test() {
         return run_data_retrieval_test();
+    }
+
+    // --- 0b. Data-execution self-test mode (opt-in via subcommand) ---------
+    // `gaia-robot test-data-execution` runs the five-turn push-pass probe
+    // (LLM Call 2 -> response.json + actions.json) over the contexts captured
+    // under tests/LLM1, auditing that every required side-effect record was
+    // emitted. Like the retrieval probe it exits non-zero on any failure so it
+    // doubles as an on-demand check and a hard CI gate.
+    if wants_data_execution_test() {
+        return run_data_execution_test();
     }
 
     // --- 0. HTTP server mode (opt-in) --------------------------------------
@@ -550,6 +561,48 @@ fn run_data_retrieval_test() -> ExitCode {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         // An I/O error writing the report is itself a failure.
+        Err(_) => ExitCode::FAILURE,
+    }
+}
+
+/// Return `true` when the program was invoked as the data-execution self-test.
+///
+/// Triggered by a `test-data-execution` (or `TestDataExecution`) argument so the
+/// probe can be launched as `gaia-robot test-data-execution`. Case-insensitive so
+/// the PowerShell wrapper name and the CLI form both work.
+fn wants_data_execution_test() -> bool {
+    std::env::args().skip(1).any(|arg| {
+        arg.eq_ignore_ascii_case("test-data-execution")
+            || arg.eq_ignore_ascii_case("testdataexecution")
+    })
+}
+
+/// Run the data-execution self-test and map its result to an exit code.
+///
+/// Builds the push-pass probe from the environment (the same dev/local config
+/// the rest of the program uses), reads each turn's `responsedatacontext.md`
+/// from `tests/LLM1`, runs LLM Call 2, audits the emitted side effects, and
+/// writes artifacts into `tests/LLM2`. Returns [`ExitCode::SUCCESS`] only when
+/// every executed turn passed.
+fn run_data_execution_test() -> ExitCode {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    let probe = match data_execution::DataExecutionProbe::from_env() {
+        Ok(probe) => probe,
+        Err(err) => {
+            let _ = writeln!(out, "data-execution self-test cannot run: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let only = parse_question_number();
+    // Read contexts from tests/LLM1 and write artifacts to tests/LLM2.
+    let input_dir = std::path::Path::new("../tests/LLM1");
+    let output_dir = std::path::Path::new("../tests/LLM2");
+    match probe.run(only, input_dir, Some(output_dir), &mut out) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
         Err(_) => ExitCode::FAILURE,
     }
 }
