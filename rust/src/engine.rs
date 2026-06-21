@@ -24,8 +24,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::actions::{ActionPlan, ActionsFile, SessionContext};
+use crate::cosmos::CosmosClient;
+use crate::embeddings::EmbeddingClient;
+use crate::executor::Executor;
 use crate::llm::LlmClient;
 use crate::prompt::{now_rfc3339, Call1Prompt, Call2Prompt};
+use crate::response_context::{build_response_data_context, parse_call1_extras, RetrievalGroup};
 use crate::web_search::BraveClient;
 
 /// The result of one turn, serialized as the front end's `ReplyResult`.
@@ -59,6 +64,12 @@ pub struct Engine {
     llm: Option<LlmClient>,
     /// The web-search client, or `None` to skip web search.
     web_search: Option<BraveClient>,
+    /// The Cosmos client used to execute the plan's data-lake/KB/diary/
+    /// connections queries, or `None` when Cosmos is not configured.
+    cosmos: Option<CosmosClient>,
+    /// The embedding client used when a retrieval action chooses semantic mode,
+    /// or `None` when embeddings are not configured.
+    embedder: Option<EmbeddingClient>,
 }
 
 impl Engine {
@@ -71,24 +82,68 @@ impl Engine {
     /// log it. A configuration error never prevents the server from starting; it
     /// simply falls back to skeleton replies.
     pub fn from_env() -> (Self, Option<String>) {
-        let (llm, warning) = match LlmClient::from_env() {
-            Ok(client) => (client, None),
-            Err(err) => (None, Some(err.to_string())),
+        // Collect any non-fatal configuration problems; none of them prevent the
+        // server from starting (it just degrades the affected capability).
+        let mut warnings: Vec<String> = Vec::new();
+
+        let llm = match LlmClient::from_env() {
+            Ok(client) => client,
+            Err(err) => {
+                warnings.push(err.to_string());
+                None
+            }
         };
-        // Web search is only meaningful alongside a model; mirror the console
-        // app and only wire it when the LLM is active.
-        let web_search = if llm.is_some() {
-            BraveClient::from_env()
+        // The retrieval clients are only meaningful alongside a model; mirror the
+        // console app and the self-test and only wire them when the LLM is active.
+        let (web_search, cosmos, embedder) = if llm.is_some() {
+            let web_search = BraveClient::from_env();
+            let cosmos = match CosmosClient::from_env() {
+                Ok(client) => client,
+                Err(err) => {
+                    warnings.push(format!("Cosmos retrieval disabled: {err}"));
+                    None
+                }
+            };
+            let embedder = match EmbeddingClient::from_env() {
+                Ok(client) => client,
+                Err(err) => {
+                    warnings.push(format!("semantic embeddings disabled: {err}"));
+                    None
+                }
+            };
+            (web_search, cosmos, embedder)
         } else {
-            None
+            (None, None, None)
         };
-        (Engine { llm, web_search }, warning)
+
+        let warning = if warnings.is_empty() {
+            None
+        } else {
+            Some(warnings.join("; "))
+        };
+        (
+            Engine {
+                llm,
+                web_search,
+                cosmos,
+                embedder,
+            },
+            warning,
+        )
     }
 
     /// Construct an engine directly from its parts (used by tests).
+    ///
+    /// Cosmos and embeddings default to `None`; the existing tests exercise the
+    /// skeleton and prompt paths, which do not touch live retrieval.
     #[cfg(test)]
     pub fn new(llm: Option<LlmClient>, web_search: Option<BraveClient>) -> Self {
-        Engine { llm, web_search }
+        Engine {
+            llm,
+            web_search,
+            cosmos: None,
+            embedder: None,
+        }
     }
 
     /// A human-readable, secret-free summary of how the engine is configured,
@@ -101,8 +156,18 @@ impl Engine {
                 } else {
                     "web search off"
                 };
+                let cosmos = if self.cosmos.is_some() {
+                    "Cosmos ON"
+                } else {
+                    "Cosmos off"
+                };
+                let embed = if self.embedder.is_some() {
+                    "embeddings ON"
+                } else {
+                    "embeddings off"
+                };
                 format!(
-                    "live model {} at {} ({web})",
+                    "live model {} at {} ({web}, {cosmos}, {embed})",
                     client.model(),
                     client.endpoint()
                 )
@@ -145,25 +210,14 @@ impl Engine {
             }
         };
 
-        // --- Web search: assemble this turn's Response Data Context ---------
-        let mut searches = Vec::new();
-        let mut evidence = String::new();
-        if let Some(brave) = &self.web_search {
-            if !input.is_empty() {
-                searches.push(input.to_string());
-                match brave.search(input, 0) {
-                    Ok(results) => evidence.push_str(&format_web_results(input, &results)),
-                    Err(err) => {
-                        evidence.push_str(&format!("Web search for \"{input}\" failed: {err}\n"))
-                    }
-                }
-            }
-        }
-
-        // The Response Data Context handed to Call 2 = the retrieved evidence
-        // plus Call 1's own reasoning about what it wanted to find.
-        let response_data_context =
-            format!("{evidence}\nCall 1 research plan (raw model output):\n{call1_raw}");
+        // --- Retrieval + deterministic Response Data Context ---------------
+        // Execute every retrieval action Call 1 planned and fold the results,
+        // together with Call 1's analysis/facts/newContext, into the eight-
+        // section markdown that grounds Call 2. This is the exact same builder
+        // the data-retrieval self-test uses, so the cloud app and the test stay
+        // in lock-step. It never makes an extra LLM call.
+        let (response_data_context, searches) =
+            self.assemble_context(user_id, input, &requested_at, &call1_raw);
 
         // --- LLM Call 2: the push / answer pass ----------------------------
         let call2 = Call2Prompt::build(user_id, input, &response_data_context, &requested_at);
@@ -194,6 +248,115 @@ impl Engine {
             },
         }
     }
+
+    /// Execute this turn's retrieval plan and deterministically assemble the
+    /// Response Data Context handed to LLM Call 2.
+    ///
+    /// Mirrors the data-retrieval self-test: parse Call 1's `actions.json` plus
+    /// its analysis/facts/newContext documents, run the Cosmos-backed queries
+    /// (via [`Executor`]) and the `Web` searches (via Brave), then fold every
+    /// result into the eight-section markdown via
+    /// [`build_response_data_context`]. It makes **no** extra LLM call and never
+    /// fails: a missing client or an unparsable plan simply yields empty
+    /// sections, so Call 2 always receives a stable, predictable structure.
+    ///
+    /// Returns the context markdown and the web queries that actually ran (for
+    /// the [`TurnResult::searches`] field).
+    fn assemble_context(
+        &self,
+        user_id: &str,
+        input: &str,
+        requested_at: &str,
+        call1_raw: &str,
+    ) -> (String, Vec<String>) {
+        // Call 1's non-action documents always parse (degrading to defaults).
+        let extras = parse_call1_extras(call1_raw);
+
+        let mut groups: Vec<RetrievalGroup> = Vec::new();
+        let mut searches: Vec<String> = Vec::new();
+
+        // Parse the action plan; without one we still emit a deterministic (but
+        // result-free) context from the extras alone.
+        if let Some(mut actions) = crate::actions::parse_call1_actions(call1_raw) {
+            // Honour the GAIA_FORCE_SEMANTIC override exactly as the self-test does.
+            if crate::executor::force_semantic() {
+                crate::executor::force_semantic_on(&mut actions);
+            }
+
+            // Split the plan into Cosmos-backed queries and Web searches.
+            let (web_actions, cosmos_actions): (Vec<ActionPlan>, Vec<ActionPlan>) = actions
+                .actions
+                .into_iter()
+                .partition(|action| action.target.eq_ignore_ascii_case("Web"));
+
+            // --- Cosmos retrieval ---------------------------------------
+            if !cosmos_actions.is_empty() {
+                if let Some(cosmos) = &self.cosmos {
+                    // Preserve the action id + target alongside each outcome.
+                    let targets: Vec<String> =
+                        cosmos_actions.iter().map(|a| a.target.clone()).collect();
+                    let action_ids: Vec<String> =
+                        cosmos_actions.iter().map(|a| a.id.clone()).collect();
+                    let plan = ActionsFile {
+                        version: actions.version.clone(),
+                        session: SessionContext {
+                            user_id: user_id.to_string(),
+                            requested_at: requested_at.to_string(),
+                        },
+                        actions: cosmos_actions,
+                    };
+                    let outcomes = match &self.embedder {
+                        Some(embedder) => {
+                            Executor::with_embedder(cosmos, Some(embedder.clone())).run(&plan)
+                        }
+                        None => Executor::new(cosmos).run(&plan),
+                    };
+                    for ((target, action_id), outcome) in
+                        targets.iter().zip(action_ids.iter()).zip(outcomes.iter())
+                    {
+                        if let Ok(records) = &outcome.result {
+                            let records: Vec<serde_json::Value> = records
+                                .iter()
+                                .filter_map(|r| serde_json::to_value(r).ok())
+                                .collect();
+                            groups.push(RetrievalGroup {
+                                action_id: action_id.clone(),
+                                container: target.clone(),
+                                records,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // --- Web (Brave) retrieval ----------------------------------
+            if !web_actions.is_empty() {
+                if let Some(brave) = &self.web_search {
+                    for action in &web_actions {
+                        if action.validate().is_err() {
+                            continue;
+                        }
+                        let query = web_query_for(action, input);
+                        if let Ok(results) = brave.search(&query, action.effective_top()) {
+                            searches.push(query);
+                            let records: Vec<serde_json::Value> = results
+                                .iter()
+                                .filter_map(|r| serde_json::to_value(r).ok())
+                                .collect();
+                            groups.push(RetrievalGroup {
+                                action_id: action.id.clone(),
+                                container: "Web".to_string(),
+                                records,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let context = build_response_data_context(user_id, input, requested_at, &extras, &groups);
+        (context, searches)
+    }
 }
 
 /// Build the skeleton-mode reply shown when no model is configured.
@@ -210,22 +373,27 @@ fn skeleton_reply(user_id: &str, input: &str) -> String {
     }
 }
 
-/// Format Brave web-search results as a compact evidence block for Call 2.
-fn format_web_results(query: &str, results: &[crate::search_history::SearchResult]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let _ = writeln!(out, "Web search results for \"{query}\":");
-    if results.is_empty() {
-        let _ = writeln!(out, "(no results)");
-    } else {
-        for (i, r) in results.iter().enumerate() {
-            let _ = writeln!(out, "{}. {} — {}", i + 1, r.title, r.url);
-            if !r.snippet.is_empty() {
-                let _ = writeln!(out, "   {}", r.snippet);
-            }
-        }
+/// Choose the query string for a `Web` action.
+///
+/// The model's free-text `text` filter is the most precise signal, then its
+/// `intent`; if neither is present we fall back to the user's input so a Web
+/// action always has *something* to search for. Mirrors the self-test's
+/// `web_query_for` so the cloud app and the probe behave identically.
+fn web_query_for(action: &ActionPlan, input: &str) -> String {
+    if let Some(text) = action
+        .filters
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        return text.to_string();
     }
-    out
+    let intent = action.intent.trim();
+    if !intent.is_empty() {
+        return intent.to_string();
+    }
+    input.trim().to_string()
 }
 
 /// Pull Gaia's reply text out of LLM Call 2's raw output.
@@ -334,5 +502,45 @@ mod tests {
         let a = new_thought_id();
         let b = new_thought_id();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn assemble_context_is_deterministic_and_degrades_without_clients() {
+        // No web/Cosmos/embedder clients configured: the retrieval sections must
+        // still be emitted (empty), Call 1's analysis/facts/newContext folded in,
+        // and no web search recorded — and the output must be byte-stable.
+        let engine = Engine::new(None, None);
+        let reply = r#"[
+          [ { "id": "q1", "kind": "search", "target": "Web", "intent": "mars news" } ],
+          { "emotion": "calm", "truthfulness": "honest", "intention": "learn" },
+          [ { "fact": "favourite_colour", "value": "blue" } ],
+          { "summary": "We spoke about colours before." }
+        ]"#;
+
+        let (context, searches) =
+            engine.assemble_context("alice", "hi", "2026-06-21T00:00:00Z", reply);
+
+        for heading in [
+            "## WebSearchResults",
+            "## DataLakeResults",
+            "## KnowledgeBaseResults",
+            "## ConnectionsResults",
+            "## EmotionResults",
+            "## TruthfulNessResults",
+            "## IntentionResults",
+            "## OldContextSummary",
+        ] {
+            assert!(context.contains(heading), "missing heading {heading}");
+        }
+        // Call 1's extras are folded into their sections.
+        assert!(context.contains("calm"));
+        assert!(context.contains("We spoke about colours before."));
+        assert!(context.contains("**favourite_colour:** blue"));
+        // With no Brave client, no web search ran this turn.
+        assert!(searches.is_empty());
+
+        // Determinism: identical inputs produce identical output.
+        let (again, _) = engine.assemble_context("alice", "hi", "2026-06-21T00:00:00Z", reply);
+        assert_eq!(context, again);
     }
 }
