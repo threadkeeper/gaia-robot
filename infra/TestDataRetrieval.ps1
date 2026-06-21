@@ -161,6 +161,11 @@ if (-not $SkipTokens) {
 # GAIA_MODE=dev turns on the live LLM + Cosmos + Brave code paths the probe needs.
 $env:GAIA_MODE = 'dev'
 
+# Force semantic (vector) retrieval for every supported target, overriding the
+# keyword query the model tends to author. Targets without an embedding (e.g.
+# GaiaConnections) keep their normal path. Set to '0' to test model-authored mode.
+$env:GAIA_FORCE_SEMANTIC = '1'
+
 # --- 4. Run the self-test ---------------------------------------------------
 Write-Host ""
 Write-Host "Running data-retrieval self-test (user_id = threadkeeper) ..." -ForegroundColor Cyan

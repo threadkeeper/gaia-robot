@@ -13,7 +13,8 @@ The class is deliberately small and reusable:
     ones. This is what the backfill worker (``infra/embed_worker.py``) uses.
 
 Authentication mirrors the rest of ``infra`` (checked in this order):
-  * ``FOUNDRY_KEY`` / ``AZURE_OPENAI_API_KEY`` env var -> API-key auth.
+  * ``FOUNDRY_KEY`` / ``FOUNDRY_API_KEY`` / ``AZURE_OPENAI_API_KEY`` env var
+    -> API-key auth.
   * otherwise -> Azure AD via ``DefaultAzureCredential`` (e.g. ``az login`` or a
     managed identity) against the Cognitive Services scope.
 
@@ -132,8 +133,14 @@ class EmbeddingClient:
         )
         dimensions = int(raw_dims) if raw_dims else 1536
 
+        # Accept the key under any of the names used across the repo. The rest of
+        # Gaia (the Rust app, run-local.ps1, TestDataRetrieval.ps1) uses
+        # FOUNDRY_API_KEY, so honour it here too rather than forcing the AAD path.
         api_key = (
-            os.environ.get("FOUNDRY_KEY") or os.environ.get("AZURE_OPENAI_API_KEY") or ""
+            os.environ.get("FOUNDRY_KEY")
+            or os.environ.get("FOUNDRY_API_KEY")
+            or os.environ.get("AZURE_OPENAI_API_KEY")
+            or ""
         ).strip() or None
         api_version = os.environ.get("AZURE_OPENAI_API_VERSION", DEFAULT_API_VERSION)
 

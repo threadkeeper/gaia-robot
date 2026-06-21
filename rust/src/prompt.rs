@@ -115,8 +115,10 @@ All six database targets are Azure Cosmos DB for NoSQL containers in database
   - c.timestamp (string)  ISO-8601 instant; the per-partition UNIQUE key on
                  GaiaConnections (the ledger). Order by this, not c.date, there.
   - c.data      (string)  the record's text body. NOT present on GaiaConnections.
-  - c.dataVector (float32[1536]) cosine embedding of c.data; MAY be ABSENT until
-                 an embedding backfill has run - do not rely on it yet.
+  - c.dataVector (float32[1536]) cosine embedding of c.data; populated by the
+                 embedding backfill and available for semantic search. A few very
+                 recent records may not be embedded yet, so semantic queries must
+                 still guard with `AND IS_DEFINED(c.dataVector)`.
   - c.metadata  (object)  free-form, optional; present on the snapshot
                  containers (not on GaiaConnections).
 GaiaConnections (the ledger) carries no c.data; instead each row has these

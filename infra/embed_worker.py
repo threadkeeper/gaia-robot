@@ -49,13 +49,17 @@ from embeddings import EmbeddingClient, TEXT_FIELD, VECTOR_FIELD
 # Container name -> partition/business key field. Mirrors infra/cosmos_create.py
 # TABLES: the entity tables key on "entity", the user tables on "userId". We need
 # the key field both to read each row's partition value and to target the patch.
+#
+# Only the containers that actually store a "/data" text payload appear here,
+# because the backfill embeds "/data" into "/dataVector". The "/data"-less
+# containers from cosmos_create.py (GaiaWebSearchHistory and GaiaConnections,
+# both has_data=False) are deliberately omitted: they have nothing to embed.
 CONTAINERS: dict[str, str] = {
     "GaiaKB": "entity",
-    "GaiaLH": "entity",
+    "GaiaDataLake": "entity",
     "UsersKB": "userId",
-    "UsersDL": "userId",
-    "GaiaCosmos": "entity",
-    "GaiaConnections": "entity",
+    "UsersDataLake": "userId",
+    "GaiaDiary": "entity",
 }
 
 # Select only the fields we need: id, the partition value (aliased "pk"), and the

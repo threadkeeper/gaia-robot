@@ -131,8 +131,30 @@ struct ProbeArtifacts {
     raw_reply: Option<String>,
     /// The parsed actions.json document (element 0 of the Call 1 array).
     actions: Option<ActionsFile>,
+    /// The exact Cosmos SQL that ran for each query action, so the artifact can
+    /// be verified against what the model authored (keyword vs semantic).
+    queries: Vec<PlannedQueryArtifact>,
     /// Per-action retrieval results keyed by `(action_id, container)`.
     results: Vec<(String, String, Vec<serde_json::Value>)>,
+}
+
+/// The actually-executed Cosmos query for one action, written to `queries.json`.
+///
+/// This makes the retrieval mode auditable: a `VectorDistance(...)` SQL proves
+/// semantic search ran, while a `CONTAINS(...)` SQL proves keyword search ran —
+/// regardless of what the raw model reply originally authored.
+#[derive(serde::Serialize)]
+struct PlannedQueryArtifact {
+    /// The action id (e.g. `q3`).
+    id: String,
+    /// The target container (e.g. `GaiaKB`).
+    target: String,
+    /// The resolved retrieval mode label (`semantic` or `keyword`).
+    mode: String,
+    /// The single logical partition the query is pinned to.
+    partition_value: String,
+    /// The exact parameterised Cosmos SQL sent to the account.
+    sql: String,
 }
 
 impl ProbeArtifacts {
@@ -140,6 +162,7 @@ impl ProbeArtifacts {
         Self {
             raw_reply: None,
             actions: None,
+            queries: Vec::new(),
             results: Vec::new(),
         }
     }
@@ -162,6 +185,12 @@ impl ProbeArtifacts {
         if let Some(actions) = &self.actions {
             let path = dir.join("actions.json");
             let json = serde_json::to_string_pretty(actions).unwrap_or_default();
+            std::fs::write(&path, json)?;
+        }
+
+        if !self.queries.is_empty() {
+            let path = dir.join("queries.json");
+            let json = serde_json::to_string_pretty(&self.queries).unwrap_or_default();
             std::fs::write(&path, json)?;
         }
 
@@ -404,7 +433,7 @@ impl DataRetrievalProbe {
         artifacts.raw_reply = Some(reply.clone());
 
         // --- Parse actions.json out of the reply --------------------------
-        let actions = match crate::actions::parse_call1_actions(&reply) {
+        let mut actions = match crate::actions::parse_call1_actions(&reply) {
             Some(actions) => actions,
             None => {
                 metrics
@@ -416,6 +445,15 @@ impl DataRetrievalProbe {
                 return (metrics, artifacts);
             }
         };
+
+        // When GAIA_FORCE_SEMANTIC is set, rewrite every supported action to
+        // semantic retrieval *before* we save the artifact or execute, so both
+        // the written actions.json and the query that runs reflect the override
+        // (the model tends to author keyword CONTAINS queries by default).
+        if crate::executor::force_semantic() {
+            crate::executor::force_semantic_on(&mut actions);
+        }
+
         artifacts.actions = Some(actions.clone());
         metrics.actions_parsed = actions.actions.len();
         if actions.actions.is_empty() {
@@ -455,6 +493,29 @@ impl DataRetrievalProbe {
                         },
                         actions: cosmos_actions,
                     };
+
+                    // Capture the exact SQL each query will run, so the artifact
+                    // is auditable: a `VectorDistance(...)` query proves semantic
+                    // search ran and a `CONTAINS(...)` query proves keyword search
+                    // ran, independent of what the raw model reply authored.
+                    let embedder_ref = self.embedder.as_ref();
+                    for action in &plan.actions {
+                        if let Ok(planned) = crate::executor::plan_for(action, embedder_ref) {
+                            let mode = if planned.sql.contains("VectorDistance") {
+                                "semantic"
+                            } else {
+                                "keyword"
+                            };
+                            artifacts.queries.push(PlannedQueryArtifact {
+                                id: action.id.clone(),
+                                target: action.target.clone(),
+                                mode: mode.to_string(),
+                                partition_value: planned.partition_value,
+                                sql: planned.sql,
+                            });
+                        }
+                    }
+
                     let outcomes = if let Some(embedder) = &self.embedder {
                         Executor::with_embedder(client, Some(embedder.clone())).run(&plan)
                     } else {
@@ -921,6 +982,7 @@ mod tests {
                 },
                 actions: Vec::new(),
             }),
+            queries: Vec::new(),
             results: Vec::new(),
         };
 

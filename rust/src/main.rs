@@ -680,6 +680,13 @@ fn run_pull_actions(
         }
     };
 
+    // When GAIA_FORCE_SEMANTIC is set, rewrite every supported action to
+    // semantic retrieval, overriding the model's keyword query and mode.
+    let mut actions = actions;
+    if executor::force_semantic() {
+        executor::force_semantic_on(&mut actions);
+    }
+
     // Keep only the Cosmos-backed actions; the Web action is handled elsewhere.
     let cosmos_actions = cosmos_actions_of(&actions);
     if cosmos_actions.is_empty() {

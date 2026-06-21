@@ -321,6 +321,43 @@ fn embed_query(embedder: Option<&EmbeddingClient>, text: &str) -> Result<Vec<f32
     embedder.embed(text).map_err(|err| err.to_string())
 }
 
+/// Return whether the `GAIA_FORCE_SEMANTIC` override is enabled.
+///
+/// When set to a truthy value, callers rewrite every supported retrieval to
+/// semantic (vector) mode before executing, overriding the model's authored
+/// keyword query and `filters.mode`. This is the on switch behind
+/// `infra/TestDataRetrieval.ps1`'s semantic run; default (unset) preserves the
+/// model-authored behaviour.
+pub fn force_semantic() -> bool {
+    force_semantic_from(crate::llm::value_from_env("GAIA_FORCE_SEMANTIC").as_deref())
+}
+
+/// Pure parse of the `GAIA_FORCE_SEMANTIC` value: `1|true|yes|on` (any case,
+/// surrounding whitespace ignored) means enabled; everything else is off.
+fn force_semantic_from(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+/// Rewrite every supported action in `plan` to semantic (vector) retrieval.
+///
+/// This mutates the plan **in place** so the change is visible both in the saved
+/// `actions.json` artifact and in the query that actually runs: it drops any
+/// model-authored keyword `query` and sets `filters.mode = "semantic"`. Targets
+/// that cannot be searched semantically (e.g. `GaiaConnections`, which has no
+/// embedding) are left untouched so they keep their normal keyword path.
+pub fn force_semantic_on(plan: &mut ActionsFile) {
+    for action in &mut plan.actions {
+        if target_supports_semantic(&action.target) {
+            // Drop the authored keyword SQL so the structured semantic builder runs.
+            action.query = None;
+            action.filters.mode = Some("semantic".to_string());
+        }
+    }
+}
+
 /// Supported retrieval modes for one action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetrievalMode {
@@ -421,6 +458,7 @@ fn non_empty(value: &Option<String>) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::actions::ActionFilters;
+    use crate::actions::SessionContext;
 
     /// Build a minimal valid query action for tests.
     fn action(target: &str) -> ActionPlan {
@@ -626,6 +664,68 @@ mod tests {
 
         let err = plan_to_query(&act, None).unwrap_err();
         assert!(err.contains("semantic mode needs embeddings"));
+    }
+
+    #[test]
+    fn force_semantic_from_recognises_truthy_values() {
+        for value in ["1", "true", "TRUE", "Yes", " on "] {
+            assert!(force_semantic_from(Some(value)), "expected '{value}' on");
+        }
+        for value in [None, Some(""), Some("0"), Some("false"), Some("off")] {
+            assert!(!force_semantic_from(value), "expected {value:?} off");
+        }
+    }
+
+    #[test]
+    fn forced_semantic_overrides_an_authored_keyword_query() {
+        let mut act = action("GaiaDataLake");
+        act.user_id = Some("threadkeeper".to_string());
+        act.entity = Some("threadkeeper".to_string());
+        // The model authored a keyword CONTAINS query; the force must drop it.
+        act.query = Some(
+            "SELECT TOP 12 c.id, c.data FROM c WHERE c.entity = @pk \
+             AND CONTAINS(LOWER(c.data), 'music') ORDER BY c.date DESC"
+                .to_string(),
+        );
+        act.filters.text = Some("music books outdoors".to_string());
+        act.filters.mode = Some("keyword".to_string());
+
+        let mut plan = ActionsFile {
+            version: "1.0".to_string(),
+            session: SessionContext {
+                user_id: "threadkeeper".to_string(),
+                requested_at: "2026-06-21T00:00:00Z".to_string(),
+            },
+            actions: vec![act],
+        };
+        force_semantic_on(&mut plan);
+
+        // The authored keyword query is gone and the mode flips to semantic, so
+        // both the saved artifact and the executed query are semantic.
+        assert_eq!(plan.actions[0].query, None);
+        assert_eq!(plan.actions[0].filters.mode.as_deref(), Some("semantic"));
+    }
+
+    #[test]
+    fn forced_semantic_leaves_unsupported_targets_unchanged() {
+        let mut act = action("GaiaConnections");
+        act.user_id = Some("threadkeeper".to_string());
+        act.entity = Some("threadkeeper".to_string());
+        act.filters.text = Some("kindness".to_string());
+        act.filters.mode = Some("keyword".to_string());
+
+        let mut plan = ActionsFile {
+            version: "1.0".to_string(),
+            session: SessionContext {
+                user_id: "threadkeeper".to_string(),
+                requested_at: "2026-06-21T00:00:00Z".to_string(),
+            },
+            actions: vec![act],
+        };
+        force_semantic_on(&mut plan);
+
+        // GaiaConnections has no embedding, so it stays on the keyword path.
+        assert_eq!(plan.actions[0].filters.mode.as_deref(), Some("keyword"));
     }
 
     #[test]
