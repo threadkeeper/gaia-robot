@@ -6,13 +6,25 @@
 //! consists of a short-lived access token (1 h) and a long-lived refresh token
 //! (30 days), both opaque hex strings backed by an in-memory store.
 //!
-//! When `GOOGLE_CLIENT_ID` is *not* set the server falls back to **dev auth**:
-//! the front end sends `Authorization: Bearer dev:<name>` and the server maps
-//! the `<name>` straight to the `user_id` (no verification).
+//! Sign-in is **mandatory**: users authenticate with Google or GitHub and the
+//! server mints a session for them. The session consists of a short-lived
+//! access token (1 h) and a long-lived refresh token (30 days), both opaque hex
+//! strings backed by an in-memory store. Every protected request must carry a
+//! valid access token — there is no dev/guest fallback, and `dev:` or unknown
+//! tokens are rejected.
 //!
 //! Google ID tokens are verified by calling Google's `tokeninfo` endpoint over
 //! HTTPS (via [`ureq`]). The returned `aud` claim must match the configured
 //! client id.
+//!
+//! **GitHub sign-in** is offered as an additional option. Because GitHub has no
+//! browser-verifiable ID token, it uses the OAuth *authorization-code* flow: the
+//! front end redirects to GitHub, GitHub redirects back with a `?code=`, and the
+//! front end posts that code to `POST /v1/auth/github`. The server exchanges the
+//! code (plus its client secret) for a GitHub access token and fetches the
+//! user's profile, then mints the same kind of Gaia session as Google does.
+//! GitHub sign-in is active when both `GITHUB_CLIENT_ID` and
+//! `GITHUB_CLIENT_SECRET` are set.
 
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
@@ -29,13 +41,21 @@ const ACCESS_TTL_SECS: u64 = 3600;
 const REFRESH_TTL_SECS: u64 = 30 * 24 * 3600;
 /// Google's public token-info endpoint.
 const GOOGLE_TOKENINFO: &str = "https://oauth2.googleapis.com/tokeninfo";
+/// GitHub OAuth access-token exchange endpoint (authorization-code flow).
+const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
+/// GitHub authenticated-user profile endpoint.
+const GITHUB_USER_URL: &str = "https://api.github.com/user";
+/// GitHub requires a `User-Agent` on every API request; identify this app.
+const GITHUB_USER_AGENT: &str = "gaia-robot";
 
 // ---- Wire types ---------------------------------------------------------
 
-/// User identity extracted from a verified Google ID token.
+/// User identity extracted from a verified sign-in (Google ID token or GitHub
+/// profile).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInfo {
-    /// Google subject (unique, stable user id).
+    /// Stable, unique subject and the user's wing id. For Google this is the
+    /// Google `sub`; for GitHub it is `github:<numeric-id>`.
     pub sub: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -43,6 +63,10 @@ pub struct UserInfo {
     pub email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub picture: Option<String>,
+    /// GitHub login handle, present only for GitHub sign-in. Surfaced to the
+    /// front end as `githubLogin` for display.
+    #[serde(rename = "githubLogin", skip_serializing_if = "Option::is_none")]
+    pub github_login: Option<String>,
 }
 
 /// Response returned to the front end from `/v1/auth/google` and
@@ -90,6 +114,11 @@ pub struct Auth {
     /// When `Some`, live-auth is active and the `aud` claim of every Google
     /// token must match this value. When `None`, only dev-auth is available.
     google_client_id: Option<String>,
+    /// GitHub OAuth client id. When this and [`Self::github_client_secret`] are
+    /// both `Some`, GitHub sign-in is available.
+    github_client_id: Option<String>,
+    /// GitHub OAuth client secret, used server-side to exchange the code.
+    github_client_secret: Option<String>,
     /// Access-token → session map.
     sessions: Mutex<HashMap<String, Session>>,
     /// Refresh-token → user-info map.
@@ -114,13 +143,35 @@ impl Auth {
     pub fn new(google_client_id: Option<String>) -> Self {
         Self {
             google_client_id,
+            github_client_id: None,
+            github_client_secret: None,
             sessions: Mutex::new(HashMap::new()),
             refresh_tokens: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(0),
         }
     }
 
-    /// Read `GOOGLE_CLIENT_ID` from the environment and build an [`Auth`].
+    /// Enable GitHub sign-in by attaching an OAuth client id and secret.
+    ///
+    /// Returns `self` so it can be chained after [`Self::new`]. GitHub sign-in
+    /// only activates when *both* values are non-empty.
+    pub fn with_github_oauth(
+        mut self,
+        client_id: Option<String>,
+        client_secret: Option<String>,
+    ) -> Self {
+        // Treat blank env values as "unset" so a stray empty var never
+        // half-enables the flow.
+        self.github_client_id = client_id.filter(|v| !v.trim().is_empty());
+        self.github_client_secret = client_secret.filter(|v| !v.trim().is_empty());
+        self
+    }
+
+    /// Read auth configuration from the environment and build an [`Auth`].
+    ///
+    /// `GOOGLE_CLIENT_ID` enables Google sign-in; `GITHUB_CLIENT_ID` +
+    /// `GITHUB_CLIENT_SECRET` enable GitHub sign-in. Either, both, or neither
+    /// may be configured.
     pub fn from_env() -> Self {
         let client_id = crate::llm::value_from_env("GOOGLE_CLIENT_ID");
         if let Some(ref id) = client_id {
@@ -128,12 +179,24 @@ impl Auth {
         } else {
             println!("auth: dev mode (no GOOGLE_CLIENT_ID)");
         }
-        Self::new(client_id)
+
+        let github_id = crate::llm::value_from_env("GITHUB_CLIENT_ID");
+        let github_secret = crate::llm::value_from_env("GITHUB_CLIENT_SECRET");
+        let auth = Self::new(client_id).with_github_oauth(github_id, github_secret);
+        if auth.is_github_live() {
+            println!("auth: GitHub sign-in enabled");
+        }
+        auth
     }
 
     /// Whether live Google sign-in is active.
     pub fn is_live(&self) -> bool {
         self.google_client_id.is_some()
+    }
+
+    /// Whether GitHub sign-in is active (both client id and secret configured).
+    pub fn is_github_live(&self) -> bool {
+        self.github_client_id.is_some() && self.github_client_secret.is_some()
     }
 
     // ---- Google token verification --------------------------------------
@@ -176,6 +239,105 @@ impl Auth {
             name: body["name"].as_str().map(str::to_string),
             email: body["email"].as_str().map(str::to_string),
             picture: body["picture"].as_str().map(str::to_string),
+            github_login: None,
+        })
+    }
+
+    // ---- GitHub OAuth code exchange -------------------------------------
+
+    /// Exchange a GitHub OAuth `code` for the authenticated user's [`UserInfo`].
+    ///
+    /// Runs the server side of GitHub's authorization-code flow: POST the code
+    /// (with the client id/secret) to GitHub's token endpoint, then call the
+    /// `/user` API with the returned access token. `redirect_uri` must match the
+    /// value the browser used to start the flow (GitHub validates it when it was
+    /// supplied); pass `None` to omit it.
+    ///
+    /// Returns a human-readable error string on any configuration or HTTP
+    /// failure, failing closed so a bad code never yields a session.
+    pub fn exchange_github_code(
+        &self,
+        code: &str,
+        redirect_uri: Option<&str>,
+    ) -> Result<UserInfo, String> {
+        let client_id = self
+            .github_client_id
+            .as_deref()
+            .ok_or("github auth is not configured (GITHUB_CLIENT_ID not set)")?;
+        let client_secret = self
+            .github_client_secret
+            .as_deref()
+            .ok_or("github auth is not configured (GITHUB_CLIENT_SECRET not set)")?;
+        if code.trim().is_empty() {
+            return Err("missing github code".to_string());
+        }
+
+        // 1. Exchange the authorization code for a GitHub access token.
+        let mut request = serde_json::json!({
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": code,
+        });
+        if let Some(uri) = redirect_uri.filter(|u| !u.is_empty()) {
+            request["redirect_uri"] = serde_json::Value::String(uri.to_string());
+        }
+        let payload = serde_json::to_vec(&request)
+            .map_err(|e| format!("failed to serialize github token request: {e}"))?;
+
+        let token_resp = ureq::post(GITHUB_TOKEN_URL)
+            .set("Accept", "application/json")
+            .set("Content-Type", "application/json")
+            .set("User-Agent", GITHUB_USER_AGENT)
+            .send_bytes(&payload)
+            .map_err(|e| format!("github token request failed: {e}"))?;
+        let token_body = token_resp
+            .into_string()
+            .map_err(|e| format!("failed to read github token response: {e}"))?;
+        let token_json: serde_json::Value = serde_json::from_str(&token_body)
+            .map_err(|e| format!("failed to parse github token response: {e}"))?;
+
+        // GitHub returns HTTP 200 with an `error` field on bad/expired codes, so
+        // a missing access token is the real failure signal here.
+        let access_token = token_json["access_token"].as_str().unwrap_or_default();
+        if access_token.is_empty() {
+            let reason = token_json["error"].as_str().unwrap_or("no access_token");
+            return Err(format!("github token exchange failed: {reason}"));
+        }
+
+        // 2. Fetch the authenticated user's profile with the access token.
+        let user_resp = ureq::get(GITHUB_USER_URL)
+            .set("Authorization", &format!("Bearer {access_token}"))
+            .set("Accept", "application/vnd.github+json")
+            .set("User-Agent", GITHUB_USER_AGENT)
+            .call()
+            .map_err(|e| format!("github user request failed: {e}"))?;
+        let user_body = user_resp
+            .into_string()
+            .map_err(|e| format!("failed to read github user response: {e}"))?;
+        let user: serde_json::Value = serde_json::from_str(&user_body)
+            .map_err(|e| format!("failed to parse github user response: {e}"))?;
+
+        let login = user["login"].as_str().unwrap_or_default();
+        // Require both a login and a numeric id; the id is the stable subject.
+        let id = match user["id"].as_i64() {
+            Some(id) if !login.is_empty() => id,
+            _ => return Err("github profile missing login/id".to_string()),
+        };
+
+        // Empty profile strings (GitHub uses null/"" for hidden email, no name)
+        // are normalized to `None`; the login is a sensible display fallback.
+        let non_empty = |key: &str| {
+            user[key]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        Ok(UserInfo {
+            sub: format!("github:{id}"),
+            name: non_empty("name").or_else(|| Some(login.to_string())),
+            email: non_empty("email"),
+            picture: non_empty("avatar_url"),
+            github_login: Some(login.to_string()),
         })
     }
 
@@ -246,37 +408,20 @@ impl Auth {
         Some(self.create_session(entry.user_info))
     }
 
-    /// Resolve a bearer token to a `user_id`.
+    /// Authenticate a bearer token, returning the `user_id` of a **valid
+    /// session** or `None`.
     ///
-    /// In **dev mode** (no `GOOGLE_CLIENT_ID`): accepts `dev:<name>` tokens and
-    /// maps `<name>` to the user id, falling back to the configured dev user.
-    ///
-    /// In **live mode**: looks up the token in the session store. If not found,
-    /// still accepts `dev:` tokens as a convenience for local testing against
-    /// the live backend.
-    pub fn resolve_user_id(&self, bearer: Option<&str>) -> String {
-        let token = match bearer {
-            Some(t) => t.trim(),
-            None => return crate::llm::dev_user_id(),
-        };
-
-        // Dev-auth tokens are always accepted (dev: prefix).
-        if let Some(name) = token.strip_prefix("dev:") {
-            return name.to_string();
+    /// This is the enforcement path for protected HTTP routes: it accepts only
+    /// tokens minted by [`Self::create_session`] after a successful Google or
+    /// GitHub sign-in. Missing, malformed, unknown, or expired tokens all yield
+    /// `None`, so unauthenticated callers are rejected — there is deliberately no
+    /// `dev:` token or guest fallback.
+    pub fn authenticate(&self, bearer: Option<&str>) -> Option<String> {
+        let token = bearer?.trim();
+        if token.is_empty() {
+            return None;
         }
-
-        // Try the session store.
-        if let Some(user_id) = self.verify_access_token(token) {
-            return user_id;
-        }
-
-        // In dev mode, treat any unknown token as the literal subject (backward
-        // compat). In live mode, unknown tokens fall through to the dev user.
-        if self.is_live() {
-            crate::llm::dev_user_id()
-        } else {
-            token.to_string()
-        }
+        self.verify_access_token(token)
     }
 
     // ---- Token generation -----------------------------------------------
@@ -330,6 +475,7 @@ mod tests {
             name: Some("Alice".to_string()),
             email: Some("alice@example.com".to_string()),
             picture: None,
+            github_login: None,
         }
     }
 
@@ -385,33 +531,33 @@ mod tests {
     }
 
     #[test]
-    fn resolve_dev_token() {
+    fn authenticate_rejects_dev_token() {
+        // Dev tokens are no longer accepted: sign-in is mandatory.
         let auth = Auth::new(Some("client.apps.googleusercontent.com".to_string()));
-        assert_eq!(auth.resolve_user_id(Some("dev:alice")), "alice");
+        assert_eq!(auth.authenticate(Some("dev:alice")), None);
     }
 
     #[test]
-    fn resolve_session_token() {
+    fn authenticate_accepts_session_token() {
         let auth = Auth::new(Some("client.apps.googleusercontent.com".to_string()));
         let exchange = auth.create_session(sample_user());
-        assert_eq!(auth.resolve_user_id(Some(&exchange.token)), "google-123");
+        assert_eq!(
+            auth.authenticate(Some(&exchange.token)),
+            Some("google-123".to_string())
+        );
     }
 
     #[test]
-    fn resolve_unknown_in_live_mode_falls_back() {
+    fn authenticate_rejects_unknown_token() {
         let auth = Auth::new(Some("client.apps.googleusercontent.com".to_string()));
-        // Unknown token in live mode → dev user id (not the token literal).
-        let result = auth.resolve_user_id(Some("unknown-jwt-token"));
-        // Should be the default dev user id, not "unknown-jwt-token".
-        assert_ne!(result, "unknown-jwt-token");
+        assert_eq!(auth.authenticate(Some("unknown-jwt-token")), None);
     }
 
     #[test]
-    fn resolve_no_bearer() {
+    fn authenticate_rejects_missing_bearer() {
         let auth = Auth::new(None);
-        // No bearer → dev user id.
-        let result = auth.resolve_user_id(None);
-        assert!(!result.is_empty());
+        assert_eq!(auth.authenticate(None), None);
+        assert_eq!(auth.authenticate(Some("   ")), None);
     }
 
     #[test]
@@ -428,5 +574,66 @@ mod tests {
         let auth = Auth::new(None);
         let err = auth.verify_google_token("fake-token").unwrap_err();
         assert!(err.contains("not configured"));
+    }
+
+    #[test]
+    fn github_disabled_by_default() {
+        let auth = Auth::new(None);
+        assert!(!auth.is_github_live());
+    }
+
+    #[test]
+    fn github_enabled_when_id_and_secret_set() {
+        let auth =
+            Auth::new(None).with_github_oauth(Some("id".to_string()), Some("secret".to_string()));
+        assert!(auth.is_github_live());
+    }
+
+    #[test]
+    fn github_disabled_when_secret_missing() {
+        // An id without a secret must not half-enable the flow.
+        let auth = Auth::new(None).with_github_oauth(Some("id".to_string()), None);
+        assert!(!auth.is_github_live());
+    }
+
+    #[test]
+    fn github_disabled_when_values_blank() {
+        // Blank env values are treated as unset.
+        let auth = Auth::new(None).with_github_oauth(Some("  ".to_string()), Some("".to_string()));
+        assert!(!auth.is_github_live());
+    }
+
+    #[test]
+    fn exchange_github_fails_without_config() {
+        let auth = Auth::new(None);
+        let err = auth.exchange_github_code("some-code", None).unwrap_err();
+        assert!(err.contains("not configured"));
+    }
+
+    #[test]
+    fn exchange_github_rejects_empty_code() {
+        let auth =
+            Auth::new(None).with_github_oauth(Some("id".to_string()), Some("secret".to_string()));
+        let err = auth.exchange_github_code("   ", None).unwrap_err();
+        assert!(err.contains("missing github code"));
+    }
+
+    #[test]
+    fn github_session_uses_subject_as_user_id() {
+        // A GitHub-derived identity flows through the same session machinery.
+        let auth = Auth::new(None);
+        let info = UserInfo {
+            sub: "github:42".to_string(),
+            name: Some("octocat".to_string()),
+            email: None,
+            picture: None,
+            github_login: Some("octocat".to_string()),
+        };
+        let exchange = auth.create_session(info);
+        assert_eq!(
+            auth.authenticate(Some(&exchange.token)),
+            Some("github:42".to_string())
+        );
+        assert_eq!(exchange.user.github_login.as_deref(), Some("octocat"));
     }
 }

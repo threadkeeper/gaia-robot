@@ -1,22 +1,58 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
+  import { consumeGithubRedirect, startGithubSignIn } from '$lib/auth/github';
   import { mountGoogleButton } from '$lib/auth/google';
   import { auth, authMode } from '$lib/stores/auth';
 
-  let name = $state('');
   let googleButtonEl: HTMLDivElement | null = $state(null);
   let googleError = $state<string | null>(null);
-  const isDevMode = $derived($authMode === 'dev');
+  let githubError = $state<string | null>(null);
+  let githubBusy = $state(false);
 
-  function go() {
-    auth.devSignIn(name);
-  }
+  const isGithubMode = $derived($authMode === 'github');
+  // Only offer a provider toggle when both sign-in methods are available.
+  const showToggle = $derived(auth.canUseGoogle && auth.canUseGithub);
 
-  function pickMode(mode: 'google' | 'dev') {
+  function pickMode(mode: 'google' | 'github') {
     auth.setMode(mode);
   }
 
+  function startGithub() {
+    githubError = null;
+    githubBusy = true;
+    try {
+      startGithubSignIn();
+    } catch (e) {
+      githubBusy = false;
+      githubError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  // On load, finish any GitHub redirect leg (?code=&state=) and sign in.
+  onMount(() => {
+    if (!auth.canUseGithub) return;
+    let redirect;
+    try {
+      redirect = consumeGithubRedirect();
+    } catch (e) {
+      githubError = e instanceof Error ? e.message : String(e);
+      return;
+    }
+    if (!redirect) return;
+    githubBusy = true;
+    auth.setMode('github');
+    void auth
+      .signInWithGithubCode(redirect.code, redirect.redirectUri)
+      .catch((e) => {
+        githubError = e instanceof Error ? e.message : String(e);
+      })
+      .finally(() => {
+        githubBusy = false;
+      });
+  });
+
   $effect(() => {
-    if (!auth.canUseGoogle || isDevMode || !googleButtonEl) return;
+    if (!auth.canUseGoogle || isGithubMode || !googleButtonEl) return;
     let cancelled = false;
     googleError = null;
     void mountGoogleButton(googleButtonEl, async (credential: string) => {
@@ -43,46 +79,43 @@
     <h1>Gaia</h1>
     <p class="tag">Your private, always-on companion.</p>
 
-    {#if auth.canUseGoogle}
-      <div class="toggle" role="tablist" aria-label="Authentication mode">
-        <button
-          role="tab"
-          aria-selected={!isDevMode}
-          class:active={!isDevMode}
-          onclick={() => pickMode('google')}
-        >Google</button>
-        <button
-          role="tab"
-          aria-selected={isDevMode}
-          class:active={isDevMode}
-          onclick={() => pickMode('dev')}
-        >Dev</button>
-      </div>
-    {/if}
-
-    {#if isDevMode}
+    {#if !auth.canUseGoogle && !auth.canUseGithub}
       <p class="hint">
-        Development mode. Pick a name to enter your wing.
+        Sign-in is not configured for this build. Set <code>VITE_GOOGLE_CLIENT_ID</code>
+        and/or <code>VITE_GITHUB_CLIENT_ID</code> to enable Google or GitHub sign-in.
       </p>
-      <form
-        onsubmit={(e) => {
-          e.preventDefault();
-          go();
-        }}
-      >
-        <input
-          bind:value={name}
-          placeholder="Your name"
-          aria-label="Your name"
-          autocomplete="off"
-        />
-        <button type="submit" class="primary">Enter Gaia</button>
-      </form>
     {:else}
-      <div class="google-button" bind:this={googleButtonEl}></div>
-      <p class="hint">Sign in with Google to enter your private wing.</p>
-      {#if googleError}
-        <p class="error">{googleError}</p>
+      {#if showToggle}
+        <div class="toggle" role="tablist" aria-label="Authentication provider">
+          <button
+            role="tab"
+            aria-selected={!isGithubMode}
+            class:active={!isGithubMode}
+            onclick={() => pickMode('google')}>Google</button
+          >
+          <button
+            role="tab"
+            aria-selected={isGithubMode}
+            class:active={isGithubMode}
+            onclick={() => pickMode('github')}>GitHub</button
+          >
+        </div>
+      {/if}
+
+      {#if isGithubMode || !auth.canUseGoogle}
+        <button class="primary github" onclick={startGithub} disabled={githubBusy}>
+          {githubBusy ? 'Connecting to GitHub…' : 'Continue with GitHub'}
+        </button>
+        <p class="hint">Sign in with GitHub to enter your private wing.</p>
+        {#if githubError}
+          <p class="error">{githubError}</p>
+        {/if}
+      {:else}
+        <div class="google-button" bind:this={googleButtonEl}></div>
+        <p class="hint">Sign in with Google to enter your private wing.</p>
+        {#if googleError}
+          <p class="error">{googleError}</p>
+        {/if}
       {/if}
     {/if}
   </div>
@@ -143,24 +176,8 @@
     color: #0b1020;
     background: linear-gradient(135deg, var(--accent), var(--accent-2));
   }
-  form {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-  input {
-    padding: 12px 14px;
-    border-radius: var(--radius);
-    border: 1px solid var(--border);
-    background: var(--bg-elev-2);
-    color: var(--text);
-    font: inherit;
-    outline: none;
-  }
-  input:focus {
-    border-color: var(--accent);
-  }
   .primary {
+    width: 100%;
     padding: 12px 16px;
     border: none;
     border-radius: var(--radius);
@@ -168,6 +185,15 @@
     font-weight: 600;
     color: #0b1020;
     background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    cursor: pointer;
+  }
+  .primary:disabled {
+    opacity: 0.6;
+    cursor: progress;
+  }
+  .primary.github {
+    color: #fff;
+    background: #24292f;
   }
   .google-button {
     display: flex;

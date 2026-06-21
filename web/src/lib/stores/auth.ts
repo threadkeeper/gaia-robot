@@ -1,14 +1,15 @@
 /**
  * Authentication store.
  *
- * In production the frontend collects a Google ID token (GIS), exchanges it at
- * POST /v1/auth/google, and stores the returned Gaia session JWT. For local
- * development — when no Google client id is configured — it runs a "dev auth"
- * mode where the user picks a subject and sends it as the bearer token.
+ * Sign-in is mandatory. The frontend authenticates with **Google** (collect a
+ * Google ID token via GIS, exchange it at POST /v1/auth/google) or **GitHub**
+ * (authorization-code redirect, exchange the code at POST /v1/auth/github). In
+ * both cases the server returns an opaque Gaia session token that is sent as the
+ * bearer on every API call. There is no dev/guest mode.
  */
 import { browser } from '$app/environment';
-import { exchangeGoogleToken, refreshSession } from '$lib/api/client';
-import { GOOGLE_CONFIGURED } from '$lib/config';
+import { exchangeGithubCode, exchangeGoogleToken, refreshSession } from '$lib/api/client';
+import { GITHUB_CONFIGURED, GOOGLE_CONFIGURED } from '$lib/config';
 import type { AuthUser } from '$lib/types';
 import { writable } from 'svelte/store';
 
@@ -18,10 +19,18 @@ const MODE_KEY = 'gaia.auth.mode.v1';
 /** Refresh the access token this many seconds before it actually expires. */
 const REFRESH_SKEW_SECONDS = 60;
 
-export type AuthMode = 'google' | 'dev';
+export type AuthMode = 'google' | 'github';
 
+/** Pick a sensible default provider given what's configured in this build. */
 function defaultMode(): AuthMode {
-  return GOOGLE_CONFIGURED ? 'google' : 'dev';
+  return GOOGLE_CONFIGURED ? 'google' : 'github';
+}
+
+/** Coerce an arbitrary stored value into a usable, configured mode. */
+function normalizeMode(value: string | null): AuthMode {
+  if (value === 'github' && GITHUB_CONFIGURED) return 'github';
+  if (value === 'google' && GOOGLE_CONFIGURED) return 'google';
+  return defaultMode();
 }
 
 function load(): AuthUser | null {
@@ -46,12 +55,10 @@ function persist(user: AuthUser | null): void {
 
 function loadMode(): AuthMode {
   if (!browser) return defaultMode();
-  if (!GOOGLE_CONFIGURED) return 'dev';
   try {
-    const raw = localStorage.getItem(MODE_KEY);
-    return raw === 'dev' || raw === 'google' ? raw : 'google';
+    return normalizeMode(localStorage.getItem(MODE_KEY));
   } catch {
-    return 'google';
+    return defaultMode();
   }
 }
 
@@ -67,7 +74,7 @@ function persistMode(mode: AuthMode): void {
 const _authMode = writable<AuthMode>(loadMode());
 let _mode: AuthMode = loadMode();
 _authMode.subscribe((m) => {
-  _mode = !GOOGLE_CONFIGURED ? 'dev' : m;
+  _mode = normalizeMode(m);
   persistMode(_mode);
 });
 
@@ -83,11 +90,28 @@ function createAuth() {
     current = u;
   });
 
-  /** True when a Google-mode access token is missing or within the skew window. */
+  /** True when an access token is missing or within the refresh skew window. */
   function accessTokenStale(user: AuthUser): boolean {
-    if (user.dev) return false;
     if (!user.expiresAt) return true;
     return user.expiresAt - REFRESH_SKEW_SECONDS <= Math.floor(Date.now() / 1000);
+  }
+
+  /** Build an `AuthUser` from a session exchange returned by the server. */
+  function userFromExchange(
+    res: Awaited<ReturnType<typeof exchangeGoogleToken>>,
+    provider: AuthMode
+  ): AuthUser {
+    return {
+      sub: res.user.sub,
+      name: res.user.name,
+      email: res.user.email,
+      picture: res.user.picture,
+      githubLogin: res.user.githubLogin,
+      provider,
+      token: res.token,
+      expiresAt: res.expiresAt,
+      refreshToken: res.refreshToken
+    };
   }
 
   /** Attempt a silent refresh using the stored refresh token. */
@@ -103,8 +127,7 @@ function createAuth() {
           sub: res.user.sub || user.sub,
           token: res.token,
           expiresAt: res.expiresAt,
-          refreshToken: res.refreshToken,
-          dev: false
+          refreshToken: res.refreshToken
         };
         persist(next);
         set(next);
@@ -126,7 +149,7 @@ function createAuth() {
 
     /** Capability flags used by the sign-in UI. */
     canUseGoogle: GOOGLE_CONFIGURED,
-    canUseDev: true,
+    canUseGithub: GITHUB_CONFIGURED,
 
     /** Current runtime mode. */
     getMode(): AuthMode {
@@ -134,22 +157,7 @@ function createAuth() {
     },
 
     setMode(mode: AuthMode) {
-      const next: AuthMode = !GOOGLE_CONFIGURED ? 'dev' : mode;
-      _authMode.set(next);
-      persist(null);
-      set(null);
-    },
-
-    /** Dev-mode sign in: bind a chosen display name to a stable subject. */
-    devSignIn(name: string) {
-      if (_mode !== 'dev') {
-        throw new Error('Switch mode to dev before using a local subject.');
-      }
-      const clean = name.trim() || 'guest';
-      const sub = `dev:${slug(clean)}`;
-      const user: AuthUser = { sub, name: clean, token: sub, dev: true };
-      persist(user);
-      set(user);
+      _authMode.set(normalizeMode(mode));
     },
 
     /** Complete direct Google sign-in by exchanging the GIS credential. */
@@ -157,20 +165,19 @@ function createAuth() {
       if (!GOOGLE_CONFIGURED) {
         throw new Error('Google auth not configured in this build.');
       }
-      if (_mode !== 'google') {
-        throw new Error('Switch mode to Google before starting sign-in.');
-      }
       const res = await exchangeGoogleToken(credential);
-      const user: AuthUser = {
-        sub: res.user.sub,
-        name: res.user.name,
-        email: res.user.email,
-        picture: res.user.picture,
-        token: res.token,
-        expiresAt: res.expiresAt,
-        refreshToken: res.refreshToken,
-        dev: false
-      };
+      const user = userFromExchange(res, 'google');
+      persist(user);
+      set(user);
+    },
+
+    /** Complete GitHub sign-in by exchanging an authorization code. */
+    async signInWithGithubCode(code: string, redirectUri?: string) {
+      if (!GITHUB_CONFIGURED) {
+        throw new Error('GitHub auth not configured in this build.');
+      }
+      const res = await exchangeGithubCode(code, redirectUri);
+      const user = userFromExchange(res, 'github');
       persist(user);
       set(user);
     },
@@ -186,7 +193,6 @@ function createAuth() {
     async getValidToken(force = false): Promise<string | null> {
       const user = current;
       if (!user) return null;
-      if (user.dev) return user.token;
       if (force || accessTokenStale(user)) {
         return doRefresh(user);
       }
@@ -199,10 +205,6 @@ function createAuth() {
     async restore(): Promise<boolean> {
       const restored = load();
       if (!restored) return false;
-      if (restored.dev) {
-        set(restored);
-        return true;
-      }
       set(restored);
       if (accessTokenStale(restored)) {
         const token = await doRefresh(restored);
@@ -216,13 +218,6 @@ function createAuth() {
       set(null);
     }
   };
-}
-
-function slug(s: string): string {
-  return s
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
 }
 
 export const auth = createAuth();

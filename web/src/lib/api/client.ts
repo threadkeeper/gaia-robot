@@ -13,7 +13,8 @@ export type DebugStreamEvent =
   | { kind: 'ping' }
   | { kind: 'error'; error: string };
 
-export interface GoogleAuthExchange {
+/** Session exchange returned by the auth endpoints (Google, GitHub, refresh). */
+export interface AuthExchange {
   token: string;
   expiresAt: number;
   refreshToken: string;
@@ -22,6 +23,7 @@ export interface GoogleAuthExchange {
     name?: string;
     email?: string;
     picture?: string;
+    githubLogin?: string;
   };
 }
 
@@ -69,7 +71,7 @@ export async function sendMessage(
 }
 
 /** Exchange a Google ID token for a Gaia session token. */
-export async function exchangeGoogleToken(idToken: string): Promise<GoogleAuthExchange> {
+export async function exchangeGoogleToken(idToken: string): Promise<AuthExchange> {
   const res = await fetch(apiUrl('/v1/auth/google'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -78,11 +80,27 @@ export async function exchangeGoogleToken(idToken: string): Promise<GoogleAuthEx
   if (!res.ok) {
     throw new ApiError(res.status, await safeText(res));
   }
-  return (await res.json()) as GoogleAuthExchange;
+  return (await res.json()) as AuthExchange;
+}
+
+/** Exchange a GitHub OAuth authorization code for a Gaia session token. */
+export async function exchangeGithubCode(
+  code: string,
+  redirectUri?: string
+): Promise<AuthExchange> {
+  const res = await fetch(apiUrl('/v1/auth/github'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code, redirectUri })
+  });
+  if (!res.ok) {
+    throw new ApiError(res.status, await safeText(res));
+  }
+  return (await res.json()) as AuthExchange;
 }
 
 /** Exchange a Gaia refresh token for a fresh access token (silent renewal). */
-export async function refreshSession(refreshToken: string): Promise<GoogleAuthExchange> {
+export async function refreshSession(refreshToken: string): Promise<AuthExchange> {
   const res = await fetch(apiUrl('/v1/auth/refresh'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -91,7 +109,7 @@ export async function refreshSession(refreshToken: string): Promise<GoogleAuthEx
   if (!res.ok) {
     throw new ApiError(res.status, await safeText(res));
   }
-  return (await res.json()) as GoogleAuthExchange;
+  return (await res.json()) as AuthExchange;
 }
 
 /**

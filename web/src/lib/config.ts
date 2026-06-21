@@ -9,8 +9,7 @@ const env = import.meta.env;
 export const API_BASE: string = (env.VITE_API_BASE ?? '').replace(/\/$/, '');
 
 /** Preferred reply transport: 'ws' streams over a WebSocket, 'post' is a single non-streaming POST. */
-export const STREAM_TRANSPORT: 'ws' | 'post' =
-  env.VITE_STREAM_TRANSPORT === 'post' ? 'post' : 'ws';
+export const STREAM_TRANSPORT: 'ws' | 'post' = env.VITE_STREAM_TRANSPORT === 'post' ? 'post' : 'ws';
 
 /** Direct Google sign-in client id (Google Identity Services). */
 export const GOOGLE_CLIENT_ID: string = (env.VITE_GOOGLE_CLIENT_ID ?? '') as string;
@@ -18,8 +17,14 @@ export const GOOGLE_CLIENT_ID: string = (env.VITE_GOOGLE_CLIENT_ID ?? '') as str
 /** Whether Google sign-in is configured in this build. */
 export const GOOGLE_CONFIGURED = !!GOOGLE_CLIENT_ID;
 
-/** True when no Google client id is configured: run in local dev-auth mode. */
-export const DEV_AUTH = !GOOGLE_CONFIGURED;
+/** GitHub OAuth client id (authorization-code flow via github.com/login/oauth). */
+export const GITHUB_CLIENT_ID: string = (env.VITE_GITHUB_CLIENT_ID ?? '') as string;
+
+/** Whether GitHub sign-in is configured in this build. */
+export const GITHUB_CONFIGURED = !!GITHUB_CLIENT_ID;
+
+/** True when at least one sign-in provider is configured. Sign-in is mandatory. */
+export const AUTH_CONFIGURED = GOOGLE_CONFIGURED || GITHUB_CONFIGURED;
 
 /** Build an absolute API URL from a path. */
 export function apiUrl(path: string): string {

@@ -37,11 +37,7 @@
       ⟲
     </button>
     <div class="account">
-      <button
-        class="avatar"
-        aria-label="Account menu"
-        onclick={() => (menuOpen = !menuOpen)}
-      >
+      <button class="avatar" aria-label="Account menu" onclick={() => (menuOpen = !menuOpen)}>
         {#if user.picture}
           <img src={user.picture} alt="" />
         {:else}
@@ -53,7 +49,7 @@
           <div class="who">
             <strong>{user.name ?? user.sub}</strong>
             {#if user.email}<span>{user.email}</span>{/if}
-            {#if user.dev}<span class="badge">dev mode</span>{/if}
+            {#if user.githubLogin}<span class="badge">@{user.githubLogin}</span>{/if}
           </div>
           <button
             role="menuitem"

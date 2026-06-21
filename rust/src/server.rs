@@ -8,7 +8,9 @@
 //! | `GET`  | `/healthz`, `/readyz` | liveness / readiness |
 //! | `POST` | `/v1/conversations/{id}/messages` | run one turn, return the reply |
 //! | `GET`  | `/v1/ws/{id}` (Upgrade) | run one turn, stream the reply over WS |
-//! | `POST` | `/v1/auth/google`, `/v1/auth/refresh` | not implemented (dev uses bearer subjects) |
+//! | `POST` | `/v1/auth/google` | exchange a Google ID token for a session |
+//! | `POST` | `/v1/auth/github` | exchange a GitHub OAuth code for a session |
+//! | `POST` | `/v1/auth/refresh` | exchange a refresh token for a fresh session |
 //!
 //! It is a small, blocking, thread-per-connection server built directly on
 //! [`std::net`] — no async runtime and no web framework — matching the project's
@@ -17,10 +19,12 @@
 //! [`crate::http_request::HttpRequest`], dispatched here, and answered with a
 //! [`crate::http_response::HttpResponse`] (or upgraded to a WebSocket).
 //!
-//! **Auth model:** in dev-auth mode the front end sends
-//! `Authorization: Bearer dev:<name>` (or a `{token}` WebSocket hello), and we
-//! map that subject to the `user_id` every read/write is scoped to. Real Google
-//! JWT verification is intentionally out of scope here.
+//! **Auth model:** sign-in is mandatory. The front end signs in with Google or
+//! GitHub, exchanges the result for a Gaia session at `POST /v1/auth/{google,
+//! github}`, and then sends the session access token as `Authorization: Bearer
+//! <token>` (or a `{token}` WebSocket hello). Protected routes reject any request
+//! that does not carry a valid session token with `401` — there is no dev/guest
+//! fallback.
 
 use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -149,6 +153,9 @@ fn route(request: &HttpRequest, engine: &Engine, auth: &Auth) -> HttpResponse {
         // Exchange a Google ID token for a Gaia session.
         ("POST", "/v1/auth/google") => handle_auth_google(request, auth),
 
+        // Exchange a GitHub OAuth code for a Gaia session.
+        ("POST", "/v1/auth/github") => handle_auth_github(request, auth),
+
         // Refresh an expired access token.
         ("POST", "/v1/auth/refresh") => handle_auth_refresh(request, auth),
 
@@ -170,7 +177,16 @@ fn handle_message(request: &HttpRequest, engine: &Engine, auth: &Auth) -> HttpRe
         }
     };
 
-    let user_id = auth.resolve_user_id(request.bearer_token());
+    let user_id = match auth.authenticate(request.bearer_token()) {
+        Some(id) => id,
+        None => {
+            return HttpResponse::with_status_json(
+                401,
+                "Unauthorized",
+                r#"{"error":"authentication required"}"#,
+            )
+        }
+    };
     let result = engine.run_turn(&user_id, &text);
 
     match serde_json::to_vec(&result) {
@@ -208,9 +224,10 @@ fn handle_websocket(
     writer.write_all(handshake.as_bytes())?;
     writer.flush()?;
 
-    // Default the user to the request's bearer (if any) or the dev id; the
-    // client's `{token}` hello refines it before the turn runs.
-    let mut user_id = auth.resolve_user_id(request.bearer_token());
+    // Authenticate from the request's bearer (if any); the client's `{token}`
+    // hello refines it before the turn runs. `None` means "not yet
+    // authenticated" — a turn is refused until a valid session token arrives.
+    let mut user_id = auth.authenticate(request.bearer_token());
 
     while let Some(message) = websocket::read_message(reader)? {
         match message {
@@ -222,13 +239,24 @@ fn handle_websocket(
 
                 // A hello frame carries the auth token; map it to the user id.
                 if let Some(token) = value.get("token").and_then(|t| t.as_str()) {
-                    user_id = auth.resolve_user_id(Some(token));
+                    user_id = auth.authenticate(Some(token));
                 }
 
-                // A text frame carries the user's message; run the turn.
+                // A text frame carries the user's message; run the turn only
+                // for an authenticated session, otherwise reject and close.
                 if let Some(input) = value.get("text").and_then(|t| t.as_str()) {
-                    let result = engine.run_turn(&user_id, input);
-                    stream_turn(writer, &result)?;
+                    match &user_id {
+                        Some(id) => {
+                            let result = engine.run_turn(id, input);
+                            stream_turn(writer, &result)?;
+                        }
+                        None => {
+                            websocket::write_text(
+                                writer,
+                                r#"{"type":"error","error":"authentication required"}"#,
+                            )?;
+                        }
+                    }
                     let _ = websocket::write_close(writer);
                     break;
                 }
@@ -314,6 +342,42 @@ fn handle_auth_google(request: &HttpRequest, auth: &Auth) -> HttpResponse {
     };
 
     match auth.verify_google_token(&id_token) {
+        Ok(info) => {
+            let exchange = auth.create_session(info);
+            match serde_json::to_vec(&exchange) {
+                Ok(json) => HttpResponse::json(json),
+                Err(err) => HttpResponse::with_status_json(
+                    500,
+                    "Internal Server Error",
+                    format!("{{\"error\":\"serialize: {err}\"}}"),
+                ),
+            }
+        }
+        Err(err) => {
+            let safe = err.replace('"', "'");
+            HttpResponse::with_status_json(401, "Unauthorized", format!("{{\"error\":\"{safe}\"}}"))
+        }
+    }
+}
+
+/// Handle `POST /v1/auth/github`: exchange a GitHub OAuth code for a session.
+fn handle_auth_github(request: &HttpRequest, auth: &Auth) -> HttpResponse {
+    let code = match parse_json_field(&request.body, "code") {
+        Some(c) => c,
+        None => {
+            return HttpResponse::with_status_json(
+                400,
+                "Bad Request",
+                "{\"error\":\"expected JSON body with code\"}",
+            )
+        }
+    };
+
+    // `redirectUri` is optional; when present it must match the value the
+    // browser used to start the flow (GitHub validates it).
+    let redirect_uri = parse_json_field(&request.body, "redirectUri");
+
+    match auth.exchange_github_code(&code, redirect_uri.as_deref()) {
         Ok(info) => {
             let exchange = auth.create_session(info);
             match serde_json::to_vec(&exchange) {
@@ -444,7 +508,36 @@ mod tests {
     }
 
     #[test]
-    fn message_route_runs_a_turn_in_skeleton_mode() {
+    fn message_route_runs_a_turn_for_authenticated_session() {
+        let engine = Engine::new(None, None);
+        let auth = dev_auth();
+        // Mint a session and send its access token: protected routes now require
+        // a valid Google/GitHub session (no dev/guest fallback).
+        let exchange = auth.create_session(crate::auth::UserInfo {
+            sub: "user-1".to_string(),
+            name: None,
+            email: None,
+            picture: None,
+            github_login: None,
+        });
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert(
+            "authorization".to_string(),
+            format!("Bearer {}", exchange.token),
+        );
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/v1/conversations/c1/messages".to_string(),
+            body: br#"{"text":"hello"}"#.to_vec(),
+            headers,
+            ..Default::default()
+        };
+        let response = route(&request, &engine, &auth);
+        assert_eq!(response.status(), 200);
+    }
+
+    #[test]
+    fn message_route_without_auth_is_401() {
         let engine = Engine::new(None, None);
         let auth = dev_auth();
         let request = HttpRequest {
@@ -453,8 +546,7 @@ mod tests {
             body: br#"{"text":"hello"}"#.to_vec(),
             ..Default::default()
         };
-        let response = route(&request, &engine, &auth);
-        assert_eq!(response.status(), 200);
+        assert_eq!(route(&request, &engine, &auth).status(), 401);
     }
 
     #[test]
@@ -477,6 +569,19 @@ mod tests {
         let request = HttpRequest {
             method: "POST".to_string(),
             path: "/v1/auth/google".to_string(),
+            body: b"{}".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(route(&request, &engine, &auth).status(), 400);
+    }
+
+    #[test]
+    fn auth_github_without_body_is_400() {
+        let engine = Engine::new(None, None);
+        let auth = dev_auth();
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/v1/auth/github".to_string(),
             body: b"{}".to_vec(),
             ..Default::default()
         };

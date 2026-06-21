@@ -7,6 +7,7 @@ interface ImportMetaEnv {
   readonly VITE_API_PROXY?: string;
   readonly VITE_STREAM_TRANSPORT?: 'ws' | 'post';
   readonly VITE_GOOGLE_CLIENT_ID?: string;
+  readonly VITE_GITHUB_CLIENT_ID?: string;
 }
 
 interface ImportMeta {

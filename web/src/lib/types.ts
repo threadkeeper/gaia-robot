@@ -147,12 +147,14 @@ export interface AuthUser {
   name?: string;
   email?: string;
   picture?: string;
-  /** Bearer token sent on every API call (Gaia session JWT in prod, sub in dev). */
+  /** GitHub login (username), present only for GitHub sign-ins. */
+  githubLogin?: string;
+  /** Which provider this identity was issued by. */
+  provider: 'google' | 'github';
+  /** Bearer token sent on every API call (opaque Gaia session token). */
   token: string;
-  /** Unix seconds when `token` expires (Gaia session JWT). Omitted in dev mode. */
+  /** Unix seconds when `token` expires. */
   expiresAt?: number;
-  /** Long-lived refresh token used for silent renewal. Omitted in dev mode. */
+  /** Long-lived refresh token used for silent renewal. */
   refreshToken?: string;
-  /** True when running in local dev-subject mode. */
-  dev: boolean;
 }
