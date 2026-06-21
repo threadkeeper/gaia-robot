@@ -237,6 +237,30 @@ jobs:
           echo "fqdn=$fqdn" >> "$GITHUB_OUTPUT"
           echo "Deployed to https://$fqdn"
 
+      - name: Configure GitHub OAuth sign-in (optional)
+        # Wires the backend's GitHub OAuth credentials onto the Container App so
+        # the /v1/auth/github code exchange works in production. The client
+        # secret is stored as a Container App secret (not a plaintext env var)
+        # and referenced via secretref. This step is skipped unless the OAuth
+        # client id variable is set, so it never disturbs Google-only deploys.
+        #
+        # NOTE: GitHub Actions forbids secret/variable names starting with
+        # "GITHUB_", so configure these instead:
+        #   - repository VARIABLE  GH_OAUTH_CLIENT_ID     = prod OAuth App client id
+        #   - repository SECRET    GH_OAUTH_CLIENT_SECRET = prod OAuth App client secret
+        if: ${{ vars.GH_OAUTH_CLIENT_ID != '' }}
+        run: |
+          az containerapp secret set \
+            --name "${{ vars.CONTAINERAPP_NAME }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --secrets github-client-secret="${{ secrets.GH_OAUTH_CLIENT_SECRET }}"
+          az containerapp update \
+            --name "${{ vars.CONTAINERAPP_NAME }}" \
+            --resource-group "${{ vars.RESOURCE_GROUP }}" \
+            --set-env-vars \
+              GITHUB_CLIENT_ID="${{ vars.GH_OAUTH_CLIENT_ID }}" \
+              GITHUB_CLIENT_SECRET=secretref:github-client-secret
+
       - name: Smoke test /healthz
         run: |
           for i in $(seq 1 30); do

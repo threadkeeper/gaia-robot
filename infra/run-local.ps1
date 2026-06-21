@@ -33,20 +33,11 @@
     Do not mint Azure tokens; use whatever is already present in infra/.env or
     the current environment. Useful when offline or when tokens are still valid.
 
-.PARAMETER DevAuth
-    Force the local dev name-picker instead of Google sign-in. By default the
-    launcher runs in LIVE auth mode whenever GOOGLE_CLIENT_ID is set in
-    infra/.env: the backend verifies Google ID tokens and the web app shows the
-    real Google sign-in button. Use -DevAuth to bypass Google while developing.
-
 .EXAMPLE
     ./infra/run-local.ps1
-    Mints tokens, starts the backend on :8080 and the web app on :5173,
-    using Google sign-in when GOOGLE_CLIENT_ID is configured.
-
-.EXAMPLE
-    ./infra/run-local.ps1 -DevAuth
-    Same, but forces the local dev name-picker instead of Google sign-in.
+    Mints tokens, starts the backend on :8080 and the web app on :5173. Sign-in
+    is enabled for whichever providers are configured in infra/.env (Google via
+    GOOGLE_CLIENT_ID, GitHub via GITHUB_CLIENT_ID + GITHUB_CLIENT_SECRET).
 
 .NOTES
     Azure AD tokens are short-lived (~1 hour). Re-run this script to refresh
@@ -56,8 +47,7 @@
 param(
     [int]$BackendPort = 8080,
     [int]$WebPort = 5173,
-    [switch]$SkipTokens,
-    [switch]$DevAuth
+    [switch]$SkipTokens
 )
 
 $ErrorActionPreference = 'Stop'
@@ -181,31 +171,37 @@ $env:GAIA_HTTP_PORT = "$BackendPort"
 # Point the web dev proxy at the chosen backend port (default already matches).
 $env:VITE_API_PROXY = "http://localhost:$BackendPort"
 
-# --- Auth mode: Google sign-in (default) vs local dev name-picker ----------
-# Single source of truth is GOOGLE_CLIENT_ID in infra/.env. The backend reads it
-# directly; here we also bridge it to the web app's VITE_GOOGLE_CLIENT_ID so the
-# front end shows the real Google button. -DevAuth forces the name-picker by
-# clearing both, regardless of what's in infra/.env.
-$googleClientId = $conf['GOOGLE_CLIENT_ID']
+# --- Auth: Google and/or GitHub sign-in -------------------------------------
+# Sign-in is mandatory (the old dev name-picker was removed). infra/.env is the
+# single source of truth: the backend reads GOOGLE_CLIENT_ID, GITHUB_CLIENT_ID
+# and GITHUB_CLIENT_SECRET directly; here we also bridge the *public* client ids
+# to the web app's VITE_* vars so the front end shows the matching buttons. The
+# GitHub client secret is backend-only and never reaches the browser.
+$googleClientId     = $conf['GOOGLE_CLIENT_ID']
+$githubClientId     = $conf['GITHUB_CLIENT_ID']
+$githubClientSecret = $conf['GITHUB_CLIENT_SECRET']
 
-if ($DevAuth) {
-    # Explicit opt-out: blank both so backend + web fall back to dev auth.
-    $env:GOOGLE_CLIENT_ID = ''
-    $env:VITE_GOOGLE_CLIENT_ID = ''
-    Write-Host "Auth: DEV name-picker (forced by -DevAuth)." -ForegroundColor Yellow
-} elseif (-not [string]::IsNullOrWhiteSpace($googleClientId)) {
-    # Default: live Google sign-in on both backend and web.
-    $env:GOOGLE_CLIENT_ID = $googleClientId
-    $env:VITE_GOOGLE_CLIENT_ID = $googleClientId
-    Write-Host "Auth: LIVE Google sign-in (client $googleClientId)." -ForegroundColor Green
+# Google: backend ID-token verification + web button.
+$env:GOOGLE_CLIENT_ID      = $googleClientId
+$env:VITE_GOOGLE_CLIENT_ID = $googleClientId
+
+# GitHub: backend code exchange (needs id + secret) + web button (id only).
+$env:GITHUB_CLIENT_ID      = $githubClientId
+$env:GITHUB_CLIENT_SECRET  = $githubClientSecret
+$env:VITE_GITHUB_CLIENT_ID = $githubClientId
+
+$providers = @()
+if (-not [string]::IsNullOrWhiteSpace($googleClientId)) { $providers += 'Google' }
+if ((-not [string]::IsNullOrWhiteSpace($githubClientId)) -and
+    (-not [string]::IsNullOrWhiteSpace($githubClientSecret))) { $providers += 'GitHub' }
+
+if ($providers.Count -gt 0) {
+    Write-Host ("Auth: LIVE sign-in via {0}." -f ($providers -join ' + ')) -ForegroundColor Green
 } else {
-    # Live is the intended default, but no client id is configured yet.
-    $env:GOOGLE_CLIENT_ID = ''
-    $env:VITE_GOOGLE_CLIENT_ID = ''
-    Write-Host "Auth: DEV name-picker - GOOGLE_CLIENT_ID is empty in infra/.env." -ForegroundColor Yellow
-    Write-Host "      Paste your Google OAuth Web Client ID into infra/.env (GOOGLE_CLIENT_ID=)" -ForegroundColor Yellow
-    Write-Host "      and re-run to enable Google sign-in. Authorized JS origins must include" -ForegroundColor Yellow
-    Write-Host "      http://localhost:$WebPort." -ForegroundColor Yellow
+    # Sign-in is mandatory, so with no provider configured the app is unusable.
+    Write-Host "Auth: NO provider configured - sign-in is mandatory, so the app will be unusable." -ForegroundColor Yellow
+    Write-Host "      Set GOOGLE_CLIENT_ID and/or GITHUB_CLIENT_ID (+ GITHUB_CLIENT_SECRET) in infra/.env." -ForegroundColor Yellow
+    Write-Host "      GitHub OAuth App callback URL must be http://localhost:$WebPort/ (note trailing slash)." -ForegroundColor Yellow
 }
 
 # --- 4. Launch the two long-running processes -------------------------------
