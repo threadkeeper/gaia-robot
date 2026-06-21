@@ -69,6 +69,7 @@ mod http_request;
 mod http_response;
 mod llm;
 mod prompt;
+mod response_context;
 mod search_history;
 mod server;
 mod sha1;

@@ -136,6 +136,13 @@ struct ProbeArtifacts {
     queries: Vec<PlannedQueryArtifact>,
     /// Per-action retrieval results keyed by `(action_id, container)`.
     results: Vec<(String, String, Vec<serde_json::Value>)>,
+    /// The user question this turn answered (for the Response Data Context).
+    question: String,
+    /// The RFC 3339 timestamp the turn was requested at.
+    requested_at: String,
+    /// Call 1's non-action documents (analysis, facts, newContext summary),
+    /// folded into the Response Data Context handed to LLM Call 2.
+    extras: crate::response_context::Call1Extras,
 }
 
 /// The actually-executed Cosmos query for one action, written to `queries.json`.
@@ -164,6 +171,9 @@ impl ProbeArtifacts {
             actions: None,
             queries: Vec::new(),
             results: Vec::new(),
+            question: String::new(),
+            requested_at: String::new(),
+            extras: crate::response_context::Call1Extras::default(),
         }
     }
 
@@ -200,6 +210,30 @@ impl ProbeArtifacts {
             let json = serde_json::to_string_pretty(records).unwrap_or_default();
             std::fs::write(&path, json)?;
         }
+
+        // Deterministically assemble the Response Data Context that bridges LLM
+        // Call 1 and Call 2 from everything gathered this turn. This is a pure
+        // string build (no extra LLM call), written alongside the JSON
+        // artifacts as `responsedatacontext.md`.
+        let groups: Vec<crate::response_context::RetrievalGroup> = self
+            .results
+            .iter()
+            .map(
+                |(action_id, container, records)| crate::response_context::RetrievalGroup {
+                    action_id: action_id.clone(),
+                    container: container.clone(),
+                    records: records.clone(),
+                },
+            )
+            .collect();
+        let context = crate::response_context::build_response_data_context(
+            PROBE_USER_ID,
+            &self.question,
+            &self.requested_at,
+            &self.extras,
+            &groups,
+        );
+        std::fs::write(dir.join("responsedatacontext.md"), context)?;
 
         Ok(())
     }
@@ -421,6 +455,9 @@ impl DataRetrievalProbe {
 
         // --- LLM Call 1: ask the model what to retrieve -------------------
         let requested_at = now_rfc3339();
+        // Record the turn details so the Response Data Context can be built.
+        artifacts.question = question.to_string();
+        artifacts.requested_at = requested_at.clone();
         let call1 = Call1Prompt::build(PROBE_USER_ID, question, "", &requested_at);
         let reply = match self.llm.complete(&call1.system, &call1.user) {
             Ok(reply) => reply,
@@ -431,6 +468,9 @@ impl DataRetrievalProbe {
         };
         metrics.llm_ok = true;
         artifacts.raw_reply = Some(reply.clone());
+        // Parse Call 1's non-action documents (analysis, facts, newContext)
+        // so they can be folded into the Response Data Context.
+        artifacts.extras = crate::response_context::parse_call1_extras(&reply);
 
         // --- Parse actions.json out of the reply --------------------------
         let mut actions = match crate::actions::parse_call1_actions(&reply) {
@@ -984,6 +1024,9 @@ mod tests {
             }),
             queries: Vec::new(),
             results: Vec::new(),
+            question: "hello?".to_string(),
+            requested_at: "2026-06-20T00:00:00Z".to_string(),
+            extras: crate::response_context::Call1Extras::default(),
         };
 
         artifacts
@@ -992,6 +1035,7 @@ mod tests {
 
         assert!(dir.join("reply.json").exists());
         assert!(dir.join("actions.json").exists());
+        assert!(dir.join("responsedatacontext.md").exists());
         assert!(!dir.join("stale.json").exists());
         assert!(dir.join("keep.txt").exists());
 

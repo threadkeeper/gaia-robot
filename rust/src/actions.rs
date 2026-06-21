@@ -85,17 +85,30 @@ pub struct ActionPlan {
 /// # // binary crate and the function is not exported as a library API.)
 /// ```
 pub fn parse_call1_actions(reply: &str) -> Option<ActionsFile> {
-    // Try the first balanced `[…]` in the reply. The model sometimes appends
-    // extra prose or metadata objects after the actions array, so a naive
-    // first-`[`-to-last-`]` scan grabs invalid JSON. Instead, walk forward
-    // from the first `[` counting brackets and respecting strings to find the
-    // matching `]`.
+    // Reuse the shared array extractor, then take element 0 (actions.json).
+    let documents = extract_call1_array(reply)?;
+    let first = documents.first()?;
+    serde_json::from_value(first.clone()).ok()
+}
+
+/// Extract LLM Call 1's full four-document array from its raw reply.
+///
+/// LLM Call 1 emits a single JSON array of four documents (in order:
+/// `actions.json`, `analysis.json`, `facts.json`, `newContext.json`). This finds
+/// that array by its outer brackets — tolerating any code fences or stray prose
+/// around it — parses it, and returns its elements. Returns `None` when no
+/// balanced array is present or it is not valid JSON, so callers can degrade
+/// gracefully. Both [`parse_call1_actions`] and the Response Data Context
+/// builder share this so they always read the *same* array the same way.
+pub fn extract_call1_array(reply: &str) -> Option<Vec<serde_json::Value>> {
+    // Walk forward from the first `[` counting brackets (and respecting string
+    // literals) to find the matching `]`; the model sometimes appends extra
+    // prose after the array, so a first-`[`-to-last-`]` scan would be invalid.
     let start = reply.find('[')?;
     let end = find_balanced_bracket(&reply[start..])? + start;
     let json = reply.get(start..=end)?;
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
-    let first = value.as_array()?.first()?;
-    serde_json::from_value(first.clone()).ok()
+    value.as_array().cloned()
 }
 
 /// Find the index (relative to `s`) of the `]` that balances the leading `[`.
