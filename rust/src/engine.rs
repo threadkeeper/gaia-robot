@@ -658,9 +658,7 @@ mod tests {
     /// model-router echoes to report the underlying model it selected.
     fn completion_with_model(content: &str, model: &str) -> String {
         let escaped = content.replace('\\', "\\\\").replace('"', "\\\"");
-        format!(
-            r#"{{"model":"{model}","choices":[{{"message":{{"content":"{escaped}"}}}}]}}"#
-        )
+        format!(r#"{{"model":"{model}","choices":[{{"message":{{"content":"{escaped}"}}}}]}}"#)
     }
 
     #[test]
