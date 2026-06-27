@@ -150,17 +150,27 @@ impl<'a> PullDataController<'a> {
         let mut cosmos_action_count = 0;
         let mut web_action_count = 0;
 
-        // Parse the action plan. Without one we still emit a deterministic (but
-        // result-free) context from the extras alone.
-        let plan = crate::actions::parse_call1_actions(call1_raw).map(|mut actions| {
-            // Honour the GAIA_FORCE_SEMANTIC override before anything reads the
-            // plan, so both the captured artifact and the executed query reflect
-            // the override.
-            if crate::executor::force_semantic() {
-                crate::executor::force_semantic_on(&mut actions);
-            }
-            actions
-        });
+        // Parse the action plan, defaulting to an empty plan so the guaranteed
+        // core-user queries below still run even when Call 1 authored nothing
+        // parseable (a missing/garbled reply must never leave Gaia blind to who
+        // the user is).
+        let mut actions = crate::actions::parse_call1_actions(call1_raw).unwrap_or_default();
+
+        // GUARANTEE Gaia always retrieves her core knowledge about the user this
+        // turn — her KB facts, diary reflections, and the connection ledger —
+        // regardless of what Call 1 planned, so she never "forgets who you are".
+        // Done before the force-semantic override so that override upgrades the
+        // embeddable core queries too.
+        crate::executor::ensure_core_user_queries(&mut actions, user_id);
+
+        // Honour the GAIA_FORCE_SEMANTIC override before anything reads the
+        // plan, so both the captured artifact and the executed query reflect
+        // the override.
+        if crate::executor::force_semantic() {
+            crate::executor::force_semantic_on(&mut actions);
+        }
+
+        let plan = Some(actions);
 
         if let Some(actions) = &plan {
             // Split the plan into Cosmos-backed queries and Web searches.
@@ -472,7 +482,10 @@ mod tests {
         // The plan parsed and was split correctly.
         assert!(result.plan.is_some());
         assert_eq!(result.web_actions, 1);
-        assert_eq!(result.cosmos_actions, 0);
+        // The three guaranteed core-user queries (KB, diary, connections) are
+        // always appended, so the model's Web-only plan still drives 3 Cosmos
+        // reads.
+        assert_eq!(result.cosmos_actions, 3);
         // The Web client was missing, so the attempt failed.
         assert!(!result.all_ok);
         assert!(result
@@ -508,29 +521,56 @@ mod tests {
     }
 
     #[test]
-    fn execute_without_a_parseable_plan_still_builds_a_context() {
-        // A reply with no JSON array yields no plan, but the context (built from
-        // empty extras) is still complete and nothing is reported as failed.
+    fn execute_without_a_parseable_plan_still_forces_core_user_queries() {
+        // A reply with no JSON array yields no model plan, but Gaia must still
+        // never "forget who you are": the three guaranteed core-user queries
+        // (KB, diary, connections) are appended so the turn still tries to read
+        // the user's identity context. With no Cosmos client they fail, but the
+        // context (built from empty extras) is still complete.
         let controller = PullDataController::new(None, None, None);
         let result = controller.execute("alice", "hi", "2026-06-21T00:00:00Z", "not json", false);
-        assert!(result.plan.is_none());
-        assert_eq!(result.cosmos_actions, 0);
+        assert!(result.plan.is_some());
+        // The three core-user containers are always queried.
+        let plan = result.plan.as_ref().unwrap();
+        assert_eq!(plan.actions.len(), 3);
+        for container in ["GaiaKB", "GaiaDiary", "GaiaConnections"] {
+            assert!(
+                plan.actions
+                    .iter()
+                    .any(|a| a.target == container && a.entity.as_deref() == Some("alice")),
+                "missing forced core query for {container}"
+            );
+        }
+        assert_eq!(result.cosmos_actions, 3);
         assert_eq!(result.web_actions, 0);
-        assert!(result.all_ok);
-        assert!(result.notes.is_empty());
+        // Cosmos was not configured, so the forced reads are reported as failed.
+        assert!(!result.all_ok);
+        assert!(result
+            .notes
+            .iter()
+            .any(|n| n.contains("Cosmos is not configured")));
         assert!(result.context.contains("## WebSearchResults"));
     }
 
     #[test]
     fn execute_runs_cosmos_and_web_actions_against_their_clients() {
-        // Drive the full pull pass with live (mock) Cosmos and Brave clients: a
-        // keyword Cosmos query and a Web search both succeed, their records are
-        // folded into the context, and the issued web query is recorded.
-        let cosmos_body = r#"{"Documents":[
+        // Drive the full pull pass with live (mock) Cosmos and Brave clients: the
+        // authored UsersKB keyword query and the Web search both succeed, and the
+        // three guaranteed core-user queries (GaiaKB, GaiaDiary, GaiaConnections)
+        // also run (returning nothing here). Their records are folded into the
+        // context and the issued web query is recorded.
+        let kb_doc = r#"{"Documents":[
             {"id":"UsersKB|alice|2026-05-10","userId":"alice","date":"2026-05-10","data":"prefers tea"}
         ]}"#;
-        let (cosmos_endpoint, cosmos_handle) =
-            crate::test_http::spawn_mock_http("200 OK", cosmos_body);
+        let empty = r#"{"Documents":[]}"#;
+        // One response per Cosmos call, in plan order: the authored q1 (UsersKB)
+        // first, then the three forced core-user queries.
+        let (cosmos_endpoint, cosmos_handle) = crate::test_http::spawn_mock_http_sequence(vec![
+            ("200 OK".to_string(), kb_doc.to_string()),
+            ("200 OK".to_string(), empty.to_string()),
+            ("200 OK".to_string(), empty.to_string()),
+            ("200 OK".to_string(), empty.to_string()),
+        ]);
         let cosmos = CosmosClient::new(cosmos_endpoint, "gaia", "tok");
 
         let brave_body = r#"{"web":{"results":[
@@ -552,11 +592,12 @@ mod tests {
 
         let result = controller.execute("alice", "mars?", "2026-06-21T00:00:00Z", reply, false);
 
-        assert_eq!(result.cosmos_actions, 1);
+        // The authored UsersKB query plus the three forced core-user queries.
+        assert_eq!(result.cosmos_actions, 4);
         assert_eq!(result.web_actions, 1);
         assert!(result.all_ok, "notes: {:?}", result.notes);
-        // Both retrieval groups were gathered and the web query recorded.
-        assert_eq!(result.groups.len(), 2);
+        // Four Cosmos groups (one per query) plus the one web group.
+        assert_eq!(result.groups.len(), 5);
         assert_eq!(result.searches, vec!["mars news".to_string()]);
         assert!(result.context.contains("prefers tea"));
         assert!(result.context.contains("Mars"));
@@ -567,10 +608,19 @@ mod tests {
 
     #[test]
     fn execute_notes_a_cosmos_failure_but_still_completes() {
-        // Cosmos returns an error status: the action is recorded as failed and
-        // all_ok flips, yet the context is still fully assembled.
-        let (cosmos_endpoint, cosmos_handle) =
-            crate::test_http::spawn_mock_http("403 Forbidden", r#"{"message":"denied"}"#);
+        // Cosmos returns an error status for every read (the authored UsersKB
+        // query and the three forced core-user queries): each is recorded as
+        // failed and all_ok flips, yet the context is still fully assembled.
+        let denied = (
+            "403 Forbidden".to_string(),
+            r#"{"message":"denied"}"#.to_string(),
+        );
+        let (cosmos_endpoint, cosmos_handle) = crate::test_http::spawn_mock_http_sequence(vec![
+            denied.clone(),
+            denied.clone(),
+            denied.clone(),
+            denied,
+        ]);
         let cosmos = CosmosClient::new(cosmos_endpoint, "gaia", "tok");
 
         let controller = PullDataController::new(Some(&cosmos), None, None);
@@ -584,7 +634,7 @@ mod tests {
 
         let result = controller.execute("alice", "hi", "2026-06-21T00:00:00Z", reply, false);
 
-        assert_eq!(result.cosmos_actions, 1);
+        assert_eq!(result.cosmos_actions, 4);
         assert!(!result.all_ok);
         assert!(result.notes.iter().any(|n| n.contains("failed")));
         assert!(result.context.contains("## DataLakeResults"));

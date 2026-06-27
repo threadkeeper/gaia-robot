@@ -16,7 +16,7 @@
 //! string-interpolated) to avoid query injection; only program-owned constants
 //! such as `TOP` are interpolated.
 
-use crate::actions::{ActionPlan, ActionsFile};
+use crate::actions::{ActionFilters, ActionPlan, ActionsFile};
 use crate::cosmos::{CosmosClient, QueryParam};
 use crate::embeddings::EmbeddingClient;
 use crate::storage::Record;
@@ -355,6 +355,68 @@ pub fn force_semantic_on(plan: &mut ActionsFile) {
             action.query = None;
             action.filters.mode = Some("semantic".to_string());
         }
+    }
+}
+
+/// The Gaia containers that always hold Gaia's core knowledge about a user:
+/// her knowledge-base facts about them ([`GaiaKB`]-equivalent), her diary
+/// reflections, and the connection ledger that tracks the relationship.
+///
+/// These are the three sources that answer "who is this person?" — so Gaia must
+/// read them on *every* turn, regardless of what LLM Call 1 plans.
+pub const CORE_USER_CONTAINERS: [&str; 3] = ["GaiaKB", "GaiaDiary", "GaiaConnections"];
+
+/// Default top-N for a forced core-user query.
+///
+/// Small on purpose: we want the most recent few records per source to remind
+/// Gaia of the user's identity, not flood the Response Data Context.
+const CORE_USER_QUERY_TOP: usize = 3;
+
+/// Guarantee that this turn retrieves Gaia's core knowledge about the user.
+///
+/// Gaia must never "forget who you are". LLM Call 1 is free to plan whatever
+/// extra retrieval a question needs, but it sometimes omits the queries that
+/// fetch the user's identity context — or scopes them to the wrong entity. To
+/// make every turn robust, this appends a guaranteed query for each core
+/// container in [`CORE_USER_CONTAINERS`] that the plan does not already cover
+/// for `user_id`, pinned to that user (`entity == user_id`, the migration's
+/// partition key). Containers the model already queries for this user are left
+/// untouched so it can still refine them.
+///
+/// Each forced query uses keyword mode with no text filter, which the executor
+/// turns into "the most recent records in the user's partition" — so it works
+/// even when embeddings are not configured. When `GAIA_FORCE_SEMANTIC` is on,
+/// call this *before* [`force_semantic_on`] so the override upgrades the
+/// embeddable core queries (KB, diary) too.
+pub fn ensure_core_user_queries(plan: &mut ActionsFile, user_id: &str) {
+    for container in CORE_USER_CONTAINERS {
+        // Skip a container the model already queries for this exact user, so we
+        // never duplicate a retrieval it deliberately scoped.
+        let already_planned = plan.actions.iter().any(|action| {
+            action.target.eq_ignore_ascii_case(container)
+                && action.entity.as_deref().map(str::trim) == Some(user_id)
+        });
+        if already_planned {
+            continue;
+        }
+
+        plan.actions.push(ActionPlan {
+            // A stable, namespaced id that cannot collide with the model's q1..qN.
+            id: format!("core-{}", container.to_ascii_lowercase()),
+            kind: "query".to_string(),
+            target: container.to_string(),
+            user_id: Some(user_id.to_string()),
+            entity: Some(user_id.to_string()),
+            intent: format!("Core {container} context about the user"),
+            top: CORE_USER_QUERY_TOP,
+            query: None,
+            filters: ActionFilters {
+                // Keyword mode + no text filter => the most recent records in the
+                // user's partition, which needs no embedding client to run.
+                mode: Some("keyword".to_string()),
+                ..ActionFilters::default()
+            },
+        });
     }
 }
 
@@ -726,6 +788,87 @@ mod tests {
 
         // GaiaConnections has no embedding, so it stays on the keyword path.
         assert_eq!(plan.actions[0].filters.mode.as_deref(), Some("keyword"));
+    }
+
+    #[test]
+    fn ensure_core_user_queries_appends_all_three_core_containers() {
+        // An empty plan must gain a guaranteed query for every core container,
+        // each pinned to the user (entity == user_id == the partition key).
+        let mut plan = ActionsFile::default();
+        ensure_core_user_queries(&mut plan, "threadkeeper");
+
+        assert_eq!(plan.actions.len(), 3);
+        for container in CORE_USER_CONTAINERS {
+            let action = plan
+                .actions
+                .iter()
+                .find(|a| a.target == container)
+                .unwrap_or_else(|| panic!("missing forced query for {container}"));
+            assert_eq!(action.kind, "query");
+            assert_eq!(action.user_id.as_deref(), Some("threadkeeper"));
+            assert_eq!(action.entity.as_deref(), Some("threadkeeper"));
+            // Keyword mode + no text filter keeps the query runnable without an
+            // embedding client.
+            assert_eq!(action.filters.mode.as_deref(), Some("keyword"));
+            assert!(action.filters.text.is_none());
+            // The forced action passes the strict user-isolation contract.
+            assert!(action.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn ensure_core_user_queries_does_not_duplicate_an_existing_query() {
+        // The model already queries GaiaKB for this user, so only the two other
+        // core containers are appended; the model's action is left untouched.
+        let mut existing = action("GaiaKB");
+        existing.id = "q5".to_string();
+        existing.user_id = Some("alice".to_string());
+        existing.entity = Some("alice".to_string());
+        existing.filters.semantic = Some("favourite books".to_string());
+
+        let mut plan = ActionsFile {
+            version: "1.0".to_string(),
+            session: SessionContext {
+                user_id: "alice".to_string(),
+                requested_at: "2026-06-21T00:00:00Z".to_string(),
+            },
+            actions: vec![existing.clone()],
+        };
+        ensure_core_user_queries(&mut plan, "alice");
+
+        assert_eq!(plan.actions.len(), 3);
+        // The model's GaiaKB action is preserved verbatim (not overwritten).
+        assert_eq!(plan.actions[0], existing);
+        // The other two core containers were appended.
+        assert!(plan.actions.iter().any(|a| a.target == "GaiaDiary"));
+        assert!(plan.actions.iter().any(|a| a.target == "GaiaConnections"));
+        assert_eq!(
+            plan.actions.iter().filter(|a| a.target == "GaiaKB").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ensure_core_user_queries_adds_a_query_for_a_different_user() {
+        // A core query the model scoped to a *different* user does not satisfy
+        // the current user's need, so a fresh query is still appended.
+        let mut other = action("GaiaDiary");
+        other.user_id = Some("bob".to_string());
+        other.entity = Some("bob".to_string());
+
+        let mut plan = ActionsFile {
+            version: "1.0".to_string(),
+            session: SessionContext::default(),
+            actions: vec![other],
+        };
+        ensure_core_user_queries(&mut plan, "alice");
+
+        // bob's GaiaDiary plus alice's three forced core queries.
+        assert_eq!(plan.actions.len(), 4);
+        assert!(plan
+            .actions
+            .iter()
+            .any(|a| a.target == "GaiaDiary" && a.entity.as_deref() == Some("alice")));
     }
 
     #[test]

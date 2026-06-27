@@ -81,6 +81,19 @@ impl fmt::Display for CosmosError {
 
 impl std::error::Error for CosmosError {}
 
+impl CosmosError {
+    /// `true` when this is an HTTP error whose status code is 404 (Not Found).
+    ///
+    /// The write path uses this to tell a missing *container* — which it can
+    /// create on demand — apart from every other failure (auth, RBAC, network,
+    /// a genuinely bad request), which it must surface unchanged.
+    pub fn is_not_found(&self) -> bool {
+        // `map_ureq_error` formats HTTP failures as `HTTP {code}: {body}`, so a
+        // 404 always begins with this exact prefix.
+        matches!(self, CosmosError::Http(message) if message.starts_with("HTTP 404"))
+    }
+}
+
 /// A named query parameter, mirroring Cosmos's `{"name": "@p", "value": ...}`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct QueryParam {
@@ -452,6 +465,79 @@ impl CosmosClient {
             .map_err(map_ureq_error)?;
 
         Ok(())
+    }
+
+    /// Upsert a document, transparently creating its container first if it does
+    /// not exist yet.
+    ///
+    /// Behaves exactly like [`upsert_doc`](CosmosClient::upsert_doc), but when
+    /// the upsert fails because the target *container* is missing (HTTP 404),
+    /// it creates the container with a Hash partition key on `partition_key_path`
+    /// and retries the upsert once. This makes the write self-healing for derived
+    /// containers (such as `DataLakeIndex`) that may not have been provisioned
+    /// ahead of time, so the first write of their lifetime creates them rather
+    /// than failing the whole turn's persistence.
+    ///
+    /// `partition_value` must equal the document's partition field, and
+    /// `partition_key_path` is the leading-slash path that field lives at
+    /// (e.g. `/entity`); the two must agree for Cosmos to accept the write.
+    pub fn upsert_doc_creating_container<T: Serialize>(
+        &self,
+        container: &str,
+        partition_value: &str,
+        doc: &T,
+        partition_key_path: &str,
+    ) -> Result<(), CosmosError> {
+        match self.upsert_doc(container, partition_value, doc) {
+            Ok(()) => Ok(()),
+            // A 404 from an *upsert* means the container is absent (a missing
+            // document would simply be inserted). Create it, then retry once.
+            Err(err) if err.is_not_found() => {
+                self.create_container_if_missing(container, partition_key_path)?;
+                self.upsert_doc(container, partition_value, doc)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Create `container` in the target database if it does not already exist.
+    ///
+    /// Issues a data-plane `POST {endpoint}dbs/{db}/colls` that defines the
+    /// container with a Hash partition key on `partition_key_path` (e.g.
+    /// `/entity`). Creation is **idempotent**: a `409 Conflict` — the container
+    /// already exists, perhaps created by a racing writer — is treated as
+    /// success, so concurrent first-writes all converge on the same container.
+    ///
+    /// Note this is a management-shaped operation: the calling identity needs a
+    /// role that permits creating containers. A data-only role will see this
+    /// rejected (surfaced as the underlying [`CosmosError`]).
+    pub fn create_container_if_missing(
+        &self,
+        container: &str,
+        partition_key_path: &str,
+    ) -> Result<(), CosmosError> {
+        let url = format!("{}dbs/{}/colls", self.endpoint, self.database);
+        let definition = serde_json::json!({
+            "id": container,
+            "partitionKey": { "paths": [partition_key_path], "kind": "Hash" },
+        });
+        let body =
+            serde_json::to_vec(&definition).map_err(|e| CosmosError::Decode(e.to_string()))?;
+
+        let auth = aad_auth_header(&self.bearer()?);
+        let result = ureq::post(&url)
+            .set("Authorization", &auth)
+            .set("x-ms-date", &now_rfc1123())
+            .set("x-ms-version", API_VERSION)
+            .set("Content-Type", "application/json")
+            .send_bytes(&body);
+
+        match result {
+            Ok(_) => Ok(()),
+            // The container already exists — exactly the state we want.
+            Err(ureq::Error::Status(409, _)) => Ok(()),
+            Err(err) => Err(map_ureq_error(err)),
+        }
     }
 
     /// Point-read a single document by id within a partition.
@@ -925,6 +1011,17 @@ mod tests {
     }
 
     #[test]
+    fn is_not_found_only_matches_http_404() {
+        // A 404 HTTP error is the missing-container signal the write path keys on.
+        assert!(CosmosError::Http("HTTP 404: {\"code\":\"NotFound\"}".into()).is_not_found());
+        // Any other status, or a non-HTTP error, is not a "not found".
+        assert!(!CosmosError::Http("HTTP 403: denied".into()).is_not_found());
+        assert!(!CosmosError::Http("HTTP 409: conflict".into()).is_not_found());
+        assert!(!CosmosError::MissingToken.is_not_found());
+        assert!(!CosmosError::Decode("bad".into()).is_not_found());
+    }
+
+    #[test]
     fn static_credential_bearer_returns_the_token_verbatim() {
         let client = CosmosClient::new("https://acct.documents.azure.com", "gaia", "tok-123");
         assert_eq!(client.bearer().expect("static token"), "tok-123");
@@ -1072,6 +1169,140 @@ mod tests {
         haystack
             .windows(needle.len())
             .position(|window| window == needle)
+    }
+
+    /// Like [`spawn_mock_cosmos`] but serves a *sequence* of scripted responses
+    /// over consecutive connections: the first request gets `responses[0]`, the
+    /// second `responses[1]`, and so on. This lets a test drive a multi-call code
+    /// path (e.g. upsert → create-container → upsert-retry) against one server.
+    fn spawn_mock_cosmos_sequence(
+        responses: Vec<(&'static str, &'static str)>,
+    ) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = thread::spawn(move || {
+            for (status_line, body) in responses {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                // Drain the request (headers + any Content-Length body) before
+                // answering, mirroring `spawn_mock_cosmos` so Windows does not
+                // send an RST that the client would see as a forcible close.
+                let mut data: Vec<u8> = Vec::new();
+                let mut buf = [0u8; 1024];
+                let header_end = loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break data.len(),
+                        Ok(n) => {
+                            data.extend_from_slice(&buf[..n]);
+                            if let Some(pos) = find_subsequence(&data, b"\r\n\r\n") {
+                                break pos + 4;
+                            }
+                        }
+                        Err(_) => break data.len(),
+                    }
+                };
+                let headers = String::from_utf8_lossy(&data[..header_end.min(data.len())]);
+                let content_len = headers
+                    .lines()
+                    .find_map(|line| {
+                        let lower = line.to_ascii_lowercase();
+                        lower
+                            .strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                let mut body_seen = data.len().saturating_sub(header_end);
+                while body_seen < content_len {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => body_seen += n,
+                        Err(_) => break,
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    #[test]
+    fn upsert_doc_creating_container_writes_directly_when_container_exists() {
+        // The first upsert succeeds (2xx), so no container creation is attempted.
+        let (endpoint, handle) = spawn_mock_cosmos("201 Created", "{}");
+        let client = CosmosClient::new(endpoint, "gaia", "tok");
+
+        client
+            .upsert_doc_creating_container(
+                "DataLakeIndex",
+                "e",
+                &serde_json::json!({ "id": "DataLakeIndex|e|2026-06-27", "entity": "e" }),
+                "/entity",
+            )
+            .expect("upsert succeeds when the container already exists");
+        handle.join().expect("mock server thread joins");
+    }
+
+    #[test]
+    fn upsert_doc_creating_container_creates_then_retries_on_404() {
+        // 1) first upsert → 404 (container missing); 2) create container → 201;
+        // 3) retry upsert → 201. The self-healing path must turn this into Ok.
+        let (endpoint, handle) = spawn_mock_cosmos_sequence(vec![
+            ("404 Not Found", "{\"code\":\"NotFound\"}"),
+            ("201 Created", "{}"),
+            ("201 Created", "{}"),
+        ]);
+        let client = CosmosClient::new(endpoint, "gaia", "tok");
+
+        client
+            .upsert_doc_creating_container(
+                "DataLakeIndex",
+                "e",
+                &serde_json::json!({ "id": "DataLakeIndex|e|2026-06-27", "entity": "e" }),
+                "/entity",
+            )
+            .expect("a missing container is created and the upsert retried");
+        handle.join().expect("mock server thread joins");
+    }
+
+    #[test]
+    fn create_container_if_missing_treats_409_conflict_as_success() {
+        // A racing writer already created the container: 409 is the desired state.
+        let (endpoint, handle) = spawn_mock_cosmos("409 Conflict", "{\"code\":\"Conflict\"}");
+        let client = CosmosClient::new(endpoint, "gaia", "tok");
+
+        client
+            .create_container_if_missing("DataLakeIndex", "/entity")
+            .expect("an existing container (409) is treated as success");
+        handle.join().expect("mock server thread joins");
+    }
+
+    #[test]
+    fn create_container_if_missing_surfaces_a_forbidden_error() {
+        // A data-only identity cannot create containers: the 403 must propagate.
+        let (endpoint, handle) = spawn_mock_cosmos("403 Forbidden", "{\"code\":\"Forbidden\"}");
+        let client = CosmosClient::new(endpoint, "gaia", "tok");
+
+        let err = client
+            .create_container_if_missing("DataLakeIndex", "/entity")
+            .expect_err("a 403 on container creation is surfaced");
+        assert!(err.to_string().contains("403"), "got: {err}");
+        handle.join().expect("mock server thread joins");
     }
 
     #[test]

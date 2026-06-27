@@ -39,6 +39,11 @@ use crate::storage::{Record, RecordKind};
 /// The Cosmos container that holds the small DataLake semantic index.
 pub const DATALAKE_INDEX_CONTAINER: &str = "DataLakeIndex";
 
+/// The partition-key path the `DataLakeIndex` container is created with when it
+/// does not yet exist. It mirrors `GaiaDataLake`'s `/entity` partition so an
+/// index entry always shares its source row's partition.
+pub const DATALAKE_INDEX_PARTITION_PATH: &str = "/entity";
+
 /// The DataLake container whose writes also feed [`DATALAKE_INDEX_CONTAINER`].
 pub const DATALAKE_CONTAINER: &str = "GaiaDataLake";
 
@@ -390,7 +395,15 @@ impl WriteDataController {
                 source: container.to_string(),
                 index_vector,
             };
-            cosmos.upsert_doc(DATALAKE_INDEX_CONTAINER, entity, &index_doc)?;
+            // The DataLakeIndex container is derived (not provisioned alongside
+            // the seven primary stores), so create it on first write if missing
+            // rather than failing the turn's persistence with a 404.
+            cosmos.upsert_doc_creating_container(
+                DATALAKE_INDEX_CONTAINER,
+                entity,
+                &index_doc,
+                DATALAKE_INDEX_PARTITION_PATH,
+            )?;
             index_synced = true;
         }
 
