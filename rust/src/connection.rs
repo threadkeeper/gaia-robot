@@ -194,4 +194,17 @@ mod tests {
         let parsed: ConnectionEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, entry);
     }
+
+    #[test]
+    fn len_and_is_empty_track_the_total_posting_count() {
+        let mut ledger = ConnectionLedger::default();
+        assert!(ledger.is_empty());
+        assert_eq!(ledger.len(), 0);
+
+        ledger.record("alice", "2026-06-16T10:00:00Z", 1.0, "");
+        ledger.record("bob", "2026-06-16T11:00:00Z", -1.0, "");
+
+        assert!(!ledger.is_empty());
+        assert_eq!(ledger.len(), 2);
+    }
 }

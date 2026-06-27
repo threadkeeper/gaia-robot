@@ -225,4 +225,89 @@ mod tests {
         let mut cursor = Cursor::new(Vec::new());
         assert!(read_message(&mut cursor).unwrap().is_none());
     }
+
+    #[test]
+    fn write_close_and_pong_round_trip_through_the_reader() {
+        // A close frame reads back as Message::Close.
+        let mut buf = Vec::new();
+        write_close(&mut buf).unwrap();
+        let mut cursor = Cursor::new(buf);
+        assert_eq!(read_message(&mut cursor).unwrap().unwrap(), Message::Close);
+
+        // A pong frame echoes its payload.
+        let mut buf = Vec::new();
+        write_pong(&mut buf, b"beat").unwrap();
+        let mut cursor = Cursor::new(buf);
+        assert_eq!(
+            read_message(&mut cursor).unwrap().unwrap(),
+            Message::Pong(b"beat".to_vec())
+        );
+    }
+
+    #[test]
+    fn reads_binary_ping_and_unknown_opcodes() {
+        // Unmasked binary frame (opcode 0x2).
+        let mut frame = vec![0x82, 0x03];
+        frame.extend_from_slice(&[1, 2, 3]);
+        let mut cursor = Cursor::new(frame);
+        assert_eq!(
+            read_message(&mut cursor).unwrap().unwrap(),
+            Message::Binary(vec![1, 2, 3])
+        );
+
+        // Ping frame (opcode 0x9) with a payload.
+        let mut frame = vec![0x89, 0x02];
+        frame.extend_from_slice(b"hi");
+        let mut cursor = Cursor::new(frame);
+        assert_eq!(
+            read_message(&mut cursor).unwrap().unwrap(),
+            Message::Ping(b"hi".to_vec())
+        );
+
+        // A continuation/unknown opcode (0x0) is surfaced as binary.
+        let mut cursor = Cursor::new(vec![0x80, 0x00]);
+        assert_eq!(
+            read_message(&mut cursor).unwrap().unwrap(),
+            Message::Binary(Vec::new())
+        );
+    }
+
+    #[test]
+    fn round_trips_a_medium_payload_using_the_16_bit_length() {
+        // 200 bytes forces the 126 length marker (16-bit extended length) on
+        // both the write and read paths.
+        let text = "x".repeat(200);
+        let mut buf = Vec::new();
+        write_text(&mut buf, &text).unwrap();
+        assert_eq!(buf[1] & 0x7f, 126);
+
+        let mut cursor = Cursor::new(buf);
+        assert_eq!(
+            read_message(&mut cursor).unwrap().unwrap(),
+            Message::Text(text)
+        );
+    }
+
+    #[test]
+    fn reads_a_64_bit_extended_length_frame() {
+        // A 127 marker selects the 64-bit length path. Three payload bytes keep
+        // the test small while still exercising the u64 length decode.
+        let mut frame = vec![0x82, 127];
+        frame.extend_from_slice(&(3u64).to_be_bytes());
+        frame.extend_from_slice(&[9, 8, 7]);
+        let mut cursor = Cursor::new(frame);
+        assert_eq!(
+            read_message(&mut cursor).unwrap().unwrap(),
+            Message::Binary(vec![9, 8, 7])
+        );
+    }
+
+    #[test]
+    fn a_truncated_frame_is_an_unexpected_eof_error() {
+        // Header promises two payload bytes but the stream ends after one.
+        let frame = vec![0x81, 0x02, b'H'];
+        let mut cursor = Cursor::new(frame);
+        let err = read_message(&mut cursor).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
 }

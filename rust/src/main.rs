@@ -80,6 +80,8 @@ mod storage;
 mod test_data_execution;
 mod test_data_persistance;
 mod test_data_retrieval;
+#[cfg(test)]
+mod test_http;
 mod web_search;
 mod websocket;
 mod write_data_controller;

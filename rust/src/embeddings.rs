@@ -157,6 +157,19 @@ impl EmbeddingClient {
         &self.endpoint
     }
 
+    /// Test-only constructor pointing the client at `endpoint` with an API-key
+    /// credential, so other modules' tests (notably the write controller) can
+    /// drive [`embed`](EmbeddingClient::embed) against a mock server.
+    #[cfg(test)]
+    pub(crate) fn for_test(endpoint: String) -> Self {
+        Self {
+            endpoint,
+            auth_token: "secret-key".to_string(),
+            auth_scheme: AuthScheme::ApiKey,
+            dimensions: None,
+        }
+    }
+
     /// Embed one piece of text into a query vector.
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
         let cleaned = if text.trim().is_empty() {
@@ -273,5 +286,76 @@ mod tests {
         let body = r#"{"data":[]}"#;
         let err = parse_embedding(body).unwrap_err();
         assert!(matches!(err, EmbeddingError::EmptyResponse));
+    }
+
+    #[test]
+    fn display_renders_each_error_variant() {
+        assert!(EmbeddingError::MissingCredential
+            .to_string()
+            .contains("no Foundry embedding credential"));
+        assert!(EmbeddingError::InvalidDimensions("nope".to_string())
+            .to_string()
+            .contains("nope"));
+        assert!(EmbeddingError::Http("boom".to_string())
+            .to_string()
+            .contains("boom"));
+        assert!(EmbeddingError::Decode("bad".to_string())
+            .to_string()
+            .contains("bad"));
+        assert!(EmbeddingError::EmptyResponse
+            .to_string()
+            .contains("response was empty"));
+    }
+
+    /// Build a client that posts to `endpoint` with an API-key credential.
+    fn client_for(endpoint: String) -> EmbeddingClient {
+        EmbeddingClient {
+            endpoint,
+            auth_token: "secret-key".to_string(),
+            auth_scheme: AuthScheme::ApiKey,
+            dimensions: Some(3),
+        }
+    }
+
+    #[test]
+    fn embed_posts_the_text_and_returns_the_query_vector() {
+        let body = r#"{"data":[{"index":0,"embedding":[0.5,0.25,0.125]}]}"#;
+        let (endpoint, handle) = crate::test_http::spawn_mock_http("200 OK", body);
+
+        let vector = client_for(endpoint)
+            .embed("hello world")
+            .expect("embed succeeds against the mock");
+
+        assert_eq!(vector, vec![0.5_f32, 0.25_f32, 0.125_f32]);
+        handle.join().expect("mock server thread joins");
+    }
+
+    #[test]
+    fn embed_blank_text_still_sends_a_request() {
+        // Whitespace-only input is normalised to a single space, not rejected.
+        let body = r#"{"data":[{"index":0,"embedding":[1.0]}]}"#;
+        let (endpoint, handle) = crate::test_http::spawn_mock_http("200 OK", body);
+
+        let vector = client_for(endpoint)
+            .embed("   ")
+            .expect("a blank query is embedded, not skipped");
+
+        assert_eq!(vector, vec![1.0_f32]);
+        handle.join().expect("mock server thread joins");
+    }
+
+    #[test]
+    fn embed_maps_a_non_success_status_into_an_http_error() {
+        let (endpoint, handle) =
+            crate::test_http::spawn_mock_http("401 Unauthorized", r#"{"error":"bad key"}"#);
+
+        let err = client_for(endpoint)
+            .embed("hello")
+            .expect_err("a 401 must surface as an error");
+        match err {
+            EmbeddingError::Http(msg) => assert!(msg.contains("401"), "got: {msg}"),
+            other => panic!("expected an Http error, got {other:?}"),
+        }
+        handle.join().expect("mock server thread joins");
     }
 }

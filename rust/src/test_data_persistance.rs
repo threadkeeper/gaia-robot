@@ -591,4 +591,44 @@ mod tests {
         let problems = vector_problems(&[3.0, 4.0], 2, true);
         assert!(problems.iter().any(|p| p.contains("not unit length")));
     }
+
+    /// A unique, process-local temp directory for the file-writing tests.
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("gaia_persist_{tag}_{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn write_artifact_writes_a_json_file_only_when_a_record_is_present() {
+        let dir = unique_temp_dir("artifact");
+        // With a record, a pretty-printed `<container>.json` is written.
+        let record = serde_json::json!({ "id": "GaiaKB|selftest|2026-06-27" });
+        write_artifact(&dir, "GaiaKB", Some(&record)).expect("artifact write succeeds");
+        let written = std::fs::read_to_string(dir.join("GaiaKB.json")).expect("file exists");
+        assert!(written.contains("GaiaKB|selftest|2026-06-27"));
+
+        // With no record, the directory is created but no JSON file appears.
+        write_artifact(&dir, "GaiaDiary", None).expect("no-op artifact write succeeds");
+        assert!(!dir.join("GaiaDiary.json").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_summary_md_renders_a_pass_table() {
+        let dir = unique_temp_dir("summary");
+        let rows = [metrics("GaiaDataLake", true), metrics("GaiaKB", true)];
+        write_summary_md(&dir, &rows, true).expect("summary write succeeds");
+
+        let md = std::fs::read_to_string(dir.join("TestSummary.md")).expect("summary exists");
+        assert!(md.contains("# Data-persistence self-test"));
+        assert!(md.contains("**Overall:** PASS"));
+        assert!(md.contains("GaiaDataLake"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -134,4 +134,16 @@ mod tests {
         assert!(text.contains("Content-Length: 4\r\n"));
         assert!(!text.contains("999"));
     }
+
+    #[test]
+    fn empty_response_has_no_body_and_carries_the_status() {
+        let resp = HttpResponse::empty(204, "No Content");
+        let mut buf = Vec::new();
+        resp.write_to(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+
+        assert!(text.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(text.contains("Content-Length: 0\r\n"));
+        assert!(text.ends_with("\r\n\r\n"));
+    }
 }

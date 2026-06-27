@@ -587,4 +587,75 @@ mod tests {
         };
         assert_eq!(route(&request, &engine, &auth).status(), 400);
     }
+
+    #[test]
+    fn auth_refresh_with_a_valid_token_returns_fresh_tokens() {
+        // Mint a session, then exchange its refresh token through the route: the
+        // happy path serializes a fresh token pair with a 200.
+        let engine = Engine::new(None, None);
+        let auth = dev_auth();
+        let exchange = auth.create_session(crate::auth::UserInfo {
+            sub: "user-1".to_string(),
+            name: None,
+            email: None,
+            picture: None,
+            github_login: None,
+        });
+        let body = format!(r#"{{"refreshToken":"{}"}}"#, exchange.refresh_token);
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/v1/auth/refresh".to_string(),
+            body: body.into_bytes(),
+            ..Default::default()
+        };
+        assert_eq!(route(&request, &engine, &auth).status(), 200);
+    }
+
+    #[test]
+    fn cors_adds_permissive_headers() {
+        let mut rendered = Vec::new();
+        cors(HttpResponse::text(200, "OK", "ok"))
+            .write_to(&mut rendered)
+            .expect("render response");
+        let rendered = String::from_utf8(rendered).expect("utf8 response");
+        assert!(rendered.contains("Access-Control-Allow-Origin: *"));
+        assert!(rendered.contains("Access-Control-Allow-Methods: GET, POST, OPTIONS"));
+        assert!(rendered.contains("Access-Control-Allow-Headers: Authorization, Content-Type"));
+    }
+
+    #[test]
+    fn to_json_serializes_a_frame() {
+        let frame = TokenFrame {
+            kind: "token",
+            token: "hello",
+        };
+        assert_eq!(to_json(&frame), r#"{"type":"token","token":"hello"}"#);
+    }
+
+    #[test]
+    fn stream_turn_writes_a_token_frame_then_a_done_frame() {
+        use std::io::Read;
+        use std::net::{TcpListener, TcpStream};
+
+        // A real localhost socket pair: stream_turn writes WebSocket frames into
+        // `client`, and we read them back off the accepted `server` end.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let mut client = TcpStream::connect(addr).expect("connect");
+        let (mut server, _) = listener.accept().expect("accept");
+
+        // A skeleton turn is a cheap, fully-formed TurnResult to stream.
+        let result = Engine::new(None, None).run_turn("alice", "hi");
+        stream_turn(&mut client, &result).expect("stream_turn writes both frames");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("close write half");
+
+        let mut received = Vec::new();
+        server.read_to_end(&mut received).expect("read frames");
+        // Server text frames are unmasked, so the JSON payloads appear verbatim.
+        let text = String::from_utf8_lossy(&received);
+        assert!(text.contains(r#""type":"token""#), "missing token frame");
+        assert!(text.contains(r#""type":"done""#), "missing done frame");
+    }
 }

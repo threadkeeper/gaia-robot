@@ -474,4 +474,74 @@ mod tests {
         assert!(result.notes.is_empty());
         assert!(result.context.contains("## WebSearchResults"));
     }
+
+    #[test]
+    fn execute_runs_cosmos_and_web_actions_against_their_clients() {
+        // Drive the full pull pass with live (mock) Cosmos and Brave clients: a
+        // keyword Cosmos query and a Web search both succeed, their records are
+        // folded into the context, and the issued web query is recorded.
+        let cosmos_body = r#"{"Documents":[
+            {"id":"UsersKB|alice|2026-05-10","userId":"alice","date":"2026-05-10","data":"prefers tea"}
+        ]}"#;
+        let (cosmos_endpoint, cosmos_handle) =
+            crate::test_http::spawn_mock_http("200 OK", cosmos_body);
+        let cosmos = CosmosClient::new(cosmos_endpoint, "gaia", "tok");
+
+        let brave_body = r#"{"web":{"results":[
+            {"title":"Mars","url":"https://example.com/mars","description":"red planet"}
+        ]}}"#;
+        let (brave_endpoint, brave_handle) =
+            crate::test_http::spawn_mock_http("200 OK", brave_body);
+        let brave = crate::web_search::BraveClient::for_test(brave_endpoint);
+
+        let controller = PullDataController::new(Some(&cosmos), None, Some(&brave));
+        let reply = r#"[
+          { "version": "1.0",
+            "session": { "user_id": "alice", "requested_at": "2026-06-21T00:00:00Z" },
+            "actions": [
+              { "id": "q1", "kind": "query", "target": "UsersKB", "user_id": "alice", "entity": "alice", "intent": "past notes", "top": 3, "filters": {} },
+              { "id": "q2", "kind": "query", "target": "Web", "user_id": "alice", "entity": "alice", "intent": "mars news", "top": 3, "filters": {} }
+            ] }
+        ]"#;
+
+        let result = controller.execute("alice", "mars?", "2026-06-21T00:00:00Z", reply, false);
+
+        assert_eq!(result.cosmos_actions, 1);
+        assert_eq!(result.web_actions, 1);
+        assert!(result.all_ok, "notes: {:?}", result.notes);
+        // Both retrieval groups were gathered and the web query recorded.
+        assert_eq!(result.groups.len(), 2);
+        assert_eq!(result.searches, vec!["mars news".to_string()]);
+        assert!(result.context.contains("prefers tea"));
+        assert!(result.context.contains("Mars"));
+
+        cosmos_handle.join().expect("cosmos mock thread joins");
+        brave_handle.join().expect("brave mock thread joins");
+    }
+
+    #[test]
+    fn execute_notes_a_cosmos_failure_but_still_completes() {
+        // Cosmos returns an error status: the action is recorded as failed and
+        // all_ok flips, yet the context is still fully assembled.
+        let (cosmos_endpoint, cosmos_handle) =
+            crate::test_http::spawn_mock_http("403 Forbidden", r#"{"message":"denied"}"#);
+        let cosmos = CosmosClient::new(cosmos_endpoint, "gaia", "tok");
+
+        let controller = PullDataController::new(Some(&cosmos), None, None);
+        let reply = r#"[
+          { "version": "1.0",
+            "session": { "user_id": "alice", "requested_at": "2026-06-21T00:00:00Z" },
+            "actions": [
+              { "id": "q1", "kind": "query", "target": "UsersKB", "user_id": "alice", "entity": "alice", "intent": "past notes", "top": 3, "filters": {} }
+            ] }
+        ]"#;
+
+        let result = controller.execute("alice", "hi", "2026-06-21T00:00:00Z", reply, false);
+
+        assert_eq!(result.cosmos_actions, 1);
+        assert!(!result.all_ok);
+        assert!(result.notes.iter().any(|n| n.contains("failed")));
+        assert!(result.context.contains("## DataLakeResults"));
+        cosmos_handle.join().expect("cosmos mock thread joins");
+    }
 }

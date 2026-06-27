@@ -548,6 +548,16 @@ mod tests {
     }
 
     #[test]
+    fn now_rfc3339_produces_a_well_formed_utc_timestamp() {
+        let now = now_rfc3339();
+        // Shape: YYYY-MM-DDTHH:MM:SSZ (20 chars, UTC 'Z' suffix).
+        assert_eq!(now.len(), 20, "got: {now}");
+        assert!(now.ends_with('Z'));
+        assert_eq!(now.as_bytes()[4], b'-');
+        assert_eq!(now.as_bytes()[10], b'T');
+    }
+
+    #[test]
     fn call2_embeds_input_context_and_timestamp() {
         let prompt = Call2Prompt::build(
             "threadkeeper",
