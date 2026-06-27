@@ -552,4 +552,128 @@ mod tests {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("abcdefghij", 5), "abcde…");
     }
+
+    /// A `TurnMetrics` fixture with every flag set as requested.
+    fn metrics(folder: &str, success: bool) -> TurnMetrics {
+        TurnMetrics {
+            folder: folder.to_string(),
+            question: "What do you know about hiking trails near the coast?".to_string(),
+            llm_ok: true,
+            response_ok: true,
+            whatsapp_ok: true,
+            push_ok: success,
+            actuate_ok: success,
+            stores_covered: if success { 4 } else { 2 },
+            multimodal: false,
+            success,
+            notes: Vec::new(),
+        }
+    }
+
+    /// Create a unique, empty temp directory for a file-IO test.
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("gaia_exec_{tag}_{}_{}", std::process::id(), nanos));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn yes_no_maps_booleans_to_words() {
+        assert_eq!(yes_no(true), "yes");
+        assert_eq!(yes_no(false), "no");
+    }
+
+    #[test]
+    fn pretty_pretty_prints_json_and_pretty_or_raw_falls_back() {
+        let value = serde_json::json!({"a": 1});
+        assert!(pretty(&value).contains("\"a\": 1"));
+
+        // A raw reply with no Call-1 array passes through unchanged.
+        assert_eq!(pretty_or_raw("just text"), "just text");
+        // A reply that embeds a JSON array is pretty-printed.
+        let pretty_array = pretty_or_raw("prefix [ {\"id\":\"q1\"} ] suffix");
+        assert!(pretty_array.contains("\"id\": \"q1\""));
+    }
+
+    #[test]
+    fn format_metrics_table_has_a_header_and_one_row_per_turn() {
+        let table = format_metrics_table(&[metrics("t1", true), metrics("t2", false)]);
+        assert!(table.contains("Turn  WhatsApp  Push  Actuate  Stores  Multimodal  Result"));
+        assert!(table.contains("t1"));
+        assert!(table.contains("PASS"));
+        assert!(table.contains("t2"));
+        assert!(table.contains("FAIL"));
+        // The stores column renders as "n/4".
+        assert!(table.contains("4/4"));
+    }
+
+    #[test]
+    fn write_to_writes_every_artifact_and_clears_stale_json() {
+        let dir = unique_temp_dir("write_to");
+        // A stale file from a previous run must be removed first.
+        std::fs::write(dir.join("stale.json"), "{}").expect("seed stale file");
+
+        let artifacts = TurnArtifacts {
+            raw_reply: Some("[ {\"id\":\"q1\"} ]".to_string()),
+            response: Some(serde_json::json!({"text": "hi"})),
+            actions: Some(serde_json::json!([{"id": "q1"}])),
+            audit: ActionAudit::default(),
+        };
+        artifacts.write_to(&dir).expect("write artifacts");
+
+        // The fixed side-effect files plus the optional documents all exist.
+        for name in [
+            "reply.json",
+            "response.json",
+            "actions.json",
+            "whatsapp.json",
+            "push.json",
+            "actuate.json",
+            "writes.json",
+        ] {
+            assert!(dir.join(name).exists(), "missing {name}");
+        }
+        // The stale file was cleared.
+        assert!(!dir.join("stale.json").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_artifacts_write_only_the_fixed_side_effect_files() {
+        let dir = unique_temp_dir("empty");
+        TurnArtifacts::empty()
+            .write_to(&dir)
+            .expect("write empties");
+
+        // The optional documents are absent when their sources are `None`.
+        assert!(!dir.join("reply.json").exists());
+        assert!(!dir.join("response.json").exists());
+        assert!(!dir.join("actions.json").exists());
+        // The four side-effect files are always written.
+        assert!(dir.join("whatsapp.json").exists());
+        assert!(dir.join("writes.json").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_summary_md_renders_a_markdown_table() {
+        let dir = unique_temp_dir("summary");
+        write_summary_md(&dir, &[metrics("t1", true), metrics("t2", false)], false)
+            .expect("write summary");
+
+        let md = std::fs::read_to_string(dir.join("TestSummary.md")).expect("read summary");
+        assert!(md.contains("# Data-Execution Self-Test Summary"));
+        assert!(md.contains("FAIL ❌"));
+        assert!(md.contains("| 1 |"));
+        assert!(md.contains("| 2 |"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

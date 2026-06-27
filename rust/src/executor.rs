@@ -750,4 +750,73 @@ mod tests {
         let err = plan_to_query(&act, None).unwrap_err();
         assert!(err.contains("keyword|semantic|auto"));
     }
+
+    /// Wrap a single action in a one-action plan for the end-to-end run tests.
+    fn plan_with(act: ActionPlan) -> ActionsFile {
+        ActionsFile {
+            version: "1.0".to_string(),
+            session: SessionContext {
+                user_id: "rust".to_string(),
+                requested_at: "2026-06-21T00:00:00Z".to_string(),
+            },
+            actions: vec![act],
+        }
+    }
+
+    #[test]
+    fn run_executes_a_keyword_action_against_the_client() {
+        // A keyword action plans without an embedder, runs one query, and parses
+        // the Documents envelope the mock returns.
+        let body = r#"{"Documents":[
+            {"id":"GaiaKB|rust|2026-05-10","entity":"rust","date":"2026-05-10","data":"ownership"}
+        ]}"#;
+        let (endpoint, handle) = crate::test_http::spawn_mock_http("200 OK", body);
+        let client = CosmosClient::new(endpoint, "gaia", "tok");
+
+        let mut act = action("GaiaKB");
+        act.user_id = Some("rust".to_string());
+        act.entity = Some("rust".to_string());
+        let outcomes = Executor::new(&client).run(&plan_with(act));
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].id, "q1");
+        let records = outcomes[0].result.as_ref().expect("the query succeeds");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].data, "ownership");
+        handle.join().expect("mock server thread joins");
+    }
+
+    #[test]
+    fn run_captures_a_cosmos_error_per_action_without_aborting() {
+        // A non-success status from Cosmos becomes the action's own error; the
+        // run still returns one outcome.
+        let (endpoint, handle) =
+            crate::test_http::spawn_mock_http("403 Forbidden", r#"{"message":"denied"}"#);
+        let client = CosmosClient::new(endpoint, "gaia", "tok");
+
+        let mut act = action("GaiaKB");
+        act.user_id = Some("rust".to_string());
+        act.entity = Some("rust".to_string());
+        let outcomes = Executor::new(&client).run(&plan_with(act));
+
+        assert_eq!(outcomes.len(), 1);
+        let err = outcomes[0]
+            .result
+            .as_ref()
+            .expect_err("a 403 fails the action");
+        assert!(err.contains("403"), "got: {err}");
+        handle.join().expect("mock server thread joins");
+    }
+
+    #[test]
+    fn run_reports_a_validation_error_without_calling_the_client() {
+        // A GaiaKB action with no entity fails validation before any HTTP call,
+        // so no mock server is needed.
+        let client = CosmosClient::new("http://127.0.0.1:0/", "gaia", "tok");
+        let act = action("GaiaKB"); // no user_id / entity set
+        let outcomes = Executor::new(&client).run(&plan_with(act));
+
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].result.is_err());
+    }
 }

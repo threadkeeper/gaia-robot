@@ -93,6 +93,17 @@ impl BraveClient {
         &self.endpoint
     }
 
+    /// Test-only constructor: build a client pointing at an arbitrary endpoint
+    /// (e.g. a localhost mock) with a throwaway key, so the real `search` path
+    /// can be exercised without the process environment.
+    #[cfg(test)]
+    pub(crate) fn for_test(endpoint: impl Into<String>) -> Self {
+        BraveClient {
+            endpoint: endpoint.into(),
+            api_key: "test-token".to_string(),
+        }
+    }
+
     /// Run a single web search and return up to `count` results.
     ///
     /// `count` is clamped to Brave's supported range (1..=20). The call is
@@ -368,5 +379,59 @@ mod tests {
         )
         .expect("a key with an endpoint should build a client");
         assert_eq!(client.endpoint(), "https://example.test/search");
+    }
+
+    #[test]
+    fn display_renders_http_and_decode_variants() {
+        let http = WebSearchError::Http("HTTP 500: boom".to_string());
+        assert_eq!(
+            http.to_string(),
+            "web search request failed: HTTP 500: boom"
+        );
+        let decode = WebSearchError::Decode("bad json".to_string());
+        assert_eq!(
+            decode.to_string(),
+            "could not decode web search response: bad json"
+        );
+    }
+
+    #[test]
+    fn search_sends_the_request_and_maps_the_results() {
+        // A 200 with a Brave-shaped body exercises the real GET + parse path.
+        let body = r#"{"web":{"results":[
+            {"title":"Mars","url":"https://example.com/mars","description":"red planet"}
+        ]}}"#;
+        let (endpoint, handle) = crate::test_http::spawn_mock_http("200 OK", body);
+        let client = from_parts(Some("token".to_string()), Some(endpoint))
+            .expect("client builds with a key and endpoint");
+
+        let results = client
+            .search("mars", 3)
+            .expect("search succeeds against the mock");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Mars");
+        assert_eq!(results[0].url, "https://example.com/mars");
+        assert_eq!(results[0].snippet, "red planet");
+        handle.join().expect("mock server thread joins");
+    }
+
+    #[test]
+    fn search_maps_a_non_success_status_into_an_http_error() {
+        let (endpoint, handle) = crate::test_http::spawn_mock_http(
+            "429 Too Many Requests",
+            r#"{"message":"slow down"}"#,
+        );
+        let client = from_parts(Some("token".to_string()), Some(endpoint))
+            .expect("client builds with a key and endpoint");
+
+        let err = client
+            .search("mars", 3)
+            .expect_err("a 429 must surface as an error");
+        match err {
+            WebSearchError::Http(msg) => assert!(msg.contains("429"), "got: {msg}"),
+            other => panic!("expected an Http error, got {other:?}"),
+        }
+        handle.join().expect("mock server thread joins");
     }
 }

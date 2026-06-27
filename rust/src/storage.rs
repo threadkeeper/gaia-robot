@@ -285,6 +285,41 @@ mod tests {
     }
 
     #[test]
+    fn kb_and_dl_table_facades_upsert_through_the_repository() {
+        let mut repo = Repository::default();
+
+        let kb = KnowledgeBaseTable::new("GaiaKB", "entity");
+        let kb_record = Record::new(
+            "kb-1",
+            "rust",
+            "",
+            "2026-06-16",
+            RecordKind::KnowledgeBase,
+            "ownership",
+            vec![0.5, 0.25],
+        );
+        kb.upsert(&mut repo, kb_record);
+
+        let dl = DataLakeTable::new("UsersDataLake", "userId");
+        let dl_record = Record::new(
+            "dl-1",
+            "",
+            "user-1",
+            "2026-06-16",
+            RecordKind::DataLake,
+            "a note",
+            Vec::new(),
+        );
+        dl.upsert(&mut repo, dl_record);
+
+        // Both facades wrote through to the shared repository.
+        assert_eq!(repo.get("kb-1").unwrap().data, "ownership");
+        assert_eq!(repo.get("dl-1").unwrap().kind, RecordKind::DataLake);
+        // The stored embedding is exposed for indexing/retrieval.
+        assert_eq!(repo.get("kb-1").unwrap().data_vector_bytes(), &[0.5, 0.25]);
+    }
+
+    #[test]
     fn kb_and_dl_tables_expose_standard_indexes() {
         let kb = KnowledgeBaseTable::new("GaiaKB", "entity");
         let dl = DataLakeTable::new("UsersDataLake", "userId");

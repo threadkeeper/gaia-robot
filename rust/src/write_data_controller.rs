@@ -731,4 +731,185 @@ mod tests {
         let err = store.fetch(&["GaiaDataLake|threadkeeper|2026-06-27".to_string()]);
         assert!(matches!(err, Err(WriteError::Offline)));
     }
+
+    #[test]
+    fn upsert_daily_creates_the_record_and_syncs_the_datalake_index() {
+        // Drive the full GaiaDataLake write path against mock servers:
+        //   1. point read -> 404 (no record yet => Created)
+        //   2. embed the day's text -> an 8-d vector
+        //   3. upsert the record -> 201
+        //   4. upsert the half-size DataLakeIndex entry -> 201
+        // The Cosmos client makes three sequential calls (read, upsert, index),
+        // so it gets a three-response sequence server; the embedder makes one.
+        let (cosmos_url, cosmos_handle) = crate::test_http::spawn_mock_http_sequence(vec![
+            ("404 Not Found".to_string(), "{}".to_string()),
+            ("201 Created".to_string(), "{}".to_string()),
+            ("201 Created".to_string(), "{}".to_string()),
+        ]);
+        let (embed_url, embed_handle) = crate::test_http::spawn_mock_http(
+            "200 OK",
+            r#"{"data":[{"index":0,"embedding":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}]}"#,
+        );
+
+        let cosmos = CosmosClient::new(cosmos_url, "GaiaDB", "token");
+        let embedder = EmbeddingClient::for_test(embed_url);
+        // A 4-d index (half of the 8-d mock embedding) keeps the assertion clear.
+        let controller = WriteDataController::new(Some(cosmos), Some(embedder), 4);
+
+        let outcome = controller
+            .upsert_daily(
+                DATALAKE_CONTAINER,
+                "threadkeeper",
+                "2026-06-27T09:00:00Z",
+                "User: hi\nGaia: hello",
+            )
+            .expect("the write path succeeds against the mocks");
+
+        assert_eq!(outcome.action, WriteAction::Created);
+        assert_eq!(outcome.id, "GaiaDataLake|threadkeeper|2026-06-27");
+        assert_eq!(outcome.vector_dims, 8);
+        // The DataLake also syncs a derived half-size index entry.
+        assert!(outcome.index_synced);
+        assert_eq!(outcome.index_dims, 4);
+
+        cosmos_handle.join().expect("cosmos mock thread joins");
+        embed_handle.join().expect("embed mock thread joins");
+    }
+
+    #[test]
+    fn upsert_daily_skips_an_identical_replay_without_writing() {
+        // When re-running today's write would reproduce byte-identical content,
+        // the stored content hash matches and the controller short-circuits as
+        // Unchanged — making only the single point-read call (no embed, no
+        // upsert). We seed an existing record whose stored hash equals the hash
+        // of the text the append will produce.
+        let chunk = "User: hi\nGaia: hello";
+        // The append seeds an empty log, so replaying yields exactly this text.
+        let final_data = append_timestamped("", chunk, "09:00:00Z");
+        let hash = content_hash(&final_data);
+        let existing = serde_json::json!({
+            "id": "UsersDataLake|threadkeeper|2026-06-27",
+            "userId": "threadkeeper",
+            "date": "2026-06-27",
+            "data": "",
+            "metadata": { "contentHash": hash },
+        })
+        .to_string();
+        // Only the point read happens on the replay path: a single response.
+        let (cosmos_url, cosmos_handle) =
+            crate::test_http::spawn_mock_http_sequence(vec![("200 OK".to_string(), existing)]);
+        // The embedder must never be called here; point it at an unroutable port
+        // so any accidental request would fail loudly rather than pass silently.
+        let cosmos = CosmosClient::new(cosmos_url, "GaiaDB", "token");
+        let embedder = EmbeddingClient::for_test("http://127.0.0.1:9/".to_string());
+        let controller = WriteDataController::new(Some(cosmos), Some(embedder), 4);
+
+        let outcome = controller
+            .upsert_daily(
+                "UsersDataLake",
+                "threadkeeper",
+                "2026-06-27T09:00:00Z",
+                chunk,
+            )
+            .expect("the replay path succeeds without writing");
+
+        assert_eq!(outcome.action, WriteAction::Unchanged);
+        assert_eq!(outcome.vector_dims, 0);
+        assert!(!outcome.index_synced);
+        cosmos_handle.join().expect("cosmos mock thread joins");
+    }
+
+    #[test]
+    fn upsert_daily_appends_to_an_existing_record() {
+        // A record already exists for today with different content, so the write
+        // appends (created == false) and re-embeds. UsersKB is not the DataLake,
+        // so no index entry is synced. Cosmos serves the read then the upsert.
+        let existing = serde_json::json!({
+            "id": "UsersKB|threadkeeper|2026-06-27",
+            "userId": "threadkeeper",
+            "date": "2026-06-27",
+            "data": "[08:00:00Z] earlier note",
+            "metadata": { "contentHash": "stale-hash" },
+        })
+        .to_string();
+        let (cosmos_url, cosmos_handle) = crate::test_http::spawn_mock_http_sequence(vec![
+            ("200 OK".to_string(), existing),
+            ("200 OK".to_string(), "{}".to_string()),
+        ]);
+        let (embed_url, embed_handle) = crate::test_http::spawn_mock_http(
+            "200 OK",
+            r#"{"data":[{"index":0,"embedding":[0.3,0.4]}]}"#,
+        );
+
+        let cosmos = CosmosClient::new(cosmos_url, "GaiaDB", "token");
+        let embedder = EmbeddingClient::for_test(embed_url);
+        let controller = WriteDataController::new(Some(cosmos), Some(embedder), 1);
+
+        let outcome = controller
+            .upsert_daily(
+                "UsersKB",
+                "threadkeeper",
+                "2026-06-27T09:00:00Z",
+                "a new line",
+            )
+            .expect("the append path succeeds");
+
+        assert_eq!(outcome.action, WriteAction::Appended);
+        assert!(!outcome.index_synced);
+        assert_eq!(outcome.vector_dims, 2);
+        cosmos_handle.join().expect("cosmos mock thread joins");
+        embed_handle.join().expect("embed mock thread joins");
+    }
+
+    #[test]
+    fn read_record_returns_the_record_on_200_and_errors_when_offline() {
+        let record = serde_json::json!({
+            "id": "GaiaKB|threadkeeper|2026-06-27",
+            "entity": "threadkeeper",
+            "date": "2026-06-27",
+            "data": "remembered fact",
+        })
+        .to_string();
+        let (cosmos_url, handle) =
+            crate::test_http::spawn_mock_http_sequence(vec![("200 OK".to_string(), record)]);
+        let controller =
+            WriteDataController::new(Some(CosmosClient::new(cosmos_url, "GaiaDB", "t")), None, 4);
+        let got = controller
+            .read_record("GaiaKB", "threadkeeper", "GaiaKB|threadkeeper|2026-06-27")
+            .expect("read succeeds")
+            .expect("a record is present");
+        assert_eq!(got.data, "remembered fact");
+        handle.join().expect("cosmos mock thread joins");
+
+        // Without a Cosmos client the read is Offline rather than a panic.
+        let offline = WriteDataController::new(None, None, 4);
+        assert!(matches!(
+            offline.read_record("GaiaKB", "e", "id"),
+            Err(WriteError::Offline)
+        ));
+    }
+
+    #[test]
+    fn read_index_vector_parses_the_index_vector_and_its_length() {
+        let doc = r#"{"id":"x","indexVector":[0.1,0.2,0.3,0.4]}"#;
+        // Two reads (full vector then length) each make one point read.
+        let (cosmos_url, handle) = crate::test_http::spawn_mock_http_sequence(vec![
+            ("200 OK".to_string(), doc.to_string()),
+            ("200 OK".to_string(), doc.to_string()),
+        ]);
+        let controller =
+            WriteDataController::new(Some(CosmosClient::new(cosmos_url, "GaiaDB", "t")), None, 4);
+
+        let vector = controller
+            .read_index_vector("threadkeeper", "x")
+            .expect("read succeeds")
+            .expect("an index doc is present");
+        assert_eq!(vector, vec![0.1_f32, 0.2, 0.3, 0.4]);
+
+        let len = controller
+            .read_index_vector_len("threadkeeper", "x")
+            .expect("read succeeds");
+        assert_eq!(len, Some(4));
+        handle.join().expect("cosmos mock thread joins");
+    }
 }

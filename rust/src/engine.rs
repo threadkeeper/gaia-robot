@@ -579,4 +579,82 @@ mod tests {
         // The pull-action labels are also stable across identical inputs.
         assert_eq!(actions, actions_again);
     }
+
+    /// Wrap `content` in the chat-completions envelope the LLM client parses.
+    fn completion(content: &str) -> String {
+        let escaped = content.replace('\\', "\\\\").replace('"', "\\\"");
+        format!(r#"{{"choices":[{{"message":{{"content":"{escaped}"}}}}]}}"#)
+    }
+
+    #[test]
+    fn run_turn_drives_two_llm_calls_and_returns_the_pushed_reply() {
+        // With a live model but no retrieval/write clients, a full turn issues
+        // exactly two completions (the pull pass and the push pass). The mock
+        // answers them in order; Call 2's content becomes the visible reply.
+        let (endpoint, handle) = crate::test_http::spawn_mock_http_sequence(vec![
+            ("200 OK".to_string(), completion("call-1 analysis")),
+            (
+                "200 OK".to_string(),
+                completion("Hello Alice, here is your answer."),
+            ),
+        ]);
+        let llm = LlmClient::for_test(endpoint);
+        let engine = Engine::new(Some(llm), None);
+
+        let result = engine.run_turn("alice", "what's up?");
+
+        assert_eq!(result.reply, "Hello Alice, here is your answer.");
+        assert_eq!(result.verdict, "allow");
+        assert_eq!(result.routing, "gpt-test");
+        // Both debug panels are populated when both calls succeed.
+        assert!(result.pull_debug.is_some());
+        assert!(result.push_debug.is_some());
+        handle.join().expect("mock server thread joins");
+    }
+
+    #[test]
+    fn run_turn_reports_a_failed_second_call_as_an_error_verdict() {
+        // Call 1 succeeds, Call 2 returns a 500: the turn degrades to an error
+        // verdict with an apologetic reply rather than panicking.
+        let (endpoint, handle) = crate::test_http::spawn_mock_http_sequence(vec![
+            ("200 OK".to_string(), completion("call-1 analysis")),
+            (
+                "500 Internal Server Error".to_string(),
+                r#"{"error":"boom"}"#.to_string(),
+            ),
+        ]);
+        let llm = LlmClient::for_test(endpoint);
+        let engine = Engine::new(Some(llm), None);
+
+        let result = engine.run_turn("alice", "hi");
+
+        assert_eq!(result.verdict, "error");
+        assert!(result.reply.contains("could not complete"));
+        // The push debug panel still reports the model, just with no actions.
+        assert!(result.push_debug.is_some());
+        handle.join().expect("mock server thread joins");
+    }
+
+    #[test]
+    fn describe_reports_a_live_model_and_its_capabilities() {
+        // A configured model with no other clients should describe itself as
+        // live with web search, Cosmos, embeddings, and writes all off.
+        // `describe` only reads the client's model/endpoint, so no server is
+        // needed — any endpoint string will do.
+        let engine = Engine::new(
+            Some(LlmClient::for_test("http://127.0.0.1:9/".to_string())),
+            None,
+        );
+        let summary = engine.describe();
+        assert!(summary.starts_with("live model gpt-test"));
+        assert!(summary.contains("web search off"));
+        assert!(summary.contains("Cosmos off"));
+        assert!(summary.contains("writes off"));
+    }
+
+    #[test]
+    fn describe_reports_skeleton_mode_without_a_model() {
+        let engine = Engine::new(None, None);
+        assert!(engine.describe().contains("skeleton mode"));
+    }
 }

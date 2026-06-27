@@ -798,4 +798,44 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn pretty_print_reply_handles_arrays_objects_and_raw_text() {
+        // An embedded JSON array is pretty-printed.
+        let array = pretty_print_reply("noise [ {\"id\":\"q1\"} ] tail");
+        assert!(array.contains("\"id\": \"q1\""));
+        // An embedded JSON object (no array) takes the object branch.
+        let object = pretty_print_reply("prefix {\"message\":\"hi\"} suffix");
+        assert!(object.contains("\"message\": \"hi\""));
+        // Text with no JSON is returned unchanged.
+        assert_eq!(pretty_print_reply("just words"), "just words");
+    }
+
+    #[test]
+    fn write_summary_md_renders_table_and_notes_section() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gaia_retrieval_summary_{}_{}",
+            std::process::id(),
+            unique
+        ));
+
+        // A failing question with a note exercises the notes section.
+        let mut failing = metrics(false);
+        failing.notes = vec!["Cosmos action q1 failed".to_string()];
+        write_summary_md(&dir, &[metrics(true), failing], false).expect("write summary");
+
+        let md = std::fs::read_to_string(dir.join("TestSummary.md")).expect("read summary");
+        assert!(md.contains("# Data-Retrieval Self-Test Summary"));
+        assert!(md.contains("FAIL ❌"));
+        // The per-question table and the notes section are both present.
+        assert!(md.contains("GaiaKB (2 rows"));
+        assert!(md.contains("## Notes"));
+        assert!(md.contains("Cosmos action q1 failed"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

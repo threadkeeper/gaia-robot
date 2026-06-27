@@ -204,6 +204,19 @@ impl LlmClient {
         &self.model
     }
 
+    /// Test-only constructor pointing the client at `endpoint` with a bearer
+    /// token, so other modules' tests (notably the engine turn loop) can drive
+    /// [`complete`](LlmClient::complete) end-to-end against a mock server.
+    #[cfg(test)]
+    pub(crate) fn for_test(endpoint: String) -> Self {
+        Self {
+            endpoint,
+            model: "gpt-test".to_string(),
+            token: "test-token".to_string(),
+            auth: AuthScheme::Bearer,
+        }
+    }
+
     /// The chat-completions endpoint this client posts to.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
@@ -959,5 +972,69 @@ COSMOS_ENDPOINT=https://example.documents.azure.com:443/\n\
             percent_encode_query_value("https://cognitiveservices.azure.com"),
             "https%3A%2F%2Fcognitiveservices.azure.com"
         );
+    }
+
+    #[test]
+    fn missing_foundry_token_message_is_descriptive() {
+        let msg = LlmError::MissingFoundryToken.to_string();
+        assert!(msg.contains("Foundry credential"));
+        assert!(msg.contains("FOUNDRY_API_KEY"));
+    }
+
+    /// Build a client that posts to `endpoint` with the given auth scheme.
+    fn client_for(endpoint: String, auth: AuthScheme) -> LlmClient {
+        LlmClient {
+            endpoint,
+            model: "gpt-test".to_string(),
+            token: "secret".to_string(),
+            auth,
+        }
+    }
+
+    #[test]
+    fn complete_sends_an_api_key_request_and_returns_the_message() {
+        // A 200 with a chat-completions body exercises the real POST + parse
+        // path through the api-key header branch.
+        let body = r#"{"choices":[{"message":{"content":"  hello there  "}}]}"#;
+        let (endpoint, handle) = crate::test_http::spawn_mock_http("200 OK", body);
+
+        let text = client_for(endpoint, AuthScheme::ApiKey)
+            .complete("system prompt", "user question")
+            .expect("complete succeeds against the mock");
+
+        // The content is trimmed before being returned.
+        assert_eq!(text, "hello there");
+        handle.join().expect("mock server thread joins");
+    }
+
+    #[test]
+    fn complete_uses_the_bearer_header_and_maps_http_errors() {
+        // The bearer branch plus a non-success status -> Http error.
+        let (endpoint, handle) =
+            crate::test_http::spawn_mock_http("500 Internal Server Error", r#"{"error":"boom"}"#);
+
+        let err = client_for(endpoint, AuthScheme::Bearer)
+            .complete("system", "user")
+            .expect_err("a 500 must surface as an error");
+        match err {
+            LlmError::Http(msg) => assert!(msg.contains("500"), "got: {msg}"),
+            other => panic!("expected an Http error, got {other:?}"),
+        }
+        handle.join().expect("mock server thread joins");
+    }
+
+    #[test]
+    fn request_preview_lists_wire_params_and_full_messages_without_the_token() {
+        let client = client_for("https://example.test/chat".to_string(), AuthScheme::ApiKey);
+        let preview = client.request_preview("SYSTEM-CONTENT", "USER-CONTENT");
+
+        // Wire parameters and the full, untruncated messages are shown.
+        assert!(preview.contains("endpoint     : https://example.test/chat"));
+        assert!(preview.contains("model        : gpt-test"));
+        assert!(preview.contains("SYSTEM-CONTENT"));
+        assert!(preview.contains("USER-CONTENT"));
+        assert!(preview.contains("none attached"));
+        // The secret token must never leak into the preview.
+        assert!(!preview.contains("secret"));
     }
 }
