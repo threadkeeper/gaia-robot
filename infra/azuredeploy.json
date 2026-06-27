@@ -241,6 +241,21 @@
       }
     },
     {
+      "type": "Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments",
+      "apiVersion": "2024-11-15",
+      "name": "[concat(parameters('accountName'), '/', guid(parameters('accountName'), parameters('containerAppName'), 'sami-data-contributor'))]",
+      "comments": "Grant the Container App's system-assigned managed identity (SAMI) the Cosmos DB Built-in Data Contributor role (read/write/delete/query + readMetadata). This is the production auth path: the app authenticates to Cosmos via its SAMI with no static token.",
+      "dependsOn": [
+        "[resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('accountName'))]",
+        "[resourceId('Microsoft.App/containerApps', parameters('containerAppName'))]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[resourceId('Microsoft.DocumentDB/databaseAccounts/sqlRoleDefinitions', parameters('accountName'), '00000000-0000-0000-0000-000000000002')]",
+        "principalId": "[reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2024-03-01', 'Full').identity.principalId]",
+        "scope": "[resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('accountName'))]"
+      }
+    },
+    {
       "type": "Microsoft.CognitiveServices/accounts",
       "apiVersion": "2025-04-01-preview",
       "name": "[parameters('foundryName')]",

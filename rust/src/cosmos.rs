@@ -33,6 +33,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -56,6 +57,8 @@ const MAX_ITEMS_PER_QUERY: &str = "100";
 pub enum CosmosError {
     /// Cosmos was requested but no AAD token could be found.
     MissingToken,
+    /// A managed-identity (SAMI) token could not be acquired from the host.
+    Token(String),
     /// The HTTP request failed or returned a non-success status.
     Http(String),
     /// A response body could not be decoded into the expected shape.
@@ -69,6 +72,7 @@ impl fmt::Display for CosmosError {
                 f,
                 "no Cosmos AAD token found (set COSMOS_AAD_TOKEN or put it in infra/.env)"
             ),
+            CosmosError::Token(msg) => write!(f, "Cosmos managed-identity token error: {msg}"),
             CosmosError::Http(msg) => write!(f, "Cosmos request failed: {msg}"),
             CosmosError::Decode(msg) => write!(f, "could not decode Cosmos response: {msg}"),
         }
@@ -96,23 +100,123 @@ impl QueryParam {
     }
 }
 
+/// How long a freshly minted managed-identity token is trusted before it is
+/// re-minted. AAD access tokens live ~60-90 minutes; refreshing well ahead of
+/// that (45 minutes) guarantees an in-flight request never uses a dead token.
+const MANAGED_IDENTITY_TTL_SECS: u64 = 45 * 60;
+
+/// A managed-identity token plus the instant after which it must be re-minted.
+#[derive(Clone)]
+struct CachedToken {
+    /// The bearer token value.
+    value: String,
+    /// Unix seconds after which [`Credential::bearer`] re-mints the token.
+    refresh_after: u64,
+}
+
+/// How a [`CosmosClient`] authenticates to the Cosmos DB data plane.
+///
+/// Both variants ultimately produce an Azure AD bearer token; they differ only
+/// in where that token comes from and whether it is refreshed.
+#[derive(Clone)]
+enum Credential {
+    /// A pre-minted AAD access token supplied via `COSMOS_AAD_TOKEN`.
+    ///
+    /// Convenient for local development (where `infra/run-local.ps1` mints a
+    /// short-lived token with the Azure CLI), but it expires after ~1 hour and
+    /// is never refreshed, so it is unsuitable for long-running deployments.
+    Static(String),
+    /// The host's **system-assigned managed identity** (SAMI) — the production
+    /// path. Tokens are minted on demand from the local identity endpoint and
+    /// cached until shortly before they expire, then transparently refreshed.
+    /// No secret or static token is needed: the Container App's identity is
+    /// granted the Cosmos *Built-in Data Contributor* role at deploy time.
+    ManagedIdentity {
+        /// AAD resource/audience to request, e.g.
+        /// `https://<account>.documents.azure.com`.
+        resource: String,
+        /// Token cache shared across clones so a single refresh serves them all.
+        cache: Arc<Mutex<Option<CachedToken>>>,
+    },
+}
+
+impl Credential {
+    /// A short, secret-free label for diagnostics (`"static"` / `"managed-identity"`).
+    fn kind(&self) -> &'static str {
+        match self {
+            Credential::Static(_) => "static",
+            Credential::ManagedIdentity { .. } => "managed-identity",
+        }
+    }
+
+    /// Resolve the bearer token to send on the next request.
+    ///
+    /// Static credentials return their token verbatim. Managed-identity
+    /// credentials return a cached token while it is still fresh and otherwise
+    /// mint a new one from the local identity endpoint, caching it for reuse.
+    fn bearer(&self) -> Result<String, CosmosError> {
+        match self {
+            Credential::Static(token) => Ok(token.clone()),
+            Credential::ManagedIdentity { resource, cache } => {
+                let now = unix_now();
+                // Fast path: a cached token that is still comfortably valid.
+                if let Ok(guard) = cache.lock() {
+                    if let Some(cached) = guard.as_ref() {
+                        if now < cached.refresh_after {
+                            return Ok(cached.value.clone());
+                        }
+                    }
+                }
+                // Mint a fresh token from the host's managed-identity endpoint.
+                let token = crate::llm::managed_identity_token(resource).ok_or_else(|| {
+                    CosmosError::Token(format!(
+                        "could not obtain a managed-identity token for {resource} \
+                         (is the host's system-assigned identity enabled and granted \
+                         the Cosmos Built-in Data Contributor role?)"
+                    ))
+                })?;
+                if let Ok(mut guard) = cache.lock() {
+                    *guard = Some(CachedToken {
+                        value: token.clone(),
+                        refresh_after: now + MANAGED_IDENTITY_TTL_SECS,
+                    });
+                }
+                Ok(token)
+            }
+        }
+    }
+}
+
 /// A minimal, immutable client bound to one Cosmos account + database.
 ///
 /// Construct with [`CosmosClient::from_env`] and call [`CosmosClient::query`],
-/// [`CosmosClient::upsert`], or [`CosmosClient::get`]. Cheap to clone; holds no
-/// network state of its own.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// [`CosmosClient::upsert`], or [`CosmosClient::get`]. Cheap to clone; managed
+/// identity clones share one token cache so refreshes are not duplicated.
+#[derive(Clone)]
 pub struct CosmosClient {
     /// Account URL, always normalised to end with a single `/`.
     endpoint: String,
     /// Database name, e.g. `gaia`.
     database: String,
-    /// AAD access token for the Cosmos data plane.
-    token: String,
+    /// How the client authenticates to the Cosmos data plane.
+    cred: Credential,
+}
+
+// Hand-written so the bearer token (a secret) is never printed in logs or
+// panic messages; only the endpoint, database, and auth *kind* are shown.
+impl fmt::Debug for CosmosClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CosmosClient")
+            .field("endpoint", &self.endpoint)
+            .field("database", &self.database)
+            .field("auth", &self.cred.kind())
+            .finish()
+    }
 }
 
 impl CosmosClient {
-    /// Build a client directly from its parts (used by [`from_env`] and tests).
+    /// Build a client from a pre-minted static AAD token (used by tests and the
+    /// `COSMOS_AAD_TOKEN` dev path).
     ///
     /// The endpoint is normalised to end with exactly one `/` so URL building is
     /// simple and predictable.
@@ -123,15 +227,36 @@ impl CosmosClient {
         database: impl Into<String>,
         token: impl Into<String>,
     ) -> Self {
-        let mut endpoint = endpoint.into();
-        if !endpoint.ends_with('/') {
-            endpoint.push('/');
-        }
         Self {
-            endpoint,
+            endpoint: normalise_endpoint(endpoint.into()),
             database: database.into(),
-            token: token.into(),
+            cred: Credential::Static(token.into()),
         }
+    }
+
+    /// Build a client that authenticates with the host's system-assigned
+    /// managed identity (SAMI), minting and refreshing Cosmos data-plane tokens
+    /// on demand. `resource` is the AAD audience, e.g.
+    /// `https://<account>.documents.azure.com`.
+    pub fn with_managed_identity(
+        endpoint: impl Into<String>,
+        database: impl Into<String>,
+        resource: impl Into<String>,
+    ) -> Self {
+        Self {
+            endpoint: normalise_endpoint(endpoint.into()),
+            database: database.into(),
+            cred: Credential::ManagedIdentity {
+                resource: resource.into(),
+                cache: Arc::new(Mutex::new(None)),
+            },
+        }
+    }
+
+    /// The bearer token to authenticate the next request, refreshing a
+    /// managed-identity token when the cached one is stale.
+    fn bearer(&self) -> Result<String, CosmosError> {
+        self.cred.bearer()
     }
 
     /// Build a client from the environment, or `Ok(None)` when Cosmos is not in
@@ -140,8 +265,13 @@ impl CosmosClient {
     /// Returns:
     /// - `Ok(None)` when dev/local mode is off, or `COSMOS_ENDPOINT` is unset
     ///   (the program then stays fully offline).
-    /// - `Ok(Some(client))` when dev mode is on and an endpoint + token resolve.
-    /// - `Err(CosmosError::MissingToken)` when an endpoint is set but no token.
+    /// - `Ok(Some(client))` otherwise. Authentication is chosen automatically:
+    ///   a `COSMOS_AAD_TOKEN`, when present, is used as a static token (the
+    ///   local dev convenience); when absent, the client falls back to the
+    ///   host's **system-assigned managed identity** (the production path).
+    ///   Because managed identity needs no secret, this no longer fails with a
+    ///   missing-token error; any auth problem instead surfaces at write time
+    ///   as a visible Cosmos error.
     pub fn from_env() -> Result<Option<Self>, CosmosError> {
         if !dev_mode_enabled() {
             return Ok(None);
@@ -153,15 +283,21 @@ impl CosmosClient {
             _ => return Ok(None),
         };
 
-        let token = resolve_env("COSMOS_AAD_TOKEN")
-            .filter(|token| !token.is_empty())
-            .ok_or(CosmosError::MissingToken)?;
-
         let database = resolve_env("COSMOS_DATABASE")
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "gaia".to_string());
 
-        Ok(Some(Self::new(endpoint, database, token)))
+        match resolve_env("COSMOS_AAD_TOKEN").filter(|token| !token.is_empty()) {
+            // A pre-minted token was supplied (local dev): use it directly.
+            Some(token) => Ok(Some(Self::new(endpoint, database, token))),
+            // No token: authenticate with the host's managed identity (SAMI).
+            None => {
+                let resource = cosmos_token_resource(&endpoint);
+                Ok(Some(Self::with_managed_identity(
+                    endpoint, database, resource,
+                )))
+            }
+        }
     }
 
     /// The database this client targets.
@@ -193,8 +329,9 @@ impl CosmosClient {
         })
         .map_err(|e| CosmosError::Decode(e.to_string()))?;
 
+        let auth = aad_auth_header(&self.bearer()?);
         let response = ureq::post(&url)
-            .set("Authorization", &aad_auth_header(&self.token))
+            .set("Authorization", &auth)
             .set("x-ms-date", &now_rfc1123())
             .set("x-ms-version", API_VERSION)
             .set("x-ms-documentdb-isquery", "true")
@@ -248,8 +385,9 @@ impl CosmosClient {
         let url = docs_url(&self.endpoint, &self.database, container);
         let body = serde_json::to_vec(doc).map_err(|e| CosmosError::Decode(e.to_string()))?;
 
+        let auth = aad_auth_header(&self.bearer()?);
         ureq::post(&url)
-            .set("Authorization", &aad_auth_header(&self.token))
+            .set("Authorization", &auth)
             .set("x-ms-date", &now_rfc1123())
             .set("x-ms-version", API_VERSION)
             .set("x-ms-documentdb-is-upsert", "true")
@@ -280,8 +418,9 @@ impl CosmosClient {
             format_args!("/{id}"),
         );
 
+        let auth = aad_auth_header(&self.bearer()?);
         let result = ureq::get(&url)
-            .set("Authorization", &aad_auth_header(&self.token))
+            .set("Authorization", &auth)
             .set("x-ms-date", &now_rfc1123())
             .set("x-ms-version", API_VERSION)
             .set(
@@ -322,8 +461,9 @@ impl CosmosClient {
             format_args!("/{id}"),
         );
 
+        let auth = aad_auth_header(&self.bearer()?);
         let result = ureq::get(&url)
-            .set("Authorization", &aad_auth_header(&self.token))
+            .set("Authorization", &auth)
             .set("x-ms-date", &now_rfc1123())
             .set("x-ms-version", API_VERSION)
             .set(
@@ -353,6 +493,47 @@ impl CosmosClient {
 fn docs_url(endpoint: &str, database: &str, container: &str) -> String {
     // `endpoint` is guaranteed to end with '/' by `CosmosClient::new`.
     format!("{endpoint}dbs/{database}/colls/{container}/docs")
+}
+
+/// Normalise a Cosmos account URL to end with exactly one `/`.
+///
+/// Centralised so every constructor produces identical, predictable endpoints
+/// for URL building.
+fn normalise_endpoint(mut endpoint: String) -> String {
+    if !endpoint.ends_with('/') {
+        endpoint.push('/');
+    }
+    endpoint
+}
+
+/// Current time as whole seconds since the Unix epoch.
+///
+/// A clock skewed before 1970 is treated as `0`; the only consumer is the
+/// managed-identity token TTL, where a slightly early refresh is harmless.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// Derive the AAD resource/audience for a Cosmos data-plane token from an
+/// account endpoint.
+///
+/// The Cosmos token audience is the bare `scheme://host` of the account, with
+/// no port, path, query, or trailing slash — e.g.
+/// `https://acct.documents.azure.com:443/` becomes
+/// `https://acct.documents.azure.com`.
+fn cosmos_token_resource(endpoint: &str) -> String {
+    // Split off the scheme (default to https if somehow absent).
+    let (scheme, rest) = match endpoint.split_once("://") {
+        Some((scheme, rest)) => (scheme, rest),
+        None => ("https", endpoint),
+    };
+    // The host is everything up to the first `/`, `:` (port), or `?` (query).
+    let host_end = rest.find(['/', ':', '?']).unwrap_or(rest.len());
+    let host = &rest[..host_end];
+    format!("{scheme}://{host}")
 }
 
 /// Build the `Authorization` header for Azure AD bearer-token auth.
@@ -665,12 +846,67 @@ mod tests {
         assert!(CosmosError::MissingToken
             .to_string()
             .contains("COSMOS_AAD_TOKEN"));
+        assert!(CosmosError::Token("nope".into())
+            .to_string()
+            .contains("managed-identity"));
         assert!(CosmosError::Http("HTTP 403".into())
             .to_string()
             .contains("403"));
         assert!(CosmosError::Decode("bad".into())
             .to_string()
             .contains("decode"));
+    }
+
+    #[test]
+    fn static_credential_bearer_returns_the_token_verbatim() {
+        let client = CosmosClient::new("https://acct.documents.azure.com", "gaia", "tok-123");
+        assert_eq!(client.bearer().expect("static token"), "tok-123");
+    }
+
+    #[test]
+    fn managed_identity_bearer_uses_a_fresh_cached_token_without_network() {
+        // Seed the cache with a token that refreshes far in the future, so the
+        // fast path returns it and never touches the identity endpoint.
+        let client =
+            CosmosClient::with_managed_identity("https://acct.documents.azure.com", "gaia", "res");
+        if let Credential::ManagedIdentity { cache, .. } = &client.cred {
+            *cache.lock().expect("lock") = Some(CachedToken {
+                value: "cached-mi-token".to_string(),
+                refresh_after: unix_now() + 3_600,
+            });
+        } else {
+            panic!("expected a managed-identity credential");
+        }
+        assert_eq!(client.bearer().expect("cached token"), "cached-mi-token");
+    }
+
+    #[test]
+    fn debug_redacts_the_token_and_shows_only_the_auth_kind() {
+        let client = CosmosClient::new("https://acct.documents.azure.com", "gaia", "super-secret");
+        let rendered = format!("{client:?}");
+        assert!(!rendered.contains("super-secret"));
+        assert!(rendered.contains("static"));
+
+        let mi =
+            CosmosClient::with_managed_identity("https://acct.documents.azure.com", "gaia", "res");
+        assert!(format!("{mi:?}").contains("managed-identity"));
+    }
+
+    #[test]
+    fn cosmos_token_resource_strips_port_path_and_query() {
+        assert_eq!(
+            cosmos_token_resource("https://acct.documents.azure.com:443/"),
+            "https://acct.documents.azure.com"
+        );
+        assert_eq!(
+            cosmos_token_resource("https://acct.documents.azure.com/dbs/gaia"),
+            "https://acct.documents.azure.com"
+        );
+        // A bare host with no scheme defaults to https.
+        assert_eq!(
+            cosmos_token_resource("acct.documents.azure.com"),
+            "https://acct.documents.azure.com"
+        );
     }
 
     #[test]
