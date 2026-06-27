@@ -5,7 +5,8 @@
 //!
 //! | Method | Path | Purpose |
 //! |---|---|---|
-//! | `GET`  | `/healthz`, `/readyz` | liveness / readiness |
+//! | `GET`  | `/healthz` | liveness (cheap; proves the process is up) |
+//! | `GET`  | `/readyz` | readiness (deep; probes every configured dependency) |
 //! | `POST` | `/v1/conversations/{id}/messages` | run one turn, return the reply |
 //! | `GET`  | `/v1/ws/{id}` (Upgrade) | run one turn, stream the reply over WS |
 //! | `POST` | `/v1/auth/google` | exchange a Google ID token for a session |
@@ -170,8 +171,12 @@ fn route(
     site: Option<&StaticSite>,
 ) -> HttpResponse {
     match (request.method.as_str(), request.path.as_str()) {
-        // Health / readiness probes (no auth).
-        ("GET", "/healthz") | ("GET", "/readyz") => HttpResponse::text(200, "OK", "ok"),
+        // Liveness probe (no auth): cheap, proves the process is up. Used by the
+        // CD smoke test and any ingress health probe, so it stays trivial.
+        ("GET", "/healthz") => HttpResponse::text(200, "OK", "ok"),
+
+        // Readiness probe (no auth): actively checks every configured dependency.
+        ("GET", "/readyz") => handle_readyz(engine),
 
         // Run one turn and return the reply.
         ("POST", path) if is_messages_path(path) => handle_message(request, engine, auth),
@@ -195,6 +200,31 @@ fn route(
 
         // Unknown route.
         _ => HttpResponse::with_status_json(404, "Not Found", r#"{"error":"not found"}"#),
+    }
+}
+
+/// Handle `GET /readyz`: probe every configured dependency and report.
+///
+/// Returns the [`HealthReport`](crate::health::HealthReport) as JSON with HTTP
+/// 200 when the service is ready (no configured dependency failed) or HTTP 503
+/// when any configured dependency is unreachable, so orchestrators and humans
+/// can distinguish "up but degraded" from "fully ready".
+fn handle_readyz(engine: &Engine) -> HttpResponse {
+    let report = engine.check_health();
+    let body = match serde_json::to_vec(&report) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return HttpResponse::with_status_json(
+                500,
+                "Internal Server Error",
+                format!(r#"{{"error":"failed to serialize readiness report: {e}"}}"#),
+            )
+        }
+    };
+    if report.ready {
+        HttpResponse::with_status_json(200, "OK", body)
+    } else {
+        HttpResponse::with_status_json(503, "Service Unavailable", body)
     }
 }
 
@@ -523,6 +553,21 @@ mod tests {
         let request = HttpRequest {
             method: "GET".to_string(),
             path: "/healthz".to_string(),
+            ..Default::default()
+        };
+        let response = route(&request, &engine, &auth, None);
+        assert_eq!(response.status(), 200);
+    }
+
+    #[test]
+    fn readyz_route_reports_ready_when_no_dependencies_configured() {
+        // A skeleton engine wires no external clients, so every dependency is
+        // reported as skipped and the service is considered ready (HTTP 200).
+        let engine = Engine::new(None, None);
+        let auth = dev_auth();
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            path: "/readyz".to_string(),
             ..Default::default()
         };
         let response = route(&request, &engine, &auth, None);

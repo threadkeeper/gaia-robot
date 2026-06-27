@@ -170,6 +170,18 @@ impl EmbeddingClient {
         }
     }
 
+    /// Probe Foundry connectivity and RBAC by embedding a tiny string.
+    ///
+    /// Runs a real embedding of `"ping"`, which exercises the full production
+    /// path: endpoint reachability, the auth scheme (managed-identity bearer or
+    /// Foundry API key), the **Cognitive Services OpenAI User** permission, and
+    /// the embedding deployment itself. This is the same Foundry account and
+    /// token the model-router uses, so a success also confirms that account's
+    /// RBAC. The vector is discarded; `Ok(())` means the call succeeded.
+    pub fn ping(&self) -> Result<(), EmbeddingError> {
+        self.embed("ping").map(|_| ())
+    }
+
     /// Embed one piece of text into a query vector.
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
         let cleaned = if text.trim().is_empty() {

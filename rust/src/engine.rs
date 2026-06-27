@@ -26,6 +26,7 @@ use serde::Serialize;
 
 use crate::cosmos::CosmosClient;
 use crate::embeddings::EmbeddingClient;
+use crate::health::{DependencyHealth, HealthReport};
 use crate::llm::LlmClient;
 use crate::prompt::{now_rfc3339, Call1Prompt, Call2Prompt};
 use crate::pull_data_controller::PullDataController;
@@ -273,6 +274,65 @@ impl Engine {
             }
             None => "skeleton mode (set GAIA_MODE=dev to enable live model calls)".to_string(),
         }
+    }
+
+    /// Actively probe every configured dependency and return a readiness report.
+    ///
+    /// This backs the server's `/readyz` endpoint. For each external dependency
+    /// the engine is wired to — the Foundry model-router, the Foundry embedding
+    /// deployment, Cosmos DB, and Brave Search — it runs a real minimal request
+    /// that exercises connectivity *and* the required RBAC. Dependencies that
+    /// are not configured in this deployment are reported as `skipped` and never
+    /// make the service unready. The call is blocking (it performs live network
+    /// requests) and is intended for an explicit readiness probe, not hot paths.
+    pub fn check_health(&self) -> HealthReport {
+        let mut checks = Vec::with_capacity(4);
+
+        // Foundry model-router (LLM): a one-token completion validates the
+        // endpoint, the managed-identity/API-key auth, and the OpenAI User role.
+        checks.push(match &self.llm {
+            Some(client) => match client.ping() {
+                Ok(()) => DependencyHealth::ok(
+                    "foundry-model-router",
+                    format!("model {} at {}", client.model(), client.endpoint()),
+                ),
+                Err(e) => DependencyHealth::failed("foundry-model-router", e.to_string()),
+            },
+            None => DependencyHealth::skipped("foundry-model-router"),
+        });
+
+        // Foundry embeddings: shares the Foundry account/RBAC but uses a
+        // different deployment, so probe it independently.
+        checks.push(match &self.embedder {
+            Some(client) => match client.ping() {
+                Ok(()) => DependencyHealth::ok("foundry-embeddings", client.endpoint().to_string()),
+                Err(e) => DependencyHealth::failed("foundry-embeddings", e.to_string()),
+            },
+            None => DependencyHealth::skipped("foundry-embeddings"),
+        });
+
+        // Cosmos DB: an authenticated metadata read of the target database.
+        checks.push(match &self.cosmos {
+            Some(client) => match client.ping() {
+                Ok(()) => DependencyHealth::ok(
+                    "cosmos",
+                    format!("{} db={}", client.endpoint(), client.database()),
+                ),
+                Err(e) => DependencyHealth::failed("cosmos", e.to_string()),
+            },
+            None => DependencyHealth::skipped("cosmos"),
+        });
+
+        // Brave Search: a single one-result query validates the subscription key.
+        checks.push(match &self.web_search {
+            Some(client) => match client.ping() {
+                Ok(()) => DependencyHealth::ok("brave-search", client.endpoint().to_string()),
+                Err(e) => DependencyHealth::failed("brave-search", e.to_string()),
+            },
+            None => DependencyHealth::skipped("brave-search"),
+        });
+
+        HealthReport::from_checks(checks)
     }
 
     /// Run one full turn for `user_id` and `input`, returning the reply.
@@ -704,6 +764,20 @@ mod tests {
         assert!(result.reply.contains("hello"));
         assert!(result.reply.contains("alice"));
         assert!(result.thought_id.starts_with("th_"));
+    }
+
+    #[test]
+    fn check_health_skips_unconfigured_dependencies_and_is_ready() {
+        // A skeleton engine has no clients, so every dependency is skipped and
+        // the service is ready (skipped dependencies never make it unready).
+        let engine = Engine::new(None, None);
+        let report = engine.check_health();
+        assert!(report.ready);
+        assert_eq!(report.checks.len(), 4);
+        assert!(report
+            .checks
+            .iter()
+            .all(|check| !check.configured && check.status == crate::health::CheckStatus::Skipped));
     }
 
     #[test]

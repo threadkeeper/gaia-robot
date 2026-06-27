@@ -310,6 +310,27 @@ impl CosmosClient {
         &self.endpoint
     }
 
+    /// Probe Cosmos connectivity and RBAC by reading the target database.
+    ///
+    /// Performs an authenticated metadata read (`GET {endpoint}dbs/{database}`),
+    /// which exercises the exact production path a real query uses: endpoint
+    /// reachability, minting/refreshing the managed-identity token, and the
+    /// Built-in Data Contributor `readMetadata` permission. It reads no user
+    /// data and returns `Ok(())` on success, or a [`CosmosError`] describing the
+    /// failure (token, auth/RBAC, network, …) so the readiness probe can report
+    /// precisely what is wrong.
+    pub fn ping(&self) -> Result<(), CosmosError> {
+        let url = format!("{}dbs/{}", self.endpoint, self.database);
+        let auth = aad_auth_header(&self.bearer()?);
+        ureq::get(&url)
+            .set("Authorization", &auth)
+            .set("x-ms-date", &now_rfc1123())
+            .set("x-ms-version", API_VERSION)
+            .call()
+            .map_err(map_ureq_error)?;
+        Ok(())
+    }
+
     /// Run a parameterised SQL query against a single logical partition.
     ///
     /// `partition_value` is the entity/userId that scopes the query to one

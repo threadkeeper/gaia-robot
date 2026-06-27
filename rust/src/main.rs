@@ -65,6 +65,7 @@ mod embeddings;
 mod engine;
 mod executor;
 mod flow;
+mod health;
 mod http_request;
 mod http_response;
 mod json_repair;
@@ -139,7 +140,7 @@ mod context_budget {
 /// exit status.
 fn main() -> ExitCode {
     // --- 0a. Data-retrieval self-test mode (opt-in via subcommand) ---------
-    // `gaia-robot test-data-retrieval` runs the five-question pull-pass probe
+    // `gaia-robot test-data-retrieval` runs the six-question pull-pass probe
     // (LLM Call 1 -> actions.json -> Cosmos + Brave) and exits non-zero on any
     // failure, so it doubles as an on-demand check and a hard CI deploy gate.
     // It is checked first so it never collides with server or console mode.
@@ -148,7 +149,7 @@ fn main() -> ExitCode {
     }
 
     // --- 0b. Data-execution self-test mode (opt-in via subcommand) ---------
-    // `gaia-robot test-data-execution` runs the five-turn push-pass probe
+    // `gaia-robot test-data-execution` runs the six-turn push-pass probe
     // (LLM Call 2 -> response.json + actions.json) over the contexts captured
     // under tests/LLM1, auditing that every required side-effect record was
     // emitted. Like the retrieval probe it exits non-zero on any failure so it
@@ -551,7 +552,7 @@ fn wants_data_retrieval_test() -> bool {
 
 /// Parse an optional 1-based question number after the subcommand name.
 ///
-/// Usage: `gaia-robot test-data-retrieval [N]` where N is 1–5.
+/// Usage: `gaia-robot test-data-retrieval [N]` where N is 1–6.
 /// Returns `None` when no number is given (run all questions).
 fn parse_question_number() -> Option<usize> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -562,7 +563,7 @@ fn parse_question_number() -> Option<usize> {
 /// Run the data-retrieval self-test and map its result to an exit code.
 ///
 /// Builds the probe from the environment (the same dev/local configuration the
-/// rest of the program uses), runs all five questions (or just one when a
+/// rest of the program uses), runs all six questions (or just one when a
 /// question number is given), and returns [`ExitCode::SUCCESS`] only when every
 /// executed question passed. A configuration problem (no model, etc.) or any
 /// retrieval failure returns [`ExitCode::FAILURE`] so CI halts before deploying.
@@ -581,7 +582,7 @@ fn run_data_retrieval_test() -> ExitCode {
     };
 
     let only = parse_question_number();
-    // Write artifacts to tests/LLM1/t1..t5 so humans can review the JSON files.
+    // Write artifacts to tests/LLM1/t1..t6 so humans can review the JSON files.
     let tests_dir = std::path::Path::new("../tests/LLM1");
     match probe.run(only, Some(tests_dir), &mut out) {
         Ok(true) => ExitCode::SUCCESS,

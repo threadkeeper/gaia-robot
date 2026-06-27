@@ -108,6 +108,41 @@ variables it expects.
 
 ---
 
+## Readiness probe (`/readyz`)
+
+The running server exposes two HTTP health endpoints:
+
+| Endpoint | Cost | Proves |
+|----------|------|--------|
+| `GET /healthz` | cheap | The process is up and accepting connections (liveness). |
+| `GET /readyz` | deep | Live connectivity **and** RBAC to every configured dependency (readiness). |
+
+`/readyz` actively probes each external dependency the engine is wired to and
+returns a JSON report:
+
+- **`foundry-model-router`** — a one-token completion (validates the endpoint,
+  the managed-identity/API-key auth, and the *Cognitive Services OpenAI User* role).
+- **`foundry-embeddings`** — embeds `"ping"` (same Foundry account, different deployment).
+- **`cosmos`** — an authenticated metadata read of the target database (validates
+  the managed-identity token and the *Cosmos Built-in Data Contributor* role).
+- **`brave-search`** — a single one-result query (validates the subscription key).
+
+Dependencies that are not configured in a given deployment are reported as
+`skipped` and never make the service unready. The endpoint returns **HTTP 200**
+when ready and **HTTP 503** when any configured dependency fails:
+
+```sh
+curl -s https://<app-host>/readyz | jq
+# { "ready": true, "checks": [ { "name": "cosmos", "configured": true,
+#   "status": "ok", "detail": "https://acct/ db=gaia" }, ... ] }
+```
+
+Each call performs real upstream requests (one Brave query, one tiny Foundry
+completion + embedding, one Cosmos read), so probe it on demand — not in a tight
+loop. The cheap `/healthz` is what the CD smoke test and ingress probes use.
+
+---
+
 ## Run everything CI runs
 
 ```sh

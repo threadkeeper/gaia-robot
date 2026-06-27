@@ -270,7 +270,28 @@ impl LlmClient {
         parse_completion(&text)
     }
 
-    /// Render a human-readable preview of *exactly* what this client will send
+    /// Probe model (model-router) connectivity and RBAC with a tiny completion.
+    ///
+    /// Sends a deliberately minimal chat completion (`max_tokens = 1`) so it
+    /// exercises the full production path — endpoint reachability, the auth
+    /// scheme (managed-identity bearer or Foundry API key), and the configured
+    /// deployment — for a negligible token cost. Only the HTTP outcome matters,
+    /// so the response body is discarded: `Ok(())` means the backend accepted
+    /// and answered the request, while an [`LlmError`] surfaces an auth/RBAC or
+    /// connectivity failure for the readiness probe to report.
+    pub fn ping(&self) -> Result<(), LlmError> {
+        let body = build_request_body(&self.model, "health check", "ping", 1);
+        let payload = serde_json::to_vec(&body).map_err(|e| LlmError::Decode(e.to_string()))?;
+
+        let request = ureq::post(&self.endpoint).set("Content-Type", "application/json");
+        let request = match self.auth {
+            AuthScheme::ApiKey => request.set("api-key", &self.token),
+            AuthScheme::Bearer => request.set("Authorization", &format!("Bearer {}", self.token)),
+        };
+
+        request.send_bytes(&payload).map_err(map_ureq_error)?;
+        Ok(())
+    }
     /// for one chat completion, so a walk-through can see the full context
     /// window with nothing hidden.
     ///

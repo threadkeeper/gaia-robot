@@ -52,7 +52,8 @@ backend with `VITE_API_BASE=https://<app>.azurecontainerapps.io`.
 |---|---|---|
 | WS   | `/v1/ws/{id}` | default; hello `{token}` then `{text}`, streams `{type:'token'}`/`{type:'done'}` |
 | POST | `/v1/conversations/{id}/messages` | non-streaming; set `VITE_STREAM_TRANSPORT=post` |
-| GET  | `/healthz` | liveness |
+| GET  | `/healthz` | liveness (cheap) |
+| GET  | `/readyz` | readiness (deep dependency + RBAC probe) |
 
 ## Scripts
 

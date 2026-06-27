@@ -126,6 +126,17 @@ impl BraveClient {
 
         parse_results(&body)
     }
+
+    /// Probe Brave Search connectivity and credentials with a minimal query.
+    ///
+    /// Runs a single one-result search, which validates that the endpoint is
+    /// reachable and the `BRAVE_SEARCH_API_KEY` subscription token is accepted.
+    /// The results are discarded; `Ok(())` means the search succeeded. (Each
+    /// call counts as one Brave query, so the readiness probe should not be
+    /// polled aggressively.)
+    pub fn ping(&self) -> Result<(), WebSearchError> {
+        self.search("gaia readiness probe", 1).map(|_| ())
+    }
 }
 
 /// Decide a [`BraveClient`] from already-resolved configuration values.
