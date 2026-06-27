@@ -20,7 +20,7 @@
 //! the front end still works end-to-end.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -29,8 +29,9 @@ use crate::embeddings::EmbeddingClient;
 use crate::llm::LlmClient;
 use crate::prompt::{now_rfc3339, Call1Prompt, Call2Prompt};
 use crate::pull_data_controller::PullDataController;
-use crate::push_data_controller::PushDataController;
+use crate::push_data_controller::{PushActionTiming, PushDataController};
 use crate::web_search::BraveClient;
+use crate::write_data_controller::{WriteDataController, DEFAULT_INDEX_DIMS};
 
 /// The result of one turn, serialized as the front end's `ReplyResult`.
 ///
@@ -59,6 +60,47 @@ pub struct TurnResult {
     /// the turn planned no actions (e.g. skeleton mode or a Call 2 failure).
     #[serde(rename = "actionsSummary", skip_serializing_if = "Option::is_none")]
     pub actions_summary: Option<String>,
+    /// Diagnostics for the **pull pass** (LLM Call 1 + retrieval), shown in the
+    /// UI debug panel. Omitted in skeleton mode (no model configured).
+    #[serde(rename = "pullDebug", skip_serializing_if = "Option::is_none")]
+    pub pull_debug: Option<PullDebug>,
+    /// Diagnostics for the **push pass** (LLM Call 2 + planned side effects),
+    /// shown in the UI debug panel. Omitted in skeleton mode and when Call 2
+    /// failed before producing a reply.
+    #[serde(rename = "pushDebug", skip_serializing_if = "Option::is_none")]
+    pub push_debug: Option<PushDebug>,
+}
+
+/// Debug diagnostics for the pull pass (LLM Call 1 + retrieval).
+///
+/// Serialized as the front end's `PullDebug`: which model answered Call 1, how
+/// long that call took, and the retrieval actions the model chose this turn.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PullDebug {
+    /// The model that produced LLM Call 1 (e.g. `gpt-4o-mini`).
+    pub model: String,
+    /// Wall-clock milliseconds spent in the LLM Call 1 request.
+    #[serde(rename = "llmMs")]
+    pub llm_ms: u64,
+    /// The retrieval actions Call 1 planned, e.g. `q1 → Web`, `q3 → GaiaKB`.
+    /// Empty when Call 1 produced no parseable action plan.
+    pub actions: Vec<String>,
+}
+
+/// Debug diagnostics for the push pass (LLM Call 2 + planned side effects).
+///
+/// Serialized as the front end's `PushDebug`: which model answered Call 2, how
+/// long that call took, and the per-action type + processing time of every side
+/// effect the model planned.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PushDebug {
+    /// The model that produced LLM Call 2 (e.g. `gpt-4o-mini`).
+    pub model: String,
+    /// Wall-clock milliseconds spent in the LLM Call 2 request.
+    #[serde(rename = "llmMs")]
+    pub llm_ms: u64,
+    /// One entry per planned action: its type and time-to-process (ms).
+    pub actions: Vec<PushActionTiming>,
 }
 
 /// Runs Gaia turns. Holds the (optional) model and web-search clients plus the
@@ -75,6 +117,10 @@ pub struct Engine {
     /// The embedding client used when a retrieval action chooses semantic mode,
     /// or `None` when embeddings are not configured.
     embedder: Option<EmbeddingClient>,
+    /// The shared write controller used to persist each completed turn back to
+    /// Cosmos (append-and-re-embed). Built from the same Cosmos + embedding
+    /// clients; `None` (or offline) means the engine simply skips persistence.
+    writer: Option<WriteDataController>,
 }
 
 impl Engine {
@@ -126,12 +172,31 @@ impl Engine {
         } else {
             Some(warnings.join("; "))
         };
+        // Build the write controller from the *same* Cosmos + embedding clients
+        // the rest of the engine uses (both are cheap to clone). When either is
+        // absent the controller is offline and persistence is silently skipped,
+        // so wiring it in never destabilizes a turn. The index size honours the
+        // `DATALAKE_INDEX_VECTOR_DIMS` override, falling back to the default.
+        let writer = if cosmos.is_some() && embedder.is_some() {
+            let index_dims = crate::llm::value_from_env("DATALAKE_INDEX_VECTOR_DIMS")
+                .and_then(|raw| raw.trim().parse::<usize>().ok())
+                .filter(|dims| *dims > 0)
+                .unwrap_or(DEFAULT_INDEX_DIMS);
+            Some(WriteDataController::new(
+                cosmos.clone(),
+                embedder.clone(),
+                index_dims,
+            ))
+        } else {
+            None
+        };
         (
             Engine {
                 llm,
                 web_search,
                 cosmos,
                 embedder,
+                writer,
             },
             warning,
         )
@@ -148,6 +213,7 @@ impl Engine {
             web_search,
             cosmos: None,
             embedder: None,
+            writer: None,
         }
     }
 
@@ -171,8 +237,13 @@ impl Engine {
                 } else {
                     "embeddings off"
                 };
+                let writes = if self.writer.as_ref().is_some_and(|w| w.is_online()) {
+                    "writes ON"
+                } else {
+                    "writes off"
+                };
                 format!(
-                    "live model {} at {} ({web}, {cosmos}, {embed})",
+                    "live model {} at {} ({web}, {cosmos}, {embed}, {writes})",
                     client.model(),
                     client.endpoint()
                 )
@@ -201,13 +272,17 @@ impl Engine {
                 thought_id,
                 searches: None,
                 actions_summary: None,
+                pull_debug: None,
+                push_debug: None,
             };
         };
 
         let requested_at = now_rfc3339();
+        let model = client.model().to_string();
 
         // --- LLM Call 1: the pull / research pass --------------------------
         let call1 = Call1Prompt::build(user_id, input, "", &requested_at);
+        let call1_start = Instant::now();
         let call1_raw = match client.complete(&call1.system, &call1.user) {
             Ok(text) => text,
             Err(err) => {
@@ -215,6 +290,7 @@ impl Engine {
                 format!("(LLM Call 1 failed: {err})")
             }
         };
+        let call1_ms = call1_start.elapsed().as_millis() as u64;
 
         // --- Retrieval + deterministic Response Data Context ---------------
         // Execute every retrieval action Call 1 planned and fold the results,
@@ -222,12 +298,23 @@ impl Engine {
         // section markdown that grounds Call 2. This is the exact same builder
         // the data-retrieval self-test uses, so the cloud app and the test stay
         // in lock-step. It never makes an extra LLM call.
-        let (response_data_context, searches) =
+        let (response_data_context, searches, pull_actions) =
             self.assemble_context(user_id, input, &requested_at, &call1_raw);
+
+        // Diagnostics for the pull pass shown in the UI debug panel: which model
+        // ran Call 1, how long it took, and the retrieval actions it chose.
+        let pull_debug = PullDebug {
+            model: model.clone(),
+            llm_ms: call1_ms,
+            actions: pull_actions,
+        };
 
         // --- LLM Call 2: the push / answer pass ----------------------------
         let call2 = Call2Prompt::build(user_id, input, &response_data_context, &requested_at);
-        match client.complete(&call2.system, &call2.user) {
+        let call2_start = Instant::now();
+        let call2_result = client.complete(&call2.system, &call2.user);
+        let call2_ms = call2_start.elapsed().as_millis() as u64;
+        match call2_result {
             Ok(call2_raw) => {
                 // Drive the shared push controller — the exact same parsing and
                 // audit the data-execution self-test runs. It yields both the
@@ -236,10 +323,20 @@ impl Engine {
                 // Capture the actions summary before moving the reply text into
                 // the result struct (both borrow `push`).
                 let actions_summary = push.actions_summary();
+                // Per-action type + processing time for the UI debug panel.
+                let push_action_timings = push
+                    .actions
+                    .as_ref()
+                    .map(crate::push_data_controller::time_actions)
+                    .unwrap_or_default();
+                // Persist this completed exchange to the user's personal data
+                // lake (append-and-re-embed). Best-effort: a write failure is
+                // logged but never changes the reply we return.
+                self.persist_turn(user_id, input, &push.reply_text, &requested_at);
                 TurnResult {
                     reply: push.reply_text,
                     verdict: "allow".to_string(),
-                    routing: client.model().to_string(),
+                    routing: model.clone(),
                     attention: 0.0,
                     thought_id,
                     searches: if searches.is_empty() {
@@ -249,12 +346,18 @@ impl Engine {
                     },
                     // Audit Call 2's actions.json and surface a short summary bubble.
                     actions_summary,
+                    pull_debug: Some(pull_debug),
+                    push_debug: Some(PushDebug {
+                        model,
+                        llm_ms: call2_ms,
+                        actions: push_action_timings,
+                    }),
                 }
             }
             Err(err) => TurnResult {
                 reply: format!("Sorry, I could not complete my reply: {err}"),
                 verdict: "error".to_string(),
-                routing: client.model().to_string(),
+                routing: model.clone(),
                 attention: 0.0,
                 thought_id,
                 searches: if searches.is_empty() {
@@ -263,6 +366,13 @@ impl Engine {
                     Some(searches)
                 },
                 actions_summary: None,
+                pull_debug: Some(pull_debug),
+                // Call 2 failed: report the model and call time, but no actions.
+                push_debug: Some(PushDebug {
+                    model,
+                    llm_ms: call2_ms,
+                    actions: Vec::new(),
+                }),
             },
         }
     }
@@ -278,15 +388,16 @@ impl Engine {
     /// fails: a missing client or an unparsable plan simply yields empty
     /// sections, so Call 2 always receives a stable, predictable structure.
     ///
-    /// Returns the context markdown and the web queries that actually ran (for
-    /// the [`TurnResult::searches`] field).
+    /// Returns the context markdown, the web queries that actually ran (for the
+    /// [`TurnResult::searches`] field), and a short label per retrieval action
+    /// the plan chose (for the pull-pass debug panel, e.g. `q1 → Web`).
     fn assemble_context(
         &self,
         user_id: &str,
         input: &str,
         requested_at: &str,
         call1_raw: &str,
-    ) -> (String, Vec<String>) {
+    ) -> (String, Vec<String>, Vec<String>) {
         // Drive the shared pull controller — the exact same code the
         // data-retrieval self-test runs — and keep only what the reply needs:
         // the assembled context and the web queries that ran. We pass
@@ -299,7 +410,67 @@ impl Engine {
             self.web_search.as_ref(),
         )
         .execute(user_id, input, requested_at, call1_raw, false);
-        (result.context, result.searches)
+
+        // One readable label per planned retrieval action (`id → target`), in
+        // plan order, so the debug panel shows exactly what Call 1 chose to fetch.
+        let actions = result
+            .plan
+            .as_ref()
+            .map(|plan| {
+                plan.actions
+                    .iter()
+                    .map(|a| format!("{} → {}", a.id, a.target))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        (result.context, result.searches, actions)
+    }
+
+    /// Persist a completed exchange to the user's personal data lake.
+    ///
+    /// Appends a single `User: … / Gaia: …` chunk to today's `UsersDataLake`
+    /// record for `user_id` through the shared [`WriteDataController`], which
+    /// reads the day's record, appends, re-embeds the whole day once, and writes
+    /// it back (creating it on the first turn of the day). `user_id` is the
+    /// `/userId` partition, so every write stays scoped to its owner.
+    ///
+    /// This is deliberately **best-effort and infallible**, matching the rest of
+    /// the engine: when no writer is configured (skeleton/offline) it is a no-op,
+    /// and any write error is logged to stderr but never affects the reply. We
+    /// skip empty exchanges so we never store blank turns.
+    fn persist_turn(&self, user_id: &str, input: &str, reply: &str, now_rfc3339: &str) {
+        // Nothing to persist without a configured, online writer.
+        let Some(writer) = self.writer.as_ref() else {
+            return;
+        };
+        if !writer.is_online() {
+            return;
+        }
+        // Don't store blank turns (e.g. an empty input with a skeleton reply).
+        if input.is_empty() && reply.is_empty() {
+            return;
+        }
+
+        // One readable line capturing both sides of the exchange. The controller
+        // timestamps and appends it under today's record.
+        let chunk = format!("User: {input}\nGaia: {reply}");
+        match writer.upsert_daily("UsersDataLake", user_id, now_rfc3339, &chunk) {
+            Ok(outcome) => {
+                // A lightweight, secret-free trace so operators can see writes
+                // landing without inspecting Cosmos directly.
+                eprintln!(
+                    "persisted turn: {} ({}, {} bytes, vector {}d)",
+                    outcome.id,
+                    outcome.action.label(),
+                    outcome.data_bytes,
+                    outcome.vector_dims,
+                );
+            }
+            Err(err) => {
+                eprintln!("persist turn failed for user {user_id}: {err}");
+            }
+        }
     }
 }
 
@@ -357,6 +528,16 @@ mod tests {
     }
 
     #[test]
+    fn persist_turn_is_a_safe_noop_without_a_writer() {
+        // The skeleton engine has no writer configured, so persisting a turn must
+        // be a safe no-op: it neither panics nor requires a Cosmos client.
+        let engine = Engine::new(None, None);
+        engine.persist_turn("alice", "hello", "hi alice", "2026-06-27T10:00:00Z");
+        // An all-empty exchange is skipped too (still no panic).
+        engine.persist_turn("", "", "", "2026-06-27T10:00:00Z");
+    }
+
+    #[test]
     fn assemble_context_is_deterministic_and_degrades_without_clients() {
         // No web/Cosmos/embedder clients configured: the retrieval sections must
         // still be emitted (empty), Call 1's analysis/facts/newContext folded in,
@@ -369,7 +550,7 @@ mod tests {
           { "summary": "We spoke about colours before." }
         ]"#;
 
-        let (context, searches) =
+        let (context, searches, actions) =
             engine.assemble_context("alice", "hi", "2026-06-21T00:00:00Z", reply);
 
         for heading in [
@@ -392,7 +573,10 @@ mod tests {
         assert!(searches.is_empty());
 
         // Determinism: identical inputs produce identical output.
-        let (again, _) = engine.assemble_context("alice", "hi", "2026-06-21T00:00:00Z", reply);
+        let (again, _, actions_again) =
+            engine.assemble_context("alice", "hi", "2026-06-21T00:00:00Z", reply);
         assert_eq!(context, again);
+        // The pull-action labels are also stable across identical inputs.
+        assert_eq!(actions, actions_again);
     }
 }

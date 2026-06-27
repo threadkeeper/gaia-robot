@@ -25,7 +25,9 @@
 //! degrade gracefully.
 
 use std::collections::BTreeSet;
+use std::time::Instant;
 
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::llm::value_from_env;
@@ -270,6 +272,86 @@ pub fn summarize_actions(audit: &ActionAudit) -> String {
     }
 
     lines.join("\n")
+}
+
+/// One push action's human-readable type and how long it took to process,
+/// captured for the UI debug panel.
+///
+/// `ms` is wall-clock milliseconds spent classifying/auditing this single
+/// action (sub-millisecond work is reported with fractional precision rather
+/// than rounded to zero). The push pass is read-only, so this measures the
+/// per-action audit cost — not a live send/write — but it is a real timing.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PushActionTiming {
+    /// A short label for the action, e.g. `WhatsApp`, `Push`, `Actuate`,
+    /// or `Upsert GaiaKB`.
+    #[serde(rename = "type")]
+    pub action_type: String,
+    /// Milliseconds spent processing this one action (may be fractional).
+    pub ms: f64,
+}
+
+/// Classify and time each action in a parsed `actions.json`, in document order.
+///
+/// For every entry under the `actions` array this audits that single action in
+/// isolation and records both its human-readable [`PushActionTiming::action_type`]
+/// and the wall-clock [`PushActionTiming::ms`] the audit took. The cloud app
+/// surfaces this in the debug panel so each turn shows which side effects LLM
+/// Call 2 planned and how long each took to handle. Returns an empty vector when
+/// `actions` is absent or not an array.
+pub fn time_actions(actions: &Value) -> Vec<PushActionTiming> {
+    let mut timings = Vec::new();
+    let Some(items) = actions.get("actions").and_then(Value::as_array) else {
+        return timings;
+    };
+
+    for action in items {
+        // Audit this single action in isolation so the timing is attributable to
+        // exactly one entry. Wrapping it in a one-element `actions` array reuses
+        // the canonical classifier, guaranteeing the label matches the audit.
+        let single = serde_json::json!({ "actions": [action] });
+        let start = Instant::now();
+        let audit = audit_actions(&single);
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        timings.push(PushActionTiming {
+            action_type: action_type_label(&audit, action),
+            ms: elapsed_ms,
+        });
+    }
+
+    timings
+}
+
+/// Derive a short type label for one already-audited action.
+///
+/// Reads the single-action `audit` first (so the label always agrees with how
+/// the action was classified), then falls back to the action's raw
+/// `kind`/`target` for entries the audit ignores.
+fn action_type_label(audit: &ActionAudit, action: &Value) -> String {
+    if !audit.whatsapp.is_empty() {
+        return "WhatsApp".to_string();
+    }
+    if !audit.push.is_empty() {
+        return "Push".to_string();
+    }
+    if !audit.actuate.is_empty() {
+        return "Actuate".to_string();
+    }
+    if let Some(store) = audit.store_writes.iter().next() {
+        return format!("Upsert {store}");
+    }
+
+    // Unrecognised action: show whatever the model labelled it, so nothing is
+    // silently dropped from the debug view.
+    let kind = string_field(action, "kind");
+    let target = string_field(action, "target");
+    match (kind.is_empty(), target.is_empty()) {
+        (false, false) => format!("{kind} → {target}"),
+        (false, true) => kind,
+        (true, false) => target,
+        (true, true) => "action".to_string(),
+    }
 }
 
 /// Summarize an Edwino actuate instruction in one short phrase, e.g.
@@ -727,6 +809,45 @@ mod tests {
         assert_eq!(audit.actuate.len(), 1);
         assert_eq!(audit.store_writes.len(), 4);
         assert!(audit.missing_stores().is_empty());
+    }
+
+    #[test]
+    fn time_actions_labels_and_times_each_action_in_order() {
+        // One of every recognised category, plus an unrecognised entry, so the
+        // labelling and ordering are both exercised.
+        let actions = json!({
+            "actions": [
+                { "id": "a1", "kind": "send", "target": "WhatsApp",
+                  "to_name": "Jonty", "message": "Hi", "urgency": 0.7 },
+                { "id": "a2", "kind": "send", "target": "Push",
+                  "message": "ping", "urgency": 0.2 },
+                { "id": "a3", "kind": "actuate", "target": "Edwino",
+                  "instruction": { "face": "happy" } },
+                { "id": "a4", "kind": "upsert", "target": "GaiaKB", "payload": {} },
+                { "id": "a5", "kind": "search", "target": "Web" }
+            ]
+        });
+
+        let timings = time_actions(&actions);
+        let labels: Vec<&str> = timings.iter().map(|t| t.action_type.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "WhatsApp",
+                "Push",
+                "Actuate",
+                "Upsert GaiaKB",
+                "search → Web"
+            ]
+        );
+        // Every timing is a real, non-negative measurement.
+        assert!(timings.iter().all(|t| t.ms >= 0.0));
+    }
+
+    #[test]
+    fn time_actions_is_empty_without_an_actions_array() {
+        assert!(time_actions(&json!({})).is_empty());
+        assert!(time_actions(&json!({ "actions": "nope" })).is_empty());
     }
 
     #[test]

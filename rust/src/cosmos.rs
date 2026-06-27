@@ -225,8 +225,28 @@ impl CosmosClient {
         partition_value: &str,
         record: &Record,
     ) -> Result<(), CosmosError> {
+        // A [`Record`] is just one serializable document shape; delegate to the
+        // generic path so there is a single upsert code path on the wire.
+        self.upsert_doc(container, partition_value, record)
+    }
+
+    /// Upsert (insert-or-replace) any serializable document into a container.
+    ///
+    /// This is the generic counterpart to [`upsert`](CosmosClient::upsert): it
+    /// accepts any `Serialize` type, so callers can write documents whose shape
+    /// differs from [`Record`] (for example the `DataLakeIndex` entries, which
+    /// carry an `indexVector` and `source` rather than `dataVector`).
+    ///
+    /// `partition_value` must equal the document's partition field; Cosmos
+    /// enforces that the two match.
+    pub fn upsert_doc<T: Serialize>(
+        &self,
+        container: &str,
+        partition_value: &str,
+        doc: &T,
+    ) -> Result<(), CosmosError> {
         let url = docs_url(&self.endpoint, &self.database, container);
-        let body = serde_json::to_vec(record).map_err(|e| CosmosError::Decode(e.to_string()))?;
+        let body = serde_json::to_vec(doc).map_err(|e| CosmosError::Decode(e.to_string()))?;
 
         ureq::post(&url)
             .set("Authorization", &aad_auth_header(&self.token))
@@ -280,6 +300,47 @@ impl CosmosClient {
                 Ok(Some(record))
             }
             // A missing document is a normal "not found", not a failure.
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(err) => Err(map_ureq_error(err)),
+        }
+    }
+
+    /// Point-read a single document by id as a raw JSON [`serde_json::Value`].
+    ///
+    /// The generic counterpart to [`get`](CosmosClient::get): use it for
+    /// documents whose shape is not a [`Record`] (for example `DataLakeIndex`
+    /// entries, which carry an `indexVector`). Returns `Ok(None)` on HTTP 404.
+    pub fn get_value(
+        &self,
+        container: &str,
+        partition_value: &str,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, CosmosError> {
+        let url = format!(
+            "{}{}",
+            docs_url(&self.endpoint, &self.database, container),
+            format_args!("/{id}"),
+        );
+
+        let result = ureq::get(&url)
+            .set("Authorization", &aad_auth_header(&self.token))
+            .set("x-ms-date", &now_rfc1123())
+            .set("x-ms-version", API_VERSION)
+            .set(
+                "x-ms-documentdb-partitionkey",
+                &partition_key_header(partition_value),
+            )
+            .call();
+
+        match result {
+            Ok(response) => {
+                let text = response
+                    .into_string()
+                    .map_err(|e| CosmosError::Http(e.to_string()))?;
+                let value =
+                    serde_json::from_str(&text).map_err(|e| CosmosError::Decode(e.to_string()))?;
+                Ok(Some(value))
+            }
             Err(ureq::Error::Status(404, _)) => Ok(None),
             Err(err) => Err(map_ureq_error(err)),
         }

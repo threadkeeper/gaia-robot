@@ -78,9 +78,11 @@ mod server;
 mod sha1;
 mod storage;
 mod test_data_execution;
+mod test_data_persistance;
 mod test_data_retrieval;
 mod web_search;
 mod websocket;
+mod write_data_controller;
 
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
@@ -150,6 +152,17 @@ fn main() -> ExitCode {
     // doubles as an on-demand check and a hard CI gate.
     if wants_data_execution_test() {
         return run_data_execution_test();
+    }
+
+    // --- 0c. Data-persistence self-test mode (opt-in via subcommand) -------
+    // `gaia-robot test-data-persistence` runs the write-pass probe: it appends
+    // two chunks per container through the shared WriteDataController, reads each
+    // record back, and verifies the append, the refreshed embedding, and (for
+    // GaiaDataLake) the synced DataLakeIndex vector. Like the other probes it
+    // exits non-zero on any failure so it doubles as an on-demand check and a
+    // hard CI gate.
+    if wants_data_persistence_test() {
+        return run_data_persistence_test();
     }
 
     // --- 0. HTTP server mode (opt-in) --------------------------------------
@@ -604,6 +617,46 @@ fn run_data_execution_test() -> ExitCode {
     let input_dir = std::path::Path::new("../tests/LLM1");
     let output_dir = std::path::Path::new("../tests/LLM2");
     match probe.run(only, input_dir, Some(output_dir), &mut out) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(_) => ExitCode::FAILURE,
+    }
+}
+
+/// Return `true` when the program was invoked as the data-persistence self-test.
+///
+/// Triggered by a `test-data-persistence` (or `TestDataPersistence`) argument so
+/// the probe can be launched as `gaia-robot test-data-persistence`.
+/// Case-insensitive so the PowerShell wrapper name and the CLI form both work.
+fn wants_data_persistence_test() -> bool {
+    std::env::args().skip(1).any(|arg| {
+        arg.eq_ignore_ascii_case("test-data-persistence")
+            || arg.eq_ignore_ascii_case("testdatapersistence")
+    })
+}
+
+/// Run the data-persistence self-test and map its result to an exit code.
+///
+/// Builds the write-pass probe from the environment (the same dev/local config
+/// the rest of the program uses), writes and reads back records for each target
+/// container, and writes artifacts into `tests/LLM3`. Returns
+/// [`ExitCode::SUCCESS`] only when every executed container passed.
+fn run_data_persistence_test() -> ExitCode {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    let probe = match test_data_persistance::DataPersistenceProbe::from_env() {
+        Ok(probe) => probe,
+        Err(err) => {
+            let _ = writeln!(out, "data-persistence self-test cannot run: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let only = parse_question_number();
+    // Write artifacts to tests/LLM3 so humans can review the read-back records.
+    let output_dir = std::path::Path::new("../tests/LLM3");
+    match probe.run(only, Some(output_dir), &mut out) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(_) => ExitCode::FAILURE,

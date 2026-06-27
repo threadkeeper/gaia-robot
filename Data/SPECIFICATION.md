@@ -3,336 +3,324 @@
 **Repository:** `threadkeeper/gaia-robot`
 **Scope:** Rust write-path for Cosmos DB containers + new `DataLakeIndex`
 two-tier retrieval design.
-**Status:** DRAFT FOR REVIEW — no code is to be written until this document and
-`OPEN_QUESTIONS.md` are approved.
+**Status:** APPROVED FOR SCAFFOLDING — all open questions resolved
+(see `DECISIONS.md`). This document reflects @threadkeeper's choices.
+
+---
+
+## 0. Executive summary (read this first)
+
+We add a generic **append-and-re-embed upsert** for Gaia's daily snapshot
+records and a small **`DataLakeIndex`** container for cheap semantic search.
+
+- **Daily key:** reuse the existing Cosmos `id`
+  (`{container}|{entity}|{yyyy-MM-dd}`) — no new `recordName` field.
+- **Write flow (lowest overhead):** point-read today's record → append a
+  timestamped plain-text chunk → re-embed the whole day's text **once** (1536-d)
+  → write back. ≈ 1 read + 1 embed + 1 upsert.
+- **Two vectors, one call:** the row keeps the full **1536-d** `dataVector`; the
+  `DataLakeIndex` keeps a **768-d** vector *derived locally* from that same
+  embedding (see §5.3) — no second API call.
+- **Two-tier DataLake retrieval:** vector search over the small `DataLakeIndex`
+  returns `id`s → fetch the full raw rows from the DataLake **SQL endpoint**
+  (Synapse/Fabric), which is **stubbed** this phase.
+- **Containers covered:** `GaiaKB`, `UsersKB`, `GaiaDataLake`, `UsersDataLake`,
+  `GaiaDiary`. Excluded: `GaiaConnections` (ledger), `GaiaWebSearchHistory`
+  (audit log).
+- **Wiring:** the writer is connected into the engine push pass now (the path
+  that today only emits `actions.json`).
+
+**Why the 768-d vector is "free":** `text-embedding-3-large` is a **Matryoshka**
+embedding — the most important meaning is packed into the *earliest* dimensions.
+So the 768-d index vector is just **the first 768 components of the 1536-d
+vector, re-normalized to unit length** (divide each kept component by the length
+of the truncated slice so cosine similarity stays valid). One embedding call
+therefore yields both sizes, at the cost of one tiny pure function
+`truncate_and_renormalize(&[f32], 768) -> Vec<f32>`.
 
 ---
 
 ## 1. Background — what exists today
 
-A survey of the current codebase (June 2026) establishes the baseline this spec
-builds on:
-
 ### 1.1 Cosmos client (`rust/src/cosmos.rs`)
-- `CosmosClient` is a thin, immutable, AAD-token-authenticated client bound to
-  one account + database (`gaia`). API version `2018-12-31`.
-- It exposes exactly three data-plane operations:
+- `CosmosClient`: thin, immutable, AAD-token client bound to one account + db
+  (`gaia`). API version `2018-12-31`.
+- Three data-plane ops only:
   - `query(container, partition_value, sql, params)` — single-partition read.
-  - `upsert(container, partition_value, &Record)` — **blind** insert-or-replace
-    (`x-ms-documentdb-is-upsert: true`). It does **not** read first, append, or
-    touch embeddings.
+  - `upsert(container, partition_value, &Record)` — **blind** insert-or-replace.
+    No read, append, or embedding.
   - `get(container, partition_value, id)` — point read, `Ok(None)` on 404.
-- API version `2018-12-31` predates the Cosmos **Partial Document Update
-  (Patch)** API (needs `2020-07-15`+), so patch-append is not available without
-  a version bump. See §6.
 
 ### 1.2 Record model (`rust/src/storage.rs`)
-- `Record` serde-maps onto the Cosmos document shape:
-  `id` ↔ `record_id`, `entity` ↔ `entity_id`, `userId` ↔ `user_id`, plus
-  `date`, `data`, `dataVector` (`Vec<f32>`), `metadata`.
-- **There is no `recordName` field today.**
-- The `Repository`/`KnowledgeBaseTable`/`DataLakeTable` types are an **in-memory
-  model only**; their `upsert` does a `BTreeMap::insert` (full replace). They do
-  not append or re-embed and are not connected to live Cosmos.
+- `Record` serde-maps onto the Cosmos doc: `id`↔`record_id`, `entity`↔`entity_id`,
+  `userId`↔`user_id`, plus `date`, `data`, `dataVector` (`Vec<f32>`), `metadata`.
+- The `Repository`/`*Table` types are an **in-memory model only** (full-replace
+  `BTreeMap::insert`); not wired to live Cosmos.
 
 ### 1.3 Embeddings (`rust/src/embeddings.rs`)
-- `EmbeddingClient::embed(text) -> Vec<f32>` calls Azure OpenAI
-  (`text-embedding`, `text-embedding-3-large`, 1536-d).
-- The output dimension is **fixed per client** from
-  `EMBEDDING_DIMENSIONS` / `COSMOS_VECTOR_DIMS` (currently 1536). There is **no**
-  way to request a second, smaller dimension (e.g. 768) for the index.
-  `text-embedding-3-large` *does* support the `dimensions` request parameter, so
-  a half-size vector is achievable (see §5.3).
+- `EmbeddingClient::embed(text) -> Vec<f32>` → Azure OpenAI
+  `text-embedding-3-large`, 1536-d (fixed by `EMBEDDING_DIMENSIONS` /
+  `COSMOS_VECTOR_DIMS`).
+- Matryoshka model → a valid 768-d vector is the renormalized first-768 slice
+  (§5.3); no second call needed.
 
 ### 1.4 Live container inventory (queried 2026-06-27, db `gaia`)
 
-| Container | PK | Records | `id` format observed | Has `data`/vector? |
-|-----------|----|---------|----------------------|--------------------|
-| `GaiaKB` | `/entity` | 3 | `GaiaKB\|threadkeeper\|2026-06-16` | yes |
-| `GaiaDataLake` | `/entity` | 31 | `GaiaDataLake\|threadkeeper\|2026-06-14` | yes |
-| `GaiaWebSearchHistory` | `/entity` | 0 | — | n/a (audit log) |
-| `UsersDataLake` | `/userId` | 31 | `UsersDataLake\|threadkeeper\|2026-06-14` | yes |
-| `UsersKB` | `/userId` | 0 | — | yes |
-| `GaiaDiary` | `/entity` | 9 | `GaiaDiary\|threadkeeper\|2026-05-31` | yes |
-| `GaiaConnections` | `/entity` | 4 | `GaiaConnections\|threadkeeper\|2026-04-27T19:09:59Z` | **no** (ledger) |
+| Container | PK | Records | `id` format observed | Gets the writer? |
+|-----------|----|---------|----------------------|------------------|
+| `GaiaKB` | `/entity` | 3 | `GaiaKB\|threadkeeper\|2026-06-16` | ✅ in-place 1536-d |
+| `GaiaDataLake` | `/entity` | 31 | `GaiaDataLake\|threadkeeper\|2026-06-14` | ✅ 1536-d + 768-d index |
+| `GaiaWebSearchHistory` | `/entity` | 0 | — | ❌ audit log |
+| `UsersDataLake` | `/userId` | 31 | `UsersDataLake\|threadkeeper\|2026-06-14` | ✅ 1536-d (index later) |
+| `UsersKB` | `/userId` | 0 | — | ✅ in-place 1536-d |
+| `GaiaDiary` | `/entity` | 9 | `GaiaDiary\|threadkeeper\|2026-05-31` | ✅ in-place 1536-d |
+| `GaiaConnections` | `/entity` | 4 | `...\|2026-04-27T19:09:59Z` | ❌ ledger |
 
-Observations that constrain the design:
-- Existing `id`s already encode `{Container}|{businessKey}|{dateOrTimestamp}` —
-  i.e. there is **one document per business key per day** on the snapshot
-  containers. That is exactly the "append within the day" grain this spec wants.
-- `GaiaConnections` is an append-only **ledger** (one row per event, ISO-8601
-  timestamp, no `data`/`dataVector`) and is therefore **excluded** from the
-  append-and-re-embed flow.
+Existing `id`s already encode `{Container}|{businessKey}|{date}` — **one doc per
+business key per day** — exactly the grain we append into, so we reuse `id` as
+the daily key (Decision Q1). `GaiaConnections` is an append-only ledger (no
+`data`/`dataVector`) and is excluded.
 
 ### 1.5 Write path is not wired
-LLM Call 2 emits `actions.json` (see `rust/src/push_data_controller.rs`), but
-**no production code calls `CosmosClient::upsert`** today (only a unit test
-does). This spec therefore also defines where the new writer plugs into the
-engine push pass.
+LLM Call 2 emits `actions.json` (`rust/src/push_data_controller.rs`); **no
+production code calls `CosmosClient::upsert`** today. Per Decision Q8 the writer
+is wired into the engine push pass as part of this work.
 
 ---
 
 ## 2. Goals & non-goals
 
 ### Goals
-1. A **generic, reusable** Rust write API that, for the snapshot containers,
-   performs: *read-if-exists → append new data → recompute embedding (where
-   applicable) → write back*, with the **lowest reasonable overhead**.
-2. Introduce a `recordName` field = **`{entity}_{yyyyMMdd}`** on every written
-   record, giving a stable, human-readable daily natural key.
-3. Keep vector embeddings **up to date** whenever a record's text changes.
-4. Add a new Cosmos container **`DataLakeIndex`** holding only
-   `recordName` + a **half-size (768-d)** vector, used as a cheap semantic index.
-5. Define the **two-tier retrieval**: semantic search over `DataLakeIndex` →
-   `recordName`s → fetch full raw rows from the DataLake **SQL endpoint**
-   (Synapse Serverless / Fabric).
+1. A generic, reusable writer doing *read-if-exists → append → re-embed → write
+   back*, lowest reasonable overhead.
+2. Use the existing Cosmos `id` (`{container}|{entity}|{yyyy-MM-dd}`) as the daily
+   key, computed deterministically from `(container, entity, today_utc)`.
+3. Keep vector embeddings current whenever a record's text changes.
+4. Add `DataLakeIndex` (partition `/entity`, like `GaiaDataLake`) holding only
+   `id` + a 768-d vector.
+5. Two-tier DataLake retrieval: vector search over `DataLakeIndex` → `id`s →
+   raw rows from the DataLake SQL endpoint (**stubbed**, Decision Q4).
 
 ### Non-goals (this phase)
-- Implementing the code (this is spec-only; scaffolding follows approval).
-- Changing `GaiaConnections` ledger semantics.
-- Building the Synapse/Fabric pipeline itself (we specify the contract Gaia
-  relies on; provisioning is tracked separately in `infra/`).
-- Backfilling old records (covered as a follow-up migration, §8).
+- Building the Synapse/Fabric pipeline or adding a SQL driver (stub only).
+- Changing `GaiaConnections` semantics.
+- Backfilling old rows (follow-up, §8).
 
 ---
 
-## 3. `recordName` design
+## 3. Daily key (the `id`)
+
+No new `recordName` field (Decision Q1). The existing Cosmos `id` is the daily
+key, constructed in the established convention:
 
 ```
-recordName = "{entity}_{yyyyMMdd}"
+id = "{container}|{entity}|{yyyy-MM-dd}"      // e.g. GaiaDataLake|threadkeeper|2026-06-27
 ```
 
-- `entity` = the business/partition key (the user for `Users*`, the subject
-  entity for `Gaia*`). For Gaia today these coincide (`threadkeeper`).
-- `yyyyMMdd` = the UTC date of the record (matches the existing per-day grain).
-- Examples: `threadkeeper_20260627`.
+- `entity` = business/partition key (user for `Users*`, subject for `Gaia*`).
+- `yyyy-MM-dd` = UTC date (matches existing rows).
+- Deterministic → computed with no read, then point-read.
+- `DataLakeIndex` docs use the **same `id`** as their source `GaiaDataLake` row.
 
-Properties:
-- **One record per entity per UTC day** → natural append target.
-- Deterministic: the writer can compute it from `(entity, today)` with no read.
-- Distinct from the Cosmos system `id`. **Open question (Q1)**: do we (a) keep the
-  current pipe-delimited `id` and add `recordName` as a separate field, or
-  (b) make `id == recordName` going forward? Recommendation: **(a)** for the
-  existing snapshot containers (avoid breaking the 65 existing rows), and
-  **`id == recordName`** for the brand-new `DataLakeIndex` container.
-
-`Record` gains a new serialized field:
-```rust
-#[serde(rename = "recordName", default, skip_serializing_if = "String::is_empty")]
-pub record_name: String,
-```
+No change to `Record`'s fields is required.
 
 ---
 
 ## 4. Generic append-and-re-embed upsert
 
-### 4.1 The chosen algorithm (baseline)
-
-For a write to a snapshot container (`GaiaKB`, `UsersKB`, `GaiaDataLake`,
-`UsersDataLake`, `GaiaDiary`):
+### 4.1 Algorithm
 
 ```
 fn upsert_daily(container, entity, today_utc, new_chunk):
-    1. record_name = f"{entity}_{yyyyMMdd(today_utc)}"
-    2. existing = cosmos.get(container, entity, id_for(record_name))   # 1 point read (~1 RU)
-    3. doc = existing.unwrap_or_else(|| new empty daily record)
-    4. doc.data = append(doc.data, new_chunk)                          # structured append (§4.3)
-    5. if container needs an in-place vector (KB, Diary):
-           doc.dataVector = embedder.embed(doc.data)                   # 1 embedding call
-       # DataLake containers do NOT store a 1536 vector here; their vector
-       # lives in DataLakeIndex (§5).
-    6. doc.recordName = record_name
-    7. cosmos.upsert(container, entity, &doc)                          # 1 write
-    8. if container is a DataLake:
-           update_data_lake_index(entity, today_utc, doc.data)        # §5.4
+    1. id  = "{container}|{entity}|{yyyy-MM-dd(today_utc)}"
+    2. existing = cosmos.get(container, entity, id)          # 1 point read (~1 RU)
+    3. doc = existing.unwrap_or_else(|| new empty daily record with this id/entity/date)
+    4. doc.data = append_timestamped(doc.data, new_chunk)    # plain-text log (§4.3)
+    5. if content hash unchanged:  return                    # M1 idempotent skip
+    6. full = embedder.embed(doc.data)                       # ONE call, 1536-d
+       doc.dataVector = full                                 # in-place vector for ALL writer containers
+    7. cosmos.upsert(container, entity, &doc)                # 1 write
+    8. if container == "GaiaDataLake":                       # DataLake also feeds the index
+           v768 = truncate_and_renormalize(full, 768)        # derived, no extra API call
+           index_doc = { id, entity, date, source: container, indexVector: v768 }
+           cosmos.upsert("DataLakeIndex", entity, &index_doc)
 ```
 
-Per write this is **1 point read + (0–1) embedding + 1 upsert** (+ the index
-update for DataLake). The point read by `id` within a known partition is the
-cheapest possible Cosmos read (~1 RU).
+Per write: **1 point read + 1 embedding + 1 upsert** (+ 1 small index upsert for
+DataLake). Point read by `id` within a known partition is the cheapest read
+(~1 RU).
+
+> Decision Q7: DataLake rows keep the in-place **1536-d** `dataVector` **and** the
+> `DataLakeIndex` holds the **768-d** vector. Decision Q5: the 768-d vector is
+> *derived* from the same 1536-d embedding — still only **one** embedding call.
 
 ### 4.2 Why this method (overhead analysis)
 
 | Option | Reads | Embeds | Writes | Notes |
 |--------|-------|--------|--------|-------|
-| **A. Read → append → re-embed whole → write back** *(chosen)* | 1 (point) | 1 | 1 | Embedding always reflects the full current text. Re-embeds the *whole daily record* each append, but a single day's text is bounded, so cost is small and predictable. |
-| B. Cosmos **Patch** append (no read) | 0 | 1* | 1 | Cheapest text append, but recomputing the embedding still needs the *full* text → forces a read anyway (*), erasing the saving. Also needs API version bump (§6). |
-| C. One sub-doc per turn + nightly rollup | 0 | many | many | More documents, more vectors, more RU, eventual consistency complexity. |
+| **A. Read → append → re-embed whole → write back** *(chosen)* | 1 (point) | 1 | 1 (+1 tiny index) | Embedding always reflects full current text; a day's text is bounded so cost is small/predictable. |
+| B. Cosmos **Patch** append (no read) | 0 | 1* | 1 | Cheapest text append, but re-embedding still needs the full text → forces a read anyway (*). Also needs an API-version bump. |
+| C. One sub-doc per turn + nightly rollup | 0 | many | many | More docs/vectors/RU, eventual-consistency complexity. |
 
-**Decision:** Option **A** is the baseline because correctness ("keep embedding
-up to date") dominates and the per-day record is small. Two cost mitigations are
-specified:
-- **M1 — content-hash skip.** Store `metadata.contentHash` (e.g. SHA-1 of
-  `data`). If an append produces no change (idempotent replay), skip the
-  embedding call and the write.
-- **M2 — embed-on-DataLake-index-only.** DataLake daily records do **not** carry
-  a 1536-d `dataVector` in Cosmos at all (they are retrieved by SQL, not vector
-  search), so the only embedding for a DataLake write is the **768-d** index
-  vector — half the cost of a full embedding.
+**Decision:** Option **A**. Mitigations:
+- **M1 — content-hash skip.** Store `metadata.contentHash` (SHA-1 of `data`);
+  idempotent replays skip embed + writes.
+- **M2 — single embedding, two sizes.** Embed once at 1536-d; derive the 768-d
+  index vector by truncation + re-normalization (§5.3).
 
-### 4.3 Append semantics
-- `data` is treated as an append-only, newline-delimited log of turn chunks for
-  the day. Each appended chunk is prefixed with a UTC time marker, e.g.
-  `\n\n[HH:MM:SSZ] {chunk}` so the daily record stays human-readable and the
-  embedding sees coherent text.
-- **Open question (Q2):** plain-text append vs. a structured JSON array under a
-  `metadata`/separate field. Recommendation: plain-text log for embedding
-  quality, with the raw structured turn also written to the DataLake analytical
-  store for exact retrieval.
+### 4.3 Append semantics (Decision Q2)
+- `data` is an append-only, newline-delimited, **timestamped plain-text log**.
+  Each chunk appends as `\n\n[HH:MM:SSZ] {chunk}` — human-readable and good for
+  embedding quality.
+- First write of the day creates the record; later writes append.
 
 ### 4.4 Error handling & idempotency
-- All fallible steps return `Result<_, E>` and use `?` (no `unwrap`/`expect`
-  outside tests) per repo standards.
-- The flow is **idempotent on replay** via M1 (same chunk → same hash → no-op).
-- A failed embedding must **not** lose the appended text: write order is
-  data-first is unsafe for vector freshness, so we embed **before** the single
-  upsert (step 5 before 7); if embedding fails we surface the error and do not
-  write a half-updated doc.
+- Fallible steps return `Result<_, E>` and use `?` (no `unwrap`/`expect` outside
+  tests).
+- Idempotent on replay via M1.
+- Embed **before** the single upsert; on embedding failure, surface the error and
+  never write a half-updated doc (text without a fresh vector).
 
 ---
 
 ## 5. `DataLakeIndex` container + two-tier retrieval
 
 ### 5.1 Rationale
-The DataLake raw text can grow large and is best queried analytically. We keep
-Cosmos lean by storing only a small semantic index there and offloading raw
-retrieval to the DataLake **SQL endpoint** (Synapse Serverless SQL over the
-Cosmos analytical store, or Microsoft Fabric mirroring).
+DataLake raw text grows and is best queried analytically. Keep Cosmos lean: store
+only a small semantic index, offload raw retrieval to the DataLake SQL endpoint
+(stubbed this phase).
 
 ### 5.2 Container definition
 - **Name:** `DataLakeIndex`
-- **Partition key:** `/entity` (mirrors the source DataLake's business key).
-  **Open question (Q3):** confirm `/entity` vs `/userId` to match whichever
-  DataLake (`GaiaDataLake` vs `UsersDataLake`) feeds it, or hold both with a
-  `source` discriminator.
+- **Partition key:** `/entity` — identical to `GaiaDataLake` (Decision Q3).
+- **Fed from:** `GaiaDataLake` (`source` field leaves room for `UsersDataLake`).
 - **Document shape:**
   ```jsonc
   {
-    "id": "threadkeeper_20260627",        // == recordName
-    "recordName": "threadkeeper_20260627",
-    "entity": "threadkeeper",             // partition key
+    "id": "GaiaDataLake|threadkeeper|2026-06-27",  // SAME id as the source row
+    "entity": "threadkeeper",                       // partition key
     "date": "2026-06-27",
-    "source": "GaiaDataLake",             // which DataLake the raw row lives in
-    "indexVector": [/* 768 float32 */],   // half-size cosine embedding
-    "_ts": 0                               // Cosmos system timestamp
+    "source": "GaiaDataLake",
+    "indexVector": [/* 768 float32 */]              // truncated+renormalized 1536-d embedding
   }
   ```
-- **No raw `data`** is stored here — only enough to find and fetch the raw row.
-- **Vector index:** DiskANN cosine on `/indexVector`, `dimensions: 768`.
+- No raw `data` here. **Vector index:** DiskANN cosine on `/indexVector`,
+  `dimensions: 768`.
 
-### 5.3 Half-size embedding (768-d)
-- `text-embedding-3-large` supports the `dimensions` request parameter, so we
-  request `768` for index vectors (vs `1536` for KB/Diary in-place vectors).
-- Implementation note for scaffolding phase: add either
-  `EmbeddingClient::embed_with_dimensions(text, dims)` or construct a second
-  `EmbeddingClient` configured to 768. Recommendation: a per-call override so a
-  single client serves both sizes. (`COSMOS_VECTOR_DIMS` stays 1536; a new
-  `DATALAKE_INDEX_VECTOR_DIMS=768` env var configures the index size.)
+### 5.3 The 768-d vector: truncate + re-normalize (Decision Q5)
+`text-embedding-3-large` is a Matryoshka model, so semantic mass concentrates in
+the earliest dimensions. To get the index vector:
+
+1. **Truncate** — take the first 768 components of the 1536-d embedding.
+2. **Re-normalize** — the slice is no longer unit-length, and cosine similarity
+   assumes unit vectors, so rescale:
+   `norm = sqrt(Σ x_i²)` over the 768 kept components; `v[i] = slice[i] / norm`.
+
+```
+full_1536 = [ x0 … x767 | x768 … x1535 ]   (length 1.0)
+slice_768 = full_1536[0..768]
+norm      = sqrt(sum(slice_768[i]^2))
+v768      = [ slice_768[i] / norm ]         (length 1.0 again)
+```
+
+One embedding call serves both the 1536-d row vector and the 768-d index vector.
+Implemented as a pure, unit-tested helper `truncate_and_renormalize(&[f32], 768)`.
+A new env var `DATALAKE_INDEX_VECTOR_DIMS=768` documents the size (default 768).
 
 ### 5.4 Keeping the index in sync
-On every DataLake daily upsert (§4.1 step 8):
-```
-update_data_lake_index(entity, today, full_day_text):
-    record_name = f"{entity}_{yyyyMMdd(today)}"
-    vec768 = embedder.embed_with_dimensions(full_day_text, 768)
-    index_doc = { id: record_name, recordName, entity, date, source, indexVector: vec768 }
-    cosmos.upsert("DataLakeIndex", entity, &index_doc)   # blind upsert is fine; whole doc is small
-```
-The index always reflects the current full-day text (the index vector is
-recomputed from the same `full_day_text` used for the raw record).
+Updated inline in the DataLake write (§4.1 step 8) from the same embedding, so
+the index always matches the raw row.
 
 ### 5.5 Retrieval flow (read path)
 ```
-1. query_vec768 = embedder.embed_with_dimensions(user_query, 768)
+1. q1536 = embedder.embed(user_query)
+   q768  = truncate_and_renormalize(q1536, 768)
 2. hits = cosmos.query("DataLakeIndex", entity,
-        "SELECT TOP @k c.recordName, c.date, c.source
+        "SELECT TOP @k c.id, c.date, c.source
          FROM c
          WHERE c.entity = @pk AND IS_DEFINED(c.indexVector)
          ORDER BY VectorDistance(c.indexVector, @queryVector, false,
                   {distanceFunction:'Cosine',dataType:'Float32'})",
         params)                                   # cheap: small vectors, small container
-3. record_names = hits.map(recordName)
-4. raw_rows = datalake_sql.fetch(record_names)    # Synapse/Fabric SQL endpoint, §5.6
+3. ids = hits.map(id)
+4. raw_rows = datalake_sql.fetch(ids)             # STUBBED this phase (§5.6)
 5. hand raw_rows to LLM Call 2 as Response Data Context
 ```
-This mirrors the existing semantic-query conventions in
-`rust/src/prompt.rs` (`VectorDistance`, `IS_DEFINED`, partition-pinned `@pk`).
+Mirrors existing conventions in `rust/src/prompt.rs` (`VectorDistance`,
+`IS_DEFINED`, partition-pinned `@pk`).
 
-### 5.6 DataLake SQL endpoint contract
-- Source of truth for raw rows: the DataLake (`GaiaDataLake`/`UsersDataLake`)
-  surfaced via **Synapse Serverless SQL** over Cosmos analytical store, or
-  **Fabric** mirroring of the Cosmos container.
-- Gaia fetches by key: `SELECT data, date FROM datalake WHERE recordName IN (...)`.
-- **Open question (Q4):** which endpoint (Synapse Serverless vs Fabric), its
-  connection/auth (SQL auth vs AAD), and the Rust SQL driver (e.g. `tiberius`).
-  This pulls in a new dependency and must clear the repo's supply-chain bar
-  (`cargo deny`/`cargo audit`); to be justified in the scaffolding PR.
-
----
-
-## 6. API version / Patch consideration
-- Sticking with blind read-modify-write (Option A) means **no API-version bump
-  is required**; `2018-12-31` is sufficient.
-- If we later adopt Cosmos Patch (Option B) for non-embedded appends, bump to
-  `2020-07-15`+. Tracked as a future optimization, not in scope now.
+### 5.6 DataLake SQL endpoint contract — STUBBED (Decision Q4)
+- Endpoint not provisioned yet. Define a trait
+  `DataLakeRawStore { fn fetch(&self, ids: &[String]) -> Result<Vec<RawRow>, _> }`
+  and ship a **stub** (e.g. read back from `GaiaDataLake` by `id`, or return a
+  marked placeholder) so the flow is exercisable.
+- **No SQL driver dependency added this phase.** A real impl (Synapse/Fabric)
+  later replaces the stub behind the same trait; any new dependency (e.g.
+  `tiberius`) must clear `cargo audit` / `cargo deny`.
 
 ---
 
-## 7. Proposed module layout (for the scaffolding phase)
-Following the repo's "one type per file" + readable-`main` conventions:
+## 6. API version
+- Option A needs **no API-version bump**; `2018-12-31` suffices. A future
+  Patch-based optimization would require `2020-07-15`+ (out of scope).
 
-| New file | Type | Responsibility |
-|----------|------|----------------|
-| `rust/src/record_writer.rs` | `RecordWriter` | The generic append-and-re-embed upsert (§4); owns a `CosmosClient` + `EmbeddingClient`. |
-| `rust/src/data_lake_index.rs` | `DataLakeIndex` | Build/sync index docs and run the §5.5 semantic query. |
-| `rust/src/data_lake_sql.rs` | `DataLakeSqlClient` | Fetch raw rows by `recordName` from Synapse/Fabric (§5.6). |
-| (edit) `rust/src/storage.rs` | `Record` | Add `record_name` field (§3). |
-| (edit) `rust/src/embeddings.rs` | `EmbeddingClient` | Add per-call `dimensions` override (§5.3). |
-| (edit) `rust/src/cosmos.rs` | `CosmosClient` | (Maybe) a typed cross-`Record`/index upsert helper. |
-| (edit) `rust/src/main.rs` / engine push pass | — | Wire `RecordWriter` into the write path that currently only emits `actions.json`. |
+---
+
+## 7. Proposed module layout (scaffolding phase)
+"One type per file" + readable-`main`:
+
+| File | Type | Responsibility |
+|------|------|----------------|
+| `rust/src/record_writer.rs` | `RecordWriter` | Generic append-and-re-embed upsert (§4); owns `CosmosClient` + `EmbeddingClient`; computes the daily `id`. |
+| `rust/src/data_lake_index.rs` | `DataLakeIndex` | Build/sync index docs (§5.4), run the §5.5 query, host `truncate_and_renormalize`. |
+| `rust/src/data_lake_raw_store.rs` | `DataLakeRawStore` (trait) + `StubRawStore` | The §5.6 stubbed raw-fetch contract. |
+| (edit) `rust/src/embeddings.rs` | `EmbeddingClient` | (Optional) place `truncate_and_renormalize` here; no size change needed. |
+| (edit) `rust/src/engine.rs` / push pass | — | **Wire `RecordWriter` into the engine push pass** (Decision Q8). |
+
+No change to `Record`'s fields is required.
 
 ---
 
 ## 8. Migration of existing rows (follow-up)
-- 65 existing snapshot rows lack `recordName`. A one-shot backfill
-  (`migrations/`) will set `recordName = {entity}_{yyyyMMdd(date)}` and, for the
-  DataLake rows, populate `DataLakeIndex` with 768-d vectors.
-- Backfill is **idempotent** (recompute from `date`) and safe to re-run.
+- The 31 `GaiaDataLake` rows already have a 1536-d `dataVector` but no
+  `DataLakeIndex` entry. A one-shot, **idempotent** backfill (`migrations/`)
+  derives the 768-d vector from each existing 1536-d vector (truncate +
+  re-normalize — no re-embedding) and writes the index docs.
+- Other writer containers keep their existing 1536-d vectors; no key change since
+  we reuse the existing `id`.
 
 ---
 
 ## 9. Testing plan (per repo standards — every logic path covered)
-- **Unit (in each new module's `#[cfg(test)] mod tests`):**
-  - `recordName` formatting (entity + UTC date, padding, month/day edges).
-  - Append semantics: empty→first chunk; existing→appended; idempotent replay
-    (M1 hash skip).
-  - "needs in-place vector" decision per container (KB/Diary yes; DataLake no;
-    Connections excluded).
-  - Index doc construction (768-d length, `id == recordName`, no raw `data`).
-  - Semantic query string builder (partition-pinned, `IS_DEFINED`, `TOP`).
+- **Unit:**
+  - Daily `id` construction (`{container}|{entity}|{yyyy-MM-dd}`, UTC, padding).
+  - Append: empty→first; existing→appended; timestamp prefix; idempotent replay.
+  - `truncate_and_renormalize`: length 768, unit norm, deterministic.
+  - Index doc construction (`id == source id`, `/entity` PK, no raw `data`).
+  - Semantic query builder (partition-pinned, `IS_DEFINED`, `TOP`).
+  - `StubRawStore::fetch` returns rows for known ids, empties for unknown.
 - **Integration (`tests/`):**
-  - Round-trip against a mock/stub Cosmos (existing tests stub HTTP) — read,
-    append, re-embed, write back, then re-read shows appended text + fresh
-    vector.
-  - DataLakeIndex sync stays consistent with the DataLake record.
-- Coverage must keep `cargo llvm-cov --fail-under-lines 80` green.
+  - Round-trip on the HTTP-stub Cosmos: read → append → re-embed → write back;
+    re-read shows appended text + fresh vector.
+  - DataLake write produces a consistent 768-d `DataLakeIndex` doc.
+  - Engine push pass performs the live upsert (wired path).
+- Keep `cargo llvm-cov --fail-under-lines 80` green.
 
 ---
 
 ## 10. Acceptance criteria
-1. A documented, tested `RecordWriter::upsert_daily` performing read → append →
-   re-embed → write back with `recordName = {entity}_{yyyyMMdd}`.
-2. Embeddings stay current for KB/Diary (in-place 1536-d) and for DataLake (via
-   768-d `DataLakeIndex`).
-3. `DataLakeIndex` container defined, synced on every DataLake write, and
-   queryable by vector similarity returning `recordName`s.
-4. A defined (even if stubbed initially) path to fetch raw rows by `recordName`
-   from the DataLake SQL endpoint.
-5. `cargo fmt`, `cargo clippy -D warnings`, `cargo test`, and coverage gate all
-   pass.
-6. No new unjustified dependencies; any SQL driver clears `cargo audit` /
-   `cargo deny`.
+1. `RecordWriter::upsert_daily` does read → append → re-embed → write back, keyed
+   by the existing `id`, for the five writer containers.
+2. KB/Diary and both DataLakes keep a current in-place 1536-d `dataVector`;
+   `GaiaDataLake` writes also sync a 768-d `DataLakeIndex` doc derived from the
+   same embedding.
+3. `DataLakeIndex` (partition `/entity`) is queryable by vector similarity and
+   returns source `id`s.
+4. A **stubbed** `DataLakeRawStore` fetches raw rows by `id`, no SQL driver added.
+5. `RecordWriter` is wired into the engine push pass and performs live writes.
+6. `cargo fmt`, `cargo clippy -D warnings`, `cargo test`, and the coverage gate
+   all pass; no new unjustified dependencies.
 
 ---
 
-*See `OPEN_QUESTIONS.md` for the decisions blocking scaffolding.*
+*All decisions recorded in `DECISIONS.md`.*

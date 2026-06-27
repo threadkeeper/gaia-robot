@@ -1,0 +1,734 @@
+//! The [`WriteDataController`]: Gaia's shared **write pass** (daily persistence).
+//!
+//! This module is the single source of truth for the *persistence* half of a
+//! turn. Where the [`crate::pull_data_controller`] runs LLM Call 1's retrieval
+//! and the [`crate::push_data_controller`] audits LLM Call 2's planned side
+//! effects, this controller actually **writes** Gaia's per-day snapshot records
+//! back to Cosmos with the lowest reasonable overhead:
+//!
+//! 1. **Read** today's record for `(container, entity)` by its deterministic
+//!    daily id (a single ~1 RU point read).
+//! 2. **Append** the new turn chunk to the day's plain-text log.
+//! 3. **Re-embed** the whole day's text once (1536-d), so the stored
+//!    `dataVector` is always current.
+//! 4. **Write back** the document with a single upsert.
+//! 5. For `GaiaDataLake`, also **sync** a small [`DataLakeIndex`] entry that
+//!    stores only the id plus a half-size (768-d) vector *derived* from the same
+//!    embedding (truncate + re-normalize — no second embedding call).
+//!
+//! The design (and every resolved decision behind it) is written up in the
+//! repository's `Data/` folder. Crucially, both the live cloud app
+//! ([`crate::engine::Engine`], once wired) and the **data-persistence self-test**
+//! ([`crate::test_data_persistance`]) drive this same controller, so the two can
+//! never drift apart: the test exercises the exact code that runs in production.
+
+// Several public items below (the raw-store trait/stub, some helpers) are part
+// of the scaffolded write/retrieve surface and are not all wired into the engine
+// yet. Mirrors the `#![allow(dead_code)]` already used in `crate::storage`.
+#![allow(dead_code)]
+
+use std::fmt;
+use std::fmt::Write as _;
+
+use serde::Serialize;
+
+use crate::cosmos::{CosmosClient, CosmosError};
+use crate::embeddings::{EmbeddingClient, EmbeddingError};
+use crate::storage::{Record, RecordKind};
+
+/// The Cosmos container that holds the small DataLake semantic index.
+pub const DATALAKE_INDEX_CONTAINER: &str = "DataLakeIndex";
+
+/// The DataLake container whose writes also feed [`DATALAKE_INDEX_CONTAINER`].
+pub const DATALAKE_CONTAINER: &str = "GaiaDataLake";
+
+/// The default dimensionality of the derived `DataLakeIndex` vector (half of the
+/// 1536-d source embedding). Overridable via `DATALAKE_INDEX_VECTOR_DIMS`.
+pub const DEFAULT_INDEX_DIMS: usize = 768;
+
+/// The snapshot containers the writer is allowed to append-and-re-embed into.
+///
+/// `GaiaConnections` (an append-only ledger) and `GaiaWebSearchHistory` (an
+/// audit log) are deliberately excluded — see the `Data/` spec, Decision Q6.
+pub const WRITER_CONTAINERS: [&str; 5] = [
+    "GaiaKB",
+    "UsersKB",
+    "GaiaDataLake",
+    "UsersDataLake",
+    "GaiaDiary",
+];
+
+/// What a single [`WriteDataController::upsert_daily`] call ended up doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteAction {
+    /// No record existed for this day; a new one was created.
+    Created,
+    /// A record already existed; the new chunk was appended to it.
+    Appended,
+    /// The append produced no change (idempotent replay); nothing was written.
+    Unchanged,
+}
+
+impl WriteAction {
+    /// A short lowercase label for reports and artifacts.
+    pub fn label(self) -> &'static str {
+        match self {
+            WriteAction::Created => "created",
+            WriteAction::Appended => "appended",
+            WriteAction::Unchanged => "unchanged",
+        }
+    }
+}
+
+/// A structured summary of one daily write, returned so callers (the engine and
+/// the self-test) can report exactly what happened without re-deriving it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriteOutcome {
+    /// The container that was written, e.g. `GaiaDataLake`.
+    pub container: String,
+    /// The deterministic daily id, e.g. `GaiaDataLake|threadkeeper|2026-06-27`.
+    pub id: String,
+    /// Whether the record was created, appended to, or left unchanged.
+    pub action: WriteAction,
+    /// The size in bytes of the day's full text after the append.
+    pub data_bytes: usize,
+    /// The dimensionality of the in-place `dataVector` that was written
+    /// (`0` when the write was skipped as unchanged).
+    pub vector_dims: usize,
+    /// `true` when a `DataLakeIndex` entry was also written this call.
+    pub index_synced: bool,
+    /// The dimensionality of the derived index vector (`0` when not synced).
+    pub index_dims: usize,
+}
+
+/// Errors that can occur while persisting a record.
+#[derive(Debug)]
+pub enum WriteError {
+    /// The target container is not one of [`WRITER_CONTAINERS`].
+    NotWriterContainer(String),
+    /// The controller has no Cosmos and/or embedding client configured.
+    Offline,
+    /// A Cosmos read or write failed.
+    Cosmos(CosmosError),
+    /// Computing the embedding failed.
+    Embedding(EmbeddingError),
+}
+
+impl fmt::Display for WriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteError::NotWriterContainer(name) => {
+                write!(f, "'{name}' is not a writer-enabled container")
+            }
+            WriteError::Offline => write!(
+                f,
+                "write pass is offline (Cosmos and/or embedding client not configured)"
+            ),
+            WriteError::Cosmos(err) => write!(f, "Cosmos write failed: {err}"),
+            WriteError::Embedding(err) => write!(f, "embedding failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for WriteError {}
+
+impl From<CosmosError> for WriteError {
+    fn from(err: CosmosError) -> Self {
+        WriteError::Cosmos(err)
+    }
+}
+
+impl From<EmbeddingError> for WriteError {
+    fn from(err: EmbeddingError) -> Self {
+        WriteError::Embedding(err)
+    }
+}
+
+/// The on-the-wire shape of a `DataLakeIndex` document.
+///
+/// It stores only enough to find and re-fetch the raw row: the source id, the
+/// partition (`entity`), the day, the originating container, and the half-size
+/// vector. It deliberately carries **no** `data` body.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct DataLakeIndexDoc {
+    /// Same id as the source DataLake row (1:1 mapping).
+    id: String,
+    /// Partition key — identical to `GaiaDataLake`'s `/entity`.
+    entity: String,
+    /// The record day (`YYYY-MM-DD`).
+    date: String,
+    /// Which DataLake the raw row lives in, e.g. `GaiaDataLake`.
+    source: String,
+    /// The truncated + re-normalized half-size embedding.
+    #[serde(rename = "indexVector")]
+    index_vector: Vec<f32>,
+}
+
+/// Gaia's shared daily-write controller.
+///
+/// Holds the same optional clients the engine uses; when either is absent the
+/// controller is "offline" and [`upsert_daily`](WriteDataController::upsert_daily)
+/// returns [`WriteError::Offline`] rather than silently dropping data.
+#[derive(Debug, Clone)]
+pub struct WriteDataController {
+    cosmos: Option<CosmosClient>,
+    embedder: Option<EmbeddingClient>,
+    index_dims: usize,
+}
+
+impl WriteDataController {
+    /// Build a controller from explicit parts (used by the engine and tests).
+    pub fn new(
+        cosmos: Option<CosmosClient>,
+        embedder: Option<EmbeddingClient>,
+        index_dims: usize,
+    ) -> Self {
+        Self {
+            cosmos,
+            embedder,
+            index_dims,
+        }
+    }
+
+    /// Build a controller from the environment.
+    ///
+    /// Reuses [`CosmosClient::from_env`] and [`EmbeddingClient::from_env`] so the
+    /// write pass shares the exact configuration as the rest of dev/local mode.
+    /// The index vector size comes from `DATALAKE_INDEX_VECTOR_DIMS` (default
+    /// [`DEFAULT_INDEX_DIMS`]).
+    pub fn from_env() -> Result<Self, WriteError> {
+        let cosmos = CosmosClient::from_env().map_err(WriteError::Cosmos)?;
+        let embedder = EmbeddingClient::from_env().map_err(WriteError::Embedding)?;
+        let index_dims = crate::llm::value_from_env("DATALAKE_INDEX_VECTOR_DIMS")
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|dims| *dims > 0)
+            .unwrap_or(DEFAULT_INDEX_DIMS);
+        Ok(Self::new(cosmos, embedder, index_dims))
+    }
+
+    /// `true` when both a Cosmos and an embedding client are configured.
+    pub fn is_online(&self) -> bool {
+        self.cosmos.is_some() && self.embedder.is_some()
+    }
+
+    /// Read back a written daily [`Record`] for verification (used by the
+    /// self-test). Returns `Ok(None)` when the record does not exist.
+    pub fn read_record(
+        &self,
+        container: &str,
+        entity: &str,
+        id: &str,
+    ) -> Result<Option<Record>, WriteError> {
+        let cosmos = self.cosmos.as_ref().ok_or(WriteError::Offline)?;
+        Ok(cosmos.get(container, entity, id)?)
+    }
+
+    /// Read back the length of a `DataLakeIndex` entry's `indexVector`, or
+    /// `Ok(None)` when no index document exists for `id` (used by the self-test
+    /// to confirm the half-size vector was synced).
+    pub fn read_index_vector_len(
+        &self,
+        entity: &str,
+        id: &str,
+    ) -> Result<Option<usize>, WriteError> {
+        Ok(self.read_index_vector(entity, id)?.map(|v| v.len()))
+    }
+
+    /// Read back a `DataLakeIndex` entry's full `indexVector`, or `Ok(None)` when
+    /// no index document exists for `id`.
+    ///
+    /// Returns the actual `f32` components (not just the length) so callers — the
+    /// persistence self-test in particular — can verify the synced half-size
+    /// vector is *sound*: correctly sized, finite, and unit-normalized by the
+    /// Matryoshka truncation step.
+    pub fn read_index_vector(
+        &self,
+        entity: &str,
+        id: &str,
+    ) -> Result<Option<Vec<f32>>, WriteError> {
+        let cosmos = self.cosmos.as_ref().ok_or(WriteError::Offline)?;
+        let value = cosmos.get_value(DATALAKE_INDEX_CONTAINER, entity, id)?;
+        Ok(value.and_then(|doc| {
+            doc.get("indexVector")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|n| n.as_f64().map(|f| f as f32))
+                        .collect()
+                })
+        }))
+    }
+
+    /// Append `chunk` to today's record for `(container, entity)`, refresh its
+    /// embedding, and write it back — creating the record on the first write of
+    /// the day. For `GaiaDataLake`, also sync the `DataLakeIndex` entry.
+    ///
+    /// `now_rfc3339` is the current instant as `YYYY-MM-DDTHH:MM:SSZ` (pass
+    /// [`crate::prompt::now_rfc3339`] in production; a fixed value in tests). The
+    /// date portion keys the record; the time portion stamps the appended line.
+    pub fn upsert_daily(
+        &self,
+        container: &str,
+        entity: &str,
+        now_rfc3339: &str,
+        chunk: &str,
+    ) -> Result<WriteOutcome, WriteError> {
+        if !is_writer_container(container) {
+            return Err(WriteError::NotWriterContainer(container.to_string()));
+        }
+        // Both clients are required to persist a fresh, embedded record.
+        let (cosmos, embedder) = match (self.cosmos.as_ref(), self.embedder.as_ref()) {
+            (Some(cosmos), Some(embedder)) => (cosmos, embedder),
+            _ => return Err(WriteError::Offline),
+        };
+
+        let (date, time_marker) = split_rfc3339(now_rfc3339);
+        let id = daily_id(container, entity, date);
+
+        // 1. Read today's record (cheap point read), if it exists.
+        let existing = cosmos.get(container, entity, &id)?;
+        let previous_data = existing
+            .as_ref()
+            .map(|r| r.data.clone())
+            .unwrap_or_default();
+        let previous_hash = existing
+            .as_ref()
+            .and_then(|r| r.metadata.get(CONTENT_HASH_KEY).cloned());
+        let created = existing.is_none();
+
+        // 2. Append the new chunk to the day's plain-text log.
+        let new_data = append_timestamped(&previous_data, chunk, time_marker);
+        let new_hash = content_hash(&new_data);
+
+        // M1: idempotent replay — identical content, nothing to do.
+        if Some(&new_hash) == previous_hash.as_ref() {
+            return Ok(WriteOutcome {
+                container: container.to_string(),
+                id,
+                action: WriteAction::Unchanged,
+                data_bytes: new_data.len(),
+                vector_dims: 0,
+                index_synced: false,
+                index_dims: 0,
+            });
+        }
+
+        // 3. Re-embed the whole day's text once (1536-d).
+        let full_vector = embedder.embed(&new_data)?;
+
+        // 4. Write the record back with the refreshed vector + content hash.
+        let record = build_record(
+            container,
+            entity,
+            date,
+            &id,
+            &new_data,
+            full_vector.clone(),
+            &new_hash,
+        );
+        cosmos.upsert(container, entity, &record)?;
+
+        // 5. For the DataLake, sync the half-size index entry (derived locally).
+        let mut index_synced = false;
+        let mut index_dims = 0;
+        if container == DATALAKE_CONTAINER {
+            let index_vector = truncate_and_renormalize(&full_vector, self.index_dims);
+            index_dims = index_vector.len();
+            let index_doc = DataLakeIndexDoc {
+                id: id.clone(),
+                entity: entity.to_string(),
+                date: date.to_string(),
+                source: container.to_string(),
+                index_vector,
+            };
+            cosmos.upsert_doc(DATALAKE_INDEX_CONTAINER, entity, &index_doc)?;
+            index_synced = true;
+        }
+
+        Ok(WriteOutcome {
+            container: container.to_string(),
+            id,
+            action: if created {
+                WriteAction::Created
+            } else {
+                WriteAction::Appended
+            },
+            data_bytes: new_data.len(),
+            vector_dims: full_vector.len(),
+            index_synced,
+            index_dims,
+        })
+    }
+}
+
+// --- Pure helpers (no network) ----------------------------------------------
+
+/// The `metadata` key under which the daily content hash is stored, enabling the
+/// idempotent-replay (M1) skip.
+const CONTENT_HASH_KEY: &str = "contentHash";
+
+/// `true` when `container` is one of the append-and-re-embed [`WRITER_CONTAINERS`].
+pub fn is_writer_container(container: &str) -> bool {
+    WRITER_CONTAINERS.contains(&container)
+}
+
+/// `true` for the user-partitioned (`/userId`) snapshot containers.
+///
+/// The `Users*` containers partition on `/userId`; the `Gaia*` containers
+/// partition on `/entity`. This decides which field on the [`Record`] carries
+/// the business key so the document matches its partition header.
+pub fn is_user_partitioned(container: &str) -> bool {
+    container.starts_with("Users")
+}
+
+/// Build the deterministic daily id `{container}|{entity}|{date}`.
+///
+/// `date` must already be `YYYY-MM-DD`. This mirrors the id convention already
+/// present on the live snapshot rows, so the writer reuses (not replaces) it.
+pub fn daily_id(container: &str, entity: &str, date: &str) -> String {
+    format!("{container}|{entity}|{date}")
+}
+
+/// Split an RFC-3339 instant `YYYY-MM-DDTHH:MM:SSZ` into its `(date, time)`
+/// halves: the `YYYY-MM-DD` day and the `HH:MM:SSZ` time-of-day marker.
+///
+/// Falls back gracefully if the input is shorter than expected, so a malformed
+/// timestamp can never panic the write path.
+fn split_rfc3339(now_rfc3339: &str) -> (&str, &str) {
+    match now_rfc3339.split_once('T') {
+        Some((date, time)) => (date, time),
+        None => (now_rfc3339, ""),
+    }
+}
+
+/// Append `chunk` to a day's plain-text log as a new time-stamped line.
+///
+/// The first write of the day seeds the log with `[<time>] <chunk>`; later
+/// writes append `\n\n[<time>] <chunk>` so the record stays a readable,
+/// chronologically-ordered transcript that embeds cleanly.
+pub fn append_timestamped(existing: &str, chunk: &str, time_marker: &str) -> String {
+    let line = format!("[{time_marker}] {chunk}");
+    if existing.is_empty() {
+        line
+    } else {
+        format!("{existing}\n\n{line}")
+    }
+}
+
+/// Derive a smaller unit-length vector from a Matryoshka embedding.
+///
+/// `text-embedding-3-large` packs the most important meaning into the earliest
+/// dimensions, so a valid `dims`-length embedding is the first `dims` components
+/// **re-normalized** to unit length (cosine similarity assumes unit vectors).
+/// If the input is shorter than `dims` the whole input is used; a zero-length
+/// slice is returned unchanged to avoid dividing by zero.
+pub fn truncate_and_renormalize(vector: &[f32], dims: usize) -> Vec<f32> {
+    let take = dims.min(vector.len());
+    let slice = &vector[..take];
+    let norm = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm == 0.0 {
+        return slice.to_vec();
+    }
+    slice.iter().map(|x| x / norm).collect()
+}
+
+/// Compute a stable hex SHA-1 of `data`, used only as a change detector (never
+/// for security). Identical text yields an identical hash, enabling the M1
+/// idempotent-replay skip.
+fn content_hash(data: &str) -> String {
+    let digest = crate::sha1::digest(data.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        // Writing to a String is infallible, so the result can be ignored.
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Build the [`Record`] to upsert for a daily write, placing the business key in
+/// the correct partition field and stamping the content hash into `metadata`.
+fn build_record(
+    container: &str,
+    entity: &str,
+    date: &str,
+    id: &str,
+    data: &str,
+    data_vector: Vec<f32>,
+    content_hash: &str,
+) -> Record {
+    let user_partitioned = is_user_partitioned(container);
+    let kind = if container.contains("DataLake") {
+        RecordKind::DataLake
+    } else {
+        RecordKind::KnowledgeBase
+    };
+    let (entity_id, user_id) = if user_partitioned {
+        ("", entity)
+    } else {
+        (entity, "")
+    };
+    let mut record = Record::new(id, entity_id, user_id, date, kind, data, data_vector);
+    record
+        .metadata
+        .insert(CONTENT_HASH_KEY.to_string(), content_hash.to_string());
+    record
+}
+
+// --- DataLake raw store (stubbed this phase, see Data/ spec §5.6) ------------
+
+/// One raw DataLake row as returned by the raw store.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawRow {
+    /// The source id, e.g. `GaiaDataLake|threadkeeper|2026-06-27`.
+    pub id: String,
+    /// The record day (`YYYY-MM-DD`).
+    pub date: String,
+    /// The full raw text body.
+    pub data: String,
+}
+
+/// Fetch raw DataLake rows by id.
+///
+/// In production this will hit the DataLake **SQL endpoint** (Synapse Serverless
+/// / Microsoft Fabric). That endpoint is not provisioned yet (Decision Q4), so
+/// the only implementation today is [`StubRawStore`], which reads the rows back
+/// out of Cosmos. The trait keeps the rest of the retrieval flow stable while
+/// the real backend is built behind it.
+pub trait DataLakeRawStore {
+    /// Return the raw rows for `ids`, skipping any that cannot be found.
+    fn fetch(&self, ids: &[String]) -> Result<Vec<RawRow>, WriteError>;
+}
+
+/// A stand-in [`DataLakeRawStore`] that reads raw rows straight from Cosmos.
+///
+/// It derives each row's partition from its id (`{container}|{entity}|{date}`)
+/// and point-reads it, so the two-tier retrieval flow is fully exercisable with
+/// no SQL driver dependency.
+#[derive(Debug, Clone)]
+pub struct StubRawStore {
+    cosmos: Option<CosmosClient>,
+}
+
+impl StubRawStore {
+    /// Build a stub store over an optional Cosmos client.
+    pub fn new(cosmos: Option<CosmosClient>) -> Self {
+        Self { cosmos }
+    }
+}
+
+impl DataLakeRawStore for StubRawStore {
+    fn fetch(&self, ids: &[String]) -> Result<Vec<RawRow>, WriteError> {
+        let cosmos = self.cosmos.as_ref().ok_or(WriteError::Offline)?;
+        let mut rows = Vec::with_capacity(ids.len());
+        for id in ids {
+            // The id encodes its own partition: {container}|{entity}|{date}.
+            let Some((container, entity, _date)) = split_daily_id(id) else {
+                continue;
+            };
+            if let Some(record) = cosmos.get(container, entity, id)? {
+                rows.push(RawRow {
+                    id: record.record_id,
+                    date: record.date,
+                    data: record.data,
+                });
+            }
+        }
+        Ok(rows)
+    }
+}
+
+/// Split a daily id back into `(container, entity, date)`.
+///
+/// Returns `None` when the id is not the expected three-part, `|`-delimited
+/// shape, so a malformed id is skipped rather than panicking.
+fn split_daily_id(id: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = id.splitn(3, '|');
+    let container = parts.next()?;
+    let entity = parts.next()?;
+    let date = parts.next()?;
+    if container.is_empty() || entity.is_empty() || date.is_empty() {
+        return None;
+    }
+    Some((container, entity, date))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daily_id_joins_container_entity_and_date_with_pipes() {
+        let id = daily_id("GaiaDataLake", "threadkeeper", "2026-06-27");
+        assert_eq!(id, "GaiaDataLake|threadkeeper|2026-06-27");
+    }
+
+    #[test]
+    fn split_rfc3339_separates_date_and_time() {
+        let (date, time) = split_rfc3339("2026-06-27T09:34:29Z");
+        assert_eq!(date, "2026-06-27");
+        assert_eq!(time, "09:34:29Z");
+    }
+
+    #[test]
+    fn split_rfc3339_handles_missing_time() {
+        let (date, time) = split_rfc3339("2026-06-27");
+        assert_eq!(date, "2026-06-27");
+        assert_eq!(time, "");
+    }
+
+    #[test]
+    fn append_timestamped_seeds_then_appends() {
+        let first = append_timestamped("", "hello", "09:00:00Z");
+        assert_eq!(first, "[09:00:00Z] hello");
+
+        let second = append_timestamped(&first, "world", "10:30:00Z");
+        assert_eq!(second, "[09:00:00Z] hello\n\n[10:30:00Z] world");
+    }
+
+    #[test]
+    fn truncate_and_renormalize_yields_unit_length_half_vector() {
+        // 4-d input whose tail holds weight, truncated to 2-d.
+        let v = vec![0.6_f32, 0.0, 0.8, 0.0];
+        let out = truncate_and_renormalize(&v, 2);
+        assert_eq!(out.len(), 2);
+        let norm = out.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6, "expected unit norm, got {norm}");
+        // First component was the only weight, so it normalizes to 1.0.
+        assert!((out[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn truncate_and_renormalize_uses_all_when_shorter_than_dims() {
+        let v = vec![3.0_f32, 4.0];
+        let out = truncate_and_renormalize(&v, 768);
+        assert_eq!(out.len(), 2);
+        // 3-4-5 triangle -> normalized to (0.6, 0.8).
+        assert!((out[0] - 0.6).abs() < 1e-6);
+        assert!((out[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn truncate_and_renormalize_returns_zero_vector_unchanged() {
+        let v = vec![0.0_f32, 0.0, 0.0];
+        let out = truncate_and_renormalize(&v, 2);
+        assert_eq!(out, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn content_hash_is_stable_and_sensitive() {
+        let a = content_hash("same text");
+        let b = content_hash("same text");
+        let c = content_hash("different text");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(a.len(), 40); // 20-byte SHA-1 rendered as hex
+    }
+
+    #[test]
+    fn writer_container_membership_excludes_ledger_and_audit_log() {
+        assert!(is_writer_container("GaiaKB"));
+        assert!(is_writer_container("GaiaDataLake"));
+        assert!(is_writer_container("GaiaDiary"));
+        assert!(!is_writer_container("GaiaConnections"));
+        assert!(!is_writer_container("GaiaWebSearchHistory"));
+    }
+
+    #[test]
+    fn user_partitioning_follows_the_users_prefix() {
+        assert!(is_user_partitioned("UsersDataLake"));
+        assert!(is_user_partitioned("UsersKB"));
+        assert!(!is_user_partitioned("GaiaDataLake"));
+        assert!(!is_user_partitioned("GaiaKB"));
+    }
+
+    #[test]
+    fn build_record_places_key_in_the_right_partition_field() {
+        let gaia = build_record(
+            "GaiaKB",
+            "threadkeeper",
+            "2026-06-27",
+            "GaiaKB|threadkeeper|2026-06-27",
+            "body",
+            vec![0.1, 0.2],
+            "hash123",
+        );
+        assert_eq!(gaia.entity_id, "threadkeeper");
+        assert_eq!(gaia.user_id, "");
+        assert_eq!(
+            gaia.metadata.get("contentHash").map(String::as_str),
+            Some("hash123")
+        );
+
+        let users = build_record(
+            "UsersDataLake",
+            "threadkeeper",
+            "2026-06-27",
+            "UsersDataLake|threadkeeper|2026-06-27",
+            "body",
+            vec![0.1, 0.2],
+            "hash123",
+        );
+        assert_eq!(users.user_id, "threadkeeper");
+        assert_eq!(users.entity_id, "");
+        assert_eq!(users.kind, RecordKind::DataLake);
+    }
+
+    #[test]
+    fn data_lake_index_doc_serializes_to_the_expected_shape() {
+        let doc = DataLakeIndexDoc {
+            id: "GaiaDataLake|threadkeeper|2026-06-27".to_string(),
+            entity: "threadkeeper".to_string(),
+            date: "2026-06-27".to_string(),
+            source: "GaiaDataLake".to_string(),
+            index_vector: vec![0.5, 0.25],
+        };
+        let value = serde_json::to_value(&doc).unwrap();
+        assert_eq!(value["id"], "GaiaDataLake|threadkeeper|2026-06-27");
+        assert_eq!(value["entity"], "threadkeeper");
+        assert_eq!(value["date"], "2026-06-27");
+        assert_eq!(value["source"], "GaiaDataLake");
+        assert_eq!(value["indexVector"], serde_json::json!([0.5, 0.25]));
+        // No raw data body lives in the index.
+        assert!(value.get("data").is_none());
+        assert!(value.get("dataVector").is_none());
+    }
+
+    #[test]
+    fn split_daily_id_round_trips_and_rejects_malformed() {
+        let parts = split_daily_id("GaiaDataLake|threadkeeper|2026-06-27");
+        assert_eq!(parts, Some(("GaiaDataLake", "threadkeeper", "2026-06-27")));
+        assert_eq!(split_daily_id("no-pipes-here"), None);
+        assert_eq!(split_daily_id("Gaia||2026-06-27"), None);
+    }
+
+    #[test]
+    fn upsert_daily_rejects_non_writer_containers() {
+        let controller = WriteDataController::new(None, None, DEFAULT_INDEX_DIMS);
+        let err = controller
+            .upsert_daily(
+                "GaiaConnections",
+                "threadkeeper",
+                "2026-06-27T09:00:00Z",
+                "x",
+            )
+            .unwrap_err();
+        assert!(matches!(err, WriteError::NotWriterContainer(_)));
+    }
+
+    #[test]
+    fn upsert_daily_is_offline_without_clients() {
+        let controller = WriteDataController::new(None, None, DEFAULT_INDEX_DIMS);
+        let err = controller
+            .upsert_daily("GaiaKB", "threadkeeper", "2026-06-27T09:00:00Z", "x")
+            .unwrap_err();
+        assert!(matches!(err, WriteError::Offline));
+        assert!(!controller.is_online());
+    }
+
+    #[test]
+    fn stub_raw_store_is_offline_without_cosmos() {
+        let store = StubRawStore::new(None);
+        let err = store.fetch(&["GaiaDataLake|threadkeeper|2026-06-27".to_string()]);
+        assert!(matches!(err, Err(WriteError::Offline)));
+    }
+}
