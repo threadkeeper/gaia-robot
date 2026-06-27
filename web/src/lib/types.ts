@@ -101,6 +101,14 @@ export interface PushDebug {
   actions: PushActionTiming[];
 }
 
+/** Visible persistence status for the turn's mandatory Cosmos write-back. */
+export interface WriteStatus {
+  /** True when the turn was saved (or was an idempotent replay no-op). */
+  ok: boolean;
+  /** Confirmation on success (id, action, size), or the error detail on failure. */
+  detail: string;
+}
+
 /** One ordered operation event emitted by Gaia internals. */
 export interface OperationEvent {
   seq: number;
@@ -150,6 +158,8 @@ export interface ReplyResult {
   pullDebug?: PullDebug;
   /** Push-pass diagnostics (model, llm time, per-action type + time). */
   pushDebug?: PushDebug;
+  /** Mandatory Cosmos write-back status; surfaced visibly so failures aren't silent. */
+  write?: WriteStatus;
 }
 
 /** Subset of {@link ReplyResult} kept on a rendered message. */
@@ -172,6 +182,8 @@ export interface ReplyMeta {
   pullDebug?: PullDebug;
   /** Push-pass diagnostics (model, llm time, per-action type + time). */
   pushDebug?: PushDebug;
+  /** Mandatory Cosmos write-back status; surfaced visibly so failures aren't silent. */
+  write?: WriteStatus;
 }
 
 /** SSE event frames emitted by /v1/conversations/{conv_id}/stream. */

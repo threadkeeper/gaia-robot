@@ -105,7 +105,8 @@ function createConversation() {
             debug: result.debug,
             flow: result.flow,
             pullDebug: result.pullDebug,
-            pushDebug: result.pushDebug
+            pushDebug: result.pushDebug,
+            write: result.write
           }
         });
 

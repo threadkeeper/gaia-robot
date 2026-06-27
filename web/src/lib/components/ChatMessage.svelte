@@ -323,6 +323,24 @@
   </div>
 {/if}
 
+{#if !isUser && !message.error && message.meta?.write}
+  <!-- Always-visible (not debug-gated) banner for the mandatory Cosmos
+       write-back. A failure here is shown prominently in red so the user
+       knows persistence is broken, even though the answer itself is valid. -->
+  <div class="row">
+    <div
+      class="bubble write"
+      class:write-err={!message.meta.write.ok}
+      title="Cosmos write-back status for this turn"
+    >
+      <span class="write-head">
+        {message.meta.write.ok ? '✓ Saved to Cosmos' : '⚠ Cosmos write failed'}
+      </span>
+      <span class="write-body">{message.meta.write.detail}</span>
+    </div>
+  </div>
+{/if}
+
 <style>
   .row {
     display: flex;
@@ -363,6 +381,35 @@
     opacity: 0.7;
   }
   .actions-body {
+    white-space: pre-wrap;
+  }
+  /* Mandatory write-back banner. Success is a quiet confirmation; failure is
+     loud (red border + tint) per the requirement that write problems be
+     visible to the user rather than silently swallowed. */
+  .bubble.write {
+    background: transparent;
+    border-style: dashed;
+    box-shadow: none;
+    font-size: 0.85em;
+    opacity: 0.9;
+  }
+  .bubble.write.write-err {
+    border-color: var(--danger);
+    border-style: solid;
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    opacity: 1;
+  }
+  .write-head {
+    display: block;
+    font-weight: 600;
+    margin-bottom: 2px;
+    opacity: 0.7;
+  }
+  .bubble.write.write-err .write-head {
+    color: var(--danger);
+    opacity: 1;
+  }
+  .write-body {
     white-space: pre-wrap;
   }
   .error-text {

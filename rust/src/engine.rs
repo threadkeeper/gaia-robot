@@ -69,6 +69,29 @@ pub struct TurnResult {
     /// failed before producing a reply.
     #[serde(rename = "pushDebug", skip_serializing_if = "Option::is_none")]
     pub push_debug: Option<PushDebug>,
+    /// Persistence status for this turn's mandatory Cosmos write-back. Surfaced
+    /// to the user (not just the debug panel) so any failure to connect to
+    /// Cosmos or to write is impossible to miss. Present on every live turn that
+    /// produced a reply; omitted only in skeleton mode (no model, nothing to
+    /// persist) and when Call 2 failed before producing a reply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write: Option<WriteStatus>,
+}
+
+/// Visible persistence status for the turn's Cosmos write-back.
+///
+/// Serialized as the front end's `WriteStatus`. Writes are **mandatory**: when
+/// the write controller is missing/offline, or a Cosmos read/write fails, this
+/// carries `ok = false` and a human-readable `detail` the UI renders as a
+/// prominent error banner rather than a silent skip.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WriteStatus {
+    /// `true` when the turn was persisted (or was an idempotent replay no-op);
+    /// `false` when persistence was skipped (offline) or failed.
+    pub ok: bool,
+    /// Human-readable detail: a short confirmation on success (id, action,
+    /// size), or the underlying error on failure.
+    pub detail: String,
 }
 
 /// Debug diagnostics for the pull pass (LLM Call 1 + retrieval).
@@ -274,6 +297,8 @@ impl Engine {
                 actions_summary: None,
                 pull_debug: None,
                 push_debug: None,
+                // Skeleton mode persists nothing (no model, nothing to save).
+                write: None,
             };
         };
 
@@ -330,9 +355,10 @@ impl Engine {
                     .map(crate::push_data_controller::time_actions)
                     .unwrap_or_default();
                 // Persist this completed exchange to the user's personal data
-                // lake (append-and-re-embed). Best-effort: a write failure is
-                // logged but never changes the reply we return.
-                self.persist_turn(user_id, input, &push.reply_text, &requested_at);
+                // lake (append-and-re-embed). Writes are mandatory: the returned
+                // status is surfaced to the user so a Cosmos connection or write
+                // failure is visible rather than silently dropped.
+                let write = self.persist_turn(user_id, input, &push.reply_text, &requested_at);
                 TurnResult {
                     reply: push.reply_text,
                     verdict: "allow".to_string(),
@@ -352,6 +378,7 @@ impl Engine {
                         llm_ms: call2_ms,
                         actions: push_action_timings,
                     }),
+                    write: Some(write),
                 }
             }
             Err(err) => TurnResult {
@@ -373,6 +400,8 @@ impl Engine {
                     llm_ms: call2_ms,
                     actions: Vec::new(),
                 }),
+                // No reply was produced, so there is nothing to persist this turn.
+                write: None,
             },
         }
     }
@@ -427,7 +456,8 @@ impl Engine {
         (result.context, result.searches, actions)
     }
 
-    /// Persist a completed exchange to the user's personal data lake.
+    /// Persist a completed exchange to the user's personal data lake, returning
+    /// a [`WriteStatus`] the caller surfaces to the user.
     ///
     /// Appends a single `User: … / Gaia: …` chunk to today's `UsersDataLake`
     /// record for `user_id` through the shared [`WriteDataController`], which
@@ -435,21 +465,32 @@ impl Engine {
     /// it back (creating it on the first turn of the day). `user_id` is the
     /// `/userId` partition, so every write stays scoped to its owner.
     ///
-    /// This is deliberately **best-effort and infallible**, matching the rest of
-    /// the engine: when no writer is configured (skeleton/offline) it is a no-op,
-    /// and any write error is logged to stderr but never affects the reply. We
-    /// skip empty exchanges so we never store blank turns.
-    fn persist_turn(&self, user_id: &str, input: &str, reply: &str, now_rfc3339: &str) {
-        // Nothing to persist without a configured, online writer.
+    /// Writes are **mandatory**: unlike the rest of the engine's best-effort
+    /// degradation, a missing/offline writer or a Cosmos read/write failure is
+    /// reported back as `WriteStatus { ok: false, .. }` (and logged to stderr)
+    /// so the front end can show a visible error instead of silently losing the
+    /// turn. The reply text itself is never altered by a write failure.
+    fn persist_turn(
+        &self,
+        user_id: &str,
+        input: &str,
+        reply: &str,
+        now_rfc3339: &str,
+    ) -> WriteStatus {
+        // A missing or offline writer is a hard, visible error — not a silent
+        // skip — because persistence is required for every live turn.
         let Some(writer) = self.writer.as_ref() else {
-            return;
+            let detail = "Cosmos write-back is not configured (no Cosmos and/or embedding client)"
+                .to_string();
+            eprintln!("persist turn skipped for user {user_id}: {detail}");
+            return WriteStatus { ok: false, detail };
         };
         if !writer.is_online() {
-            return;
-        }
-        // Don't store blank turns (e.g. an empty input with a skeleton reply).
-        if input.is_empty() && reply.is_empty() {
-            return;
+            let detail =
+                "Cosmos write-back is offline (Cosmos and/or embedding client not connected)"
+                    .to_string();
+            eprintln!("persist turn skipped for user {user_id}: {detail}");
+            return WriteStatus { ok: false, detail };
         }
 
         // One readable line capturing both sides of the exchange. The controller
@@ -466,9 +507,20 @@ impl Engine {
                     outcome.data_bytes,
                     outcome.vector_dims,
                 );
+                WriteStatus {
+                    ok: true,
+                    detail: format!(
+                        "saved to Cosmos UsersDataLake: {} ({}, {} bytes)",
+                        outcome.id,
+                        outcome.action.label(),
+                        outcome.data_bytes,
+                    ),
+                }
             }
             Err(err) => {
-                eprintln!("persist turn failed for user {user_id}: {err}");
+                let detail = format!("Cosmos write failed: {err}");
+                eprintln!("persist turn failed for user {user_id}: {detail}");
+                WriteStatus { ok: false, detail }
             }
         }
     }
@@ -528,13 +580,18 @@ mod tests {
     }
 
     #[test]
-    fn persist_turn_is_a_safe_noop_without_a_writer() {
-        // The skeleton engine has no writer configured, so persisting a turn must
-        // be a safe no-op: it neither panics nor requires a Cosmos client.
+    fn persist_turn_reports_a_visible_error_without_an_online_writer() {
+        // Writes are mandatory: the skeleton engine has no writer configured, so
+        // persisting a turn must not silently skip. It returns a visible failure
+        // status (never panics) the front end can show to the user.
         let engine = Engine::new(None, None);
-        engine.persist_turn("alice", "hello", "hi alice", "2026-06-27T10:00:00Z");
-        // An all-empty exchange is skipped too (still no panic).
-        engine.persist_turn("", "", "", "2026-06-27T10:00:00Z");
+        let status = engine.persist_turn("alice", "hello", "hi alice", "2026-06-27T10:00:00Z");
+        assert!(!status.ok, "missing writer must report a failed write");
+        assert!(
+            status.detail.to_lowercase().contains("cosmos"),
+            "detail should name Cosmos, got: {}",
+            status.detail
+        );
     }
 
     #[test]
@@ -609,6 +666,15 @@ mod tests {
         // Both debug panels are populated when both calls succeed.
         assert!(result.pull_debug.is_some());
         assert!(result.push_debug.is_some());
+        // Persistence is mandatory and always reported. This test engine has no
+        // writer, so the status must be present and flag the missing Cosmos.
+        let write = result
+            .write
+            .expect("a completed turn always reports a write status");
+        assert!(
+            !write.ok,
+            "no writer configured, so the write must be reported as failed"
+        );
         handle.join().expect("mock server thread joins");
     }
 
