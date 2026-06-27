@@ -60,7 +60,6 @@ mod auth;
 mod base64;
 mod connection;
 mod cosmos;
-mod data_execution;
 mod diary;
 mod embeddings;
 mod engine;
@@ -68,13 +67,17 @@ mod executor;
 mod flow;
 mod http_request;
 mod http_response;
+mod json_repair;
 mod llm;
 mod prompt;
+mod pull_data_controller;
+mod push_data_controller;
 mod response_context;
 mod search_history;
 mod server;
 mod sha1;
 mod storage;
+mod test_data_execution;
 mod test_data_retrieval;
 mod web_search;
 mod websocket;
@@ -588,7 +591,7 @@ fn run_data_execution_test() -> ExitCode {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    let probe = match data_execution::DataExecutionProbe::from_env() {
+    let probe = match test_data_execution::DataExecutionProbe::from_env() {
         Ok(probe) => probe,
         Err(err) => {
             let _ = writeln!(out, "data-execution self-test cannot run: {err}");

@@ -1,55 +1,44 @@
-//! The [`DataExecutionProbe`] type: an end-to-end self-test of Gaia's push pass.
+//! The [`PushDataController`]: Gaia's shared **push pass** (LLM Call 2 side effects).
 //!
-//! This module powers the `gaia-robot test-data-execution` subcommand (and the
-//! `infra/DataExecution.ps1` wrapper). It is the **push-pass** counterpart to
-//! [`crate::test_data_retrieval`]: where the retrieval probe exercises LLM Call
-//! 1 (decide what to fetch and run the reads), this probe exercises **LLM Call
-//! 2** — answer the user and emit the side-effecting `actions.json`.
+//! This module is the single source of truth for the *answer-and-act* half of a
+//! turn. Where the [`crate::pull_data_controller`] runs LLM Call 1's retrieval,
+//! this controller owns everything around LLM Call 2:
 //!
-//! For each turn already captured under `tests/LLM1/t{N}/`, the probe:
+//! 1. **Prompt** — [`PushDataController::build_prompt`] assembles the focused
+//!    Call 2 prompt (Gaia's identity, the two-document contract, the WhatsApp
+//!    contact list, and the Edwino actuate format) from this turn's question and
+//!    grounding context.
+//! 2. **Processing** — [`PushDataController::process`] parses the raw Call 2
+//!    reply into its two documents (`response.json` + `actions.json`), extracts
+//!    the reply text, and **audits** the planned side effects (WhatsApp / Push /
+//!    Edwino actuate / the four store write-backs) into an [`ActionAudit`].
 //!
-//! 1. Reads that turn's `responsedatacontext.md` (the deterministic grounding
-//!    context assembled between Call 1 and Call 2) and the user's question.
-//! 2. Builds a focused Call 2 prompt that hands Gaia the question, the context,
-//!    and her list of WhatsApp contacts, then asks her to emit two documents:
-//!    `response.json` (a possibly multi-modal reply) and `actions.json` (the
-//!    side effects to carry out).
-//! 3. Parses and **audits** the emitted `actions.json`, checking that every
-//!    required record was produced this turn: a WhatsApp message, a Push
-//!    message, an Edwino actuate instruction, and an upsert into each of the
-//!    four data stores (GaiaConnections, GaiaKB, GaiaDataLake, GaiaDiary).
+//! Crucially, both the **live cloud app** ([`crate::engine::Engine`]) and the
+//! **data-execution self-test** ([`crate::test_data_execution`]) drive this same
+//! controller, so the two can never drift apart: the test exercises the exact
+//! code that runs in production. Processing is **read-only** — it validates and
+//! summarizes the `actions.json` the model *planned*; it never executes the
+//! writes/sends against live Cosmos, WhatsApp, Push, or the robot.
 //!
-//! The probe is **read-only against production**: it validates the `actions.json`
-//! that Call 2 *plans*; it never executes the writes/sends against live Cosmos,
-//! WhatsApp, Push, or the robot. The full contract lives in
-//! `tests/LLM2/DataExecutionSpec.md`.
+//! Processing is infallible: a reply with no parseable array yields an empty
+//! [`PushResult`] (`parsed = false`) rather than an error, so every caller can
+//! degrade gracefully.
 
 use std::collections::BTreeSet;
-use std::io::{self, Write};
-use std::path::Path;
 
 use serde_json::Value;
 
-use crate::llm::{value_from_env, LlmClient};
-use crate::prompt::now_rfc3339;
-
-/// The user every turn is scoped to. Matches the `threadkeeper` exports under
-/// `migrations/` and the retrieval probe, so the context lines up with real
-/// seeded data.
-const PROBE_USER_ID: &str = "threadkeeper";
-
-/// The number of turns the probe runs, one per `tests/LLM1/t{N}/` folder.
-const TURN_COUNT: usize = 5;
+use crate::llm::value_from_env;
 
 /// The four data stores Gaia must write to every turn.
-const REQUIRED_STORES: [&str; 4] = ["GaiaConnections", "GaiaKB", "GaiaDataLake", "GaiaDiary"];
+pub const REQUIRED_STORES: [&str; 4] = ["GaiaConnections", "GaiaKB", "GaiaDataLake", "GaiaDiary"];
 
 /// The WhatsApp/Push urgency above which the delivery API actually executes a
 /// message. Records at or below this are still produced, just suppressed.
-const URGENCY_DELIVERY_THRESHOLD: f64 = 0.33;
+pub const URGENCY_DELIVERY_THRESHOLD: f64 = 0.33;
 
-/// Fallback default contact, used when the `GAIA_WHATSAPP_DEFAULT_*` env vars
-/// are absent. Mirrors the documented default in `infra/.env.sample`.
+/// Fallback default contact name, used when the `GAIA_WHATSAPP_DEFAULT_*` env
+/// vars are absent. Mirrors the documented default in `infra/.env.sample`.
 const DEFAULT_CONTACT_NAME: &str = "Jonty";
 /// Fallback default contact phone (E.164).
 const DEFAULT_CONTACT_PHONE: &str = "+27725697683";
@@ -166,7 +155,7 @@ pub struct ActionAudit {
 
 impl ActionAudit {
     /// The required stores still missing an upsert this turn.
-    fn missing_stores(&self) -> Vec<&'static str> {
+    pub fn missing_stores(&self) -> Vec<&'static str> {
         REQUIRED_STORES
             .iter()
             .copied()
@@ -357,370 +346,11 @@ fn read_urgency(action: &Value) -> Option<f64> {
 }
 
 /// Whether `urgency` is a valid score in the closed range `0.00 … 1.00`.
-fn urgency_in_range(urgency: f64) -> bool {
+pub fn urgency_in_range(urgency: f64) -> bool {
     (0.0..=1.0).contains(&urgency)
 }
 
-/// Per-turn outcome of the push-pass probe.
-#[derive(Debug, Clone)]
-pub struct TurnMetrics {
-    /// The turn folder name, e.g. `t1`.
-    pub folder: String,
-    /// The user's question for this turn.
-    pub question: String,
-    /// Whether LLM Call 2 returned a usable reply.
-    pub llm_ok: bool,
-    /// Whether `response.json` parsed with non-empty text.
-    pub response_ok: bool,
-    /// Whether a valid WhatsApp record was produced.
-    pub whatsapp_ok: bool,
-    /// Whether a valid Push record was produced.
-    pub push_ok: bool,
-    /// Whether a valid Edwino actuate record was produced.
-    pub actuate_ok: bool,
-    /// How many of the four stores received an upsert this turn.
-    pub stores_covered: usize,
-    /// Whether the reply carried multi-modal media.
-    pub multimodal: bool,
-    /// Overall pass/fail for this turn.
-    pub success: bool,
-    /// Human-readable notes explaining any failure.
-    pub notes: Vec<String>,
-}
-
-/// Raw artifacts written to disk for one turn.
-struct TurnArtifacts {
-    /// The raw LLM Call 2 reply, before parsing.
-    raw_reply: Option<String>,
-    /// The parsed `response.json` document.
-    response: Option<Value>,
-    /// The parsed `actions.json` document.
-    actions: Option<Value>,
-    /// The audited side-effect records.
-    audit: ActionAudit,
-}
-
-impl TurnArtifacts {
-    fn empty() -> Self {
-        Self {
-            raw_reply: None,
-            response: None,
-            actions: None,
-            audit: ActionAudit::default(),
-        }
-    }
-
-    /// Write the artifacts as pretty-printed JSON files into `dir`.
-    fn write_to(&self, dir: &Path) -> io::Result<()> {
-        std::fs::create_dir_all(dir)?;
-
-        if let Some(reply) = &self.raw_reply {
-            std::fs::write(dir.join("reply.json"), pretty_or_raw(reply))?;
-        }
-        if let Some(response) = &self.response {
-            std::fs::write(dir.join("response.json"), pretty(response))?;
-        }
-        if let Some(actions) = &self.actions {
-            std::fs::write(dir.join("actions.json"), pretty(actions))?;
-        }
-
-        std::fs::write(
-            dir.join("whatsapp.json"),
-            serde_json::to_string_pretty(&self.audit.whatsapp).unwrap_or_default(),
-        )?;
-        std::fs::write(
-            dir.join("push.json"),
-            serde_json::to_string_pretty(&self.audit.push).unwrap_or_default(),
-        )?;
-        std::fs::write(
-            dir.join("actuate.json"),
-            serde_json::to_string_pretty(&self.audit.actuate).unwrap_or_default(),
-        )?;
-        std::fs::write(
-            dir.join("writes.json"),
-            serde_json::to_string_pretty(&self.audit.store_actions).unwrap_or_default(),
-        )?;
-
-        Ok(())
-    }
-}
-
-/// Runs the data-execution self-test end to end.
-///
-/// Holds the live model client (always required) and the resolved WhatsApp
-/// contact list. Built with [`DataExecutionProbe::from_env`], driven with
-/// [`DataExecutionProbe::run`].
-pub struct DataExecutionProbe {
-    /// The chat model client used for LLM Call 2.
-    llm: LlmClient,
-    /// The contacts Gaia may WhatsApp.
-    contacts: Vec<WhatsAppContact>,
-}
-
-impl DataExecutionProbe {
-    /// Build a probe from the process environment.
-    ///
-    /// A model is mandatory (the probe cannot run Call 2 without one); the
-    /// contact list is resolved from `GAIA_WHATSAPP_*` (with the documented
-    /// `Jonty` default). Returns a clear error string when the model is missing
-    /// or misconfigured, so the subcommand can print it and exit non-zero.
-    pub fn from_env() -> Result<Self, String> {
-        let llm = match LlmClient::from_env() {
-            Ok(Some(client)) => client,
-            Ok(None) => {
-                return Err(
-                    "LLM is not enabled. Set GAIA_MODE=dev (or local) and configure a model \
-                     (FOUNDRY_ENDPOINT + MODEL_ROUTER_DEPLOYMENT + FOUNDRY_API_KEY, or GITHUB_TOKEN)."
-                        .to_string(),
-                )
-            }
-            Err(err) => return Err(format!("LLM configuration error: {err}")),
-        };
-
-        Ok(Self {
-            llm,
-            contacts: contacts_from_env(),
-        })
-    }
-
-    /// Run the probe over the captured turns, write a report, and return whether
-    /// the self-test passed.
-    ///
-    /// `input_dir` is where each turn's `responsedatacontext.md` is read from
-    /// (the `tests/LLM1` folder). When `output_dir` is set, per-turn artifacts
-    /// are written into `output_dir/t1 … t5`. When `only` is `Some(n)`, run only
-    /// turn `n` (1-based). The boolean is the gate: `true` only when every
-    /// executed turn passed.
-    pub fn run(
-        &self,
-        only: Option<usize>,
-        input_dir: &Path,
-        output_dir: Option<&Path>,
-        out: &mut impl Write,
-    ) -> io::Result<bool> {
-        writeln!(
-            out,
-            "Gaia data-execution self-test (LLM Call 2 / push pass)"
-        )?;
-        writeln!(out, "  user_id : {PROBE_USER_ID}")?;
-        writeln!(
-            out,
-            "  model   : {} ({})",
-            self.llm.model(),
-            self.llm.endpoint()
-        )?;
-        writeln!(out, "  contacts: {}", self.contacts.len())?;
-        writeln!(out)?;
-
-        // Decide which turns to run.
-        let turns: Vec<usize> = match only {
-            Some(n) if (1..=TURN_COUNT).contains(&n) => vec![n],
-            Some(n) => {
-                writeln!(out, "ERROR: turn {n} does not exist (1–{TURN_COUNT}).")?;
-                return Ok(false);
-            }
-            None => (1..=TURN_COUNT).collect(),
-        };
-
-        let mut all = Vec::with_capacity(turns.len());
-        for n in turns {
-            let folder = format!("t{n}");
-            writeln!(out, "[{n}/{TURN_COUNT}] {folder}")?;
-
-            let (metrics, artifacts) = self.probe_one(input_dir, &folder);
-
-            if let Some(dir) = output_dir {
-                let q_dir = dir.join(&folder);
-                if let Err(err) = artifacts.write_to(&q_dir) {
-                    writeln!(
-                        out,
-                        "      - warning: could not write artifacts to {}: {err}",
-                        q_dir.display()
-                    )?;
-                }
-            }
-
-            for note in &metrics.notes {
-                writeln!(out, "      - {note}")?;
-            }
-            writeln!(
-                out,
-                "      => {} | WhatsApp {} | Push {} | Actuate {} | stores {}/4{}",
-                if metrics.success { "PASS" } else { "FAIL" },
-                if metrics.whatsapp_ok { "ok" } else { "—" },
-                if metrics.push_ok { "ok" } else { "—" },
-                if metrics.actuate_ok { "ok" } else { "—" },
-                metrics.stores_covered,
-                if metrics.multimodal {
-                    " | multimodal"
-                } else {
-                    ""
-                },
-            )?;
-            all.push(metrics);
-        }
-
-        writeln!(out)?;
-        write!(out, "{}", format_metrics_table(&all))?;
-        let pass = !all.is_empty() && all.iter().all(|m| m.success);
-        writeln!(out)?;
-        writeln!(out, "OVERALL: {}", if pass { "PASS" } else { "FAIL" })?;
-
-        if let Some(dir) = output_dir {
-            if let Err(err) = write_summary_md(dir, &all, pass) {
-                writeln!(out, "warning: could not write TestSummary.md: {err}")?;
-            }
-        }
-
-        Ok(pass)
-    }
-
-    /// Run one turn: read its context, call the model, audit the result.
-    fn probe_one(&self, input_dir: &Path, folder: &str) -> (TurnMetrics, TurnArtifacts) {
-        let mut metrics = TurnMetrics {
-            folder: folder.to_string(),
-            question: String::new(),
-            llm_ok: false,
-            response_ok: false,
-            whatsapp_ok: false,
-            push_ok: false,
-            actuate_ok: false,
-            stores_covered: 0,
-            multimodal: false,
-            success: false,
-            notes: Vec::new(),
-        };
-        let mut artifacts = TurnArtifacts::empty();
-
-        // --- Read this turn's grounding context --------------------------
-        let context_path = input_dir.join(folder).join("responsedatacontext.md");
-        let context = match std::fs::read_to_string(&context_path) {
-            Ok(text) => text,
-            Err(err) => {
-                metrics
-                    .notes
-                    .push(format!("could not read {}: {err}", context_path.display()));
-                return (metrics, artifacts);
-            }
-        };
-        let question = parse_question(&context);
-        metrics.question = question.clone();
-
-        // --- LLM Call 2: answer + plan side effects ----------------------
-        let requested_at = now_rfc3339();
-        let prompt = build_execution_prompt(
-            PROBE_USER_ID,
-            &question,
-            &context,
-            &self.contacts,
-            &requested_at,
-        );
-        let reply = match self.llm.complete(&prompt.system, &prompt.user) {
-            Ok(reply) => reply,
-            Err(err) => {
-                metrics.notes.push(format!("LLM Call 2 failed: {err}"));
-                return (metrics, artifacts);
-            }
-        };
-        metrics.llm_ok = true;
-        artifacts.raw_reply = Some(reply.clone());
-
-        // --- Parse the two documents (response.json, actions.json) -------
-        let documents = match crate::actions::extract_call1_array(&reply) {
-            Some(docs) => docs,
-            None => {
-                metrics
-                    .notes
-                    .push("could not parse the JSON array from the reply".to_string());
-                return (metrics, artifacts);
-            }
-        };
-        let response = documents.first().cloned();
-        let actions = documents.get(1).cloned();
-        artifacts.response = response.clone();
-        artifacts.actions = actions.clone();
-
-        // --- Validate response.json --------------------------------------
-        if let Some(response) = &response {
-            let text = string_field(response, "text");
-            metrics.response_ok = !text.is_empty();
-            metrics.multimodal = response
-                .get("media")
-                .and_then(Value::as_array)
-                .map(|m| !m.is_empty())
-                .unwrap_or(false);
-            if !metrics.response_ok {
-                metrics
-                    .notes
-                    .push("response.json has no non-empty `text`".to_string());
-            }
-        } else {
-            metrics
-                .notes
-                .push("no response.json (first array element)".to_string());
-        }
-
-        // --- Audit actions.json ------------------------------------------
-        let Some(actions) = &actions else {
-            metrics
-                .notes
-                .push("no actions.json (second array element)".to_string());
-            return (metrics, artifacts);
-        };
-        let audit = audit_actions(actions);
-
-        // WhatsApp: at least one with a phone, a message, and a valid urgency.
-        metrics.whatsapp_ok = audit.whatsapp.iter().any(|m| {
-            !m.to_phone.is_empty() && !m.message.is_empty() && urgency_in_range(m.urgency)
-        });
-        if !metrics.whatsapp_ok {
-            metrics.notes.push(
-                "missing a valid WhatsApp record (phone + message + urgency 0–1)".to_string(),
-            );
-        }
-
-        // Push: at least one with a message and a valid urgency.
-        metrics.push_ok = audit
-            .push
-            .iter()
-            .any(|m| !m.message.is_empty() && urgency_in_range(m.urgency));
-        if !metrics.push_ok {
-            metrics
-                .notes
-                .push("missing a valid Push record (message + urgency 0–1)".to_string());
-        }
-
-        // Actuate: at least one Edwino instruction object.
-        metrics.actuate_ok = audit.actuate.iter().any(Value::is_object);
-        if !metrics.actuate_ok {
-            metrics
-                .notes
-                .push("missing a valid Edwino actuate instruction".to_string());
-        }
-
-        // Store write-backs: all four required containers.
-        metrics.stores_covered = audit.store_writes.len();
-        let missing = audit.missing_stores();
-        if !missing.is_empty() {
-            metrics
-                .notes
-                .push(format!("missing store write-backs: {}", missing.join(", ")));
-        }
-
-        artifacts.audit = audit;
-
-        metrics.success = metrics.llm_ok
-            && metrics.response_ok
-            && metrics.whatsapp_ok
-            && metrics.push_ok
-            && metrics.actuate_ok
-            && missing.is_empty();
-
-        (metrics, artifacts)
-    }
-}
-
-/// The two chat messages sent to LLM Call 2 for the push-pass probe.
+/// The two chat messages sent to LLM Call 2 for the push pass.
 pub struct ExecutionPrompt {
     /// The system message: identity, document spec, contacts, output rule.
     pub system: String,
@@ -728,7 +358,7 @@ pub struct ExecutionPrompt {
     pub user: String,
 }
 
-/// Build the focused Call 2 prompt for one turn of the data-execution test.
+/// Build the focused Call 2 prompt for one turn of the push pass.
 ///
 /// Hands Gaia her identity, the document spec (response.json + the seven required
 /// `actions.json` records), the WhatsApp contact list, and the Edwino actuate
@@ -783,7 +413,7 @@ pub fn build_execution_prompt(
     ExecutionPrompt { system, user }
 }
 
-/// The two-document contract for LLM Call 2 in the data-execution test.
+/// The two-document contract for LLM Call 2 in the push pass.
 const EXECUTION_DOCUMENT_SPEC: &str = "\
 1. response.json - Gaia's reply to the human, in her voice. May be MULTI-MODAL.
    { \"text\": \"<the reply to show the user>\",
@@ -824,103 +454,188 @@ You MUST emit ONE of EACH of these records EVERY turn (seven actions minimum):
    { \"id\":\"a6\", \"kind\":\"upsert\", \"target\":\"GaiaDataLake\",    \"payload\":{ \"entity\":\"<this user>\", \"data\":\"<a snapshot of this turn>\" }, \"reason\":\"<why>\" }
    { \"id\":\"a7\", \"kind\":\"upsert\", \"target\":\"GaiaDiary\",       \"payload\":{ \"entity\":\"<this user>\", \"data\":\"<Gaia's private reflection on this turn>\" }, \"reason\":\"<why>\" }";
 
-/// Extract the user's question from a `responsedatacontext.md` body.
+/// Everything the push pass produced from one LLM Call 2 reply.
 ///
-/// The Response Data Context builder writes a `- **question:** <text>` header
-/// line; this returns the text after it, or an empty string when absent.
-fn parse_question(context: &str) -> String {
-    const MARKER: &str = "**question:**";
-    for line in context.lines() {
-        if let Some(idx) = line.find(MARKER) {
-            return line[idx + MARKER.len()..].trim().to_string();
+/// Callers take only the fields they need. The engine reads `reply_text` and
+/// [`PushResult::actions_summary`]; the self-test additionally reads `response`,
+/// `actions`, `multimodal`, [`PushResult::response_text`], and the `audit`.
+#[derive(Debug, Clone)]
+pub struct PushResult {
+    /// Whether the raw reply yielded a parseable JSON array of documents.
+    pub parsed: bool,
+    /// The parsed `response.json` document (array element 0), if present.
+    pub response: Option<Value>,
+    /// The parsed `actions.json` document (array element 1), if present.
+    pub actions: Option<Value>,
+    /// Gaia's reply text to show the user: `response.json.text` when present,
+    /// otherwise the raw (fence-stripped) reply so the UI is never blank.
+    pub reply_text: String,
+    /// Whether `response.json` carried a non-empty `media` array.
+    pub multimodal: bool,
+    /// The audited side effects from `actions.json` (empty when absent).
+    pub audit: ActionAudit,
+}
+
+impl PushResult {
+    /// The `text` of `response.json`, trimmed, or empty when absent.
+    ///
+    /// Distinct from [`PushResult::reply_text`], which falls back to the raw
+    /// reply: this returns *only* the model's structured `text` field, so the
+    /// self-test can tell a real reply from a fallback.
+    pub fn response_text(&self) -> String {
+        self.response
+            .as_ref()
+            .and_then(|r| r.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    }
+
+    /// A short, human-readable summary of the planned side effects, or `None`
+    /// when nothing actionable was planned. Wraps [`summarize_actions`].
+    pub fn actions_summary(&self) -> Option<String> {
+        let summary = summarize_actions(&self.audit);
+        if summary.trim().is_empty() {
+            None
+        } else {
+            Some(summary)
         }
     }
-    String::new()
 }
 
-/// Pretty-print a JSON value, falling back to its compact form.
-fn pretty(value: &Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+/// Owns the push pass. Holds the WhatsApp contact list used to build the Call 2
+/// prompt; cheap to construct from the environment once per process.
+pub struct PushDataController {
+    /// The contacts Gaia may WhatsApp, offered to the model in the prompt.
+    contacts: Vec<WhatsAppContact>,
 }
 
-/// Pretty-print the JSON array embedded in a raw reply, or return it unchanged.
-fn pretty_or_raw(reply: &str) -> String {
-    if let Some(docs) = crate::actions::extract_call1_array(reply) {
-        let array = Value::Array(docs);
-        return pretty(&array);
+impl PushDataController {
+    /// Build a controller from the process environment (the `GAIA_WHATSAPP_*`
+    /// contact configuration, with the documented `Jonty` default).
+    pub fn from_env() -> Self {
+        Self {
+            contacts: contacts_from_env(),
+        }
     }
-    reply.to_string()
+
+    /// Build a controller from an explicit contact list (used by tests).
+    #[cfg(test)]
+    pub fn new(contacts: Vec<WhatsAppContact>) -> Self {
+        Self { contacts }
+    }
+
+    /// The contacts this controller offers to the model.
+    pub fn contacts(&self) -> &[WhatsAppContact] {
+        &self.contacts
+    }
+
+    /// Build the Call 2 prompt for one turn, embedding this controller's
+    /// contacts. See [`build_execution_prompt`].
+    pub fn build_prompt(
+        &self,
+        user_id: &str,
+        question: &str,
+        context: &str,
+        requested_at: &str,
+    ) -> ExecutionPrompt {
+        build_execution_prompt(user_id, question, context, &self.contacts, requested_at)
+    }
+
+    /// Process a raw LLM Call 2 reply into its reply text and audited side
+    /// effects.
+    ///
+    /// Parses the `[response.json, actions.json]` array (tolerating code fences
+    /// and stray prose, and repairing the common dropped-brace defect via
+    /// [`crate::actions::extract_call1_array`]), extracts the reply text, detects
+    /// multi-modal media, and audits the planned actions. This is **read-only**:
+    /// it never executes the writes/sends. Infallible — an unparseable reply
+    /// yields `parsed = false` with an empty audit.
+    pub fn process(reply: &str) -> PushResult {
+        let cleaned = strip_code_fences(reply.trim());
+
+        // Pull out the two documents. `extract_call1_array` already tolerates
+        // fences/prose and repairs a dropped element brace, so this is the same
+        // parser the rest of the pipeline uses.
+        let documents = crate::actions::extract_call1_array(cleaned);
+        let (response, actions, parsed) = match &documents {
+            Some(docs) => (docs.first().cloned(), docs.get(1).cloned(), true),
+            None => (None, None, false),
+        };
+
+        let reply_text = reply_text_from(response.as_ref(), cleaned);
+        let multimodal = response.as_ref().map(has_media).unwrap_or(false);
+        let audit = actions.as_ref().map(audit_actions).unwrap_or_default();
+
+        PushResult {
+            parsed,
+            response,
+            actions,
+            reply_text,
+            multimodal,
+            audit,
+        }
+    }
 }
 
-/// Render the per-turn results as an aligned text table.
-fn format_metrics_table(all: &[TurnMetrics]) -> String {
-    let mut out = String::new();
-    out.push_str("Turn  WhatsApp  Push  Actuate  Stores  Multimodal  Result\n");
-    out.push_str("----  --------  ----  -------  ------  ----------  ------\n");
-    for m in all {
-        out.push_str(&format!(
-            "{:<4}  {:<8}  {:<4}  {:<7}  {:<6}  {:<10}  {}\n",
-            m.folder,
-            yes_no(m.whatsapp_ok),
-            yes_no(m.push_ok),
-            yes_no(m.actuate_ok),
-            format!("{}/4", m.stores_covered),
-            yes_no(m.multimodal),
-            if m.success { "PASS" } else { "FAIL" },
-        ));
-    }
-    out
+/// Whether a `response.json` value carries a non-empty `media` array.
+fn has_media(response: &Value) -> bool {
+    response
+        .get("media")
+        .and_then(Value::as_array)
+        .map(|m| !m.is_empty())
+        .unwrap_or(false)
 }
 
-/// `yes`/`no` for a boolean column.
-fn yes_no(value: bool) -> &'static str {
-    if value {
-        "yes"
-    } else {
-        "no"
+/// Choose the reply text to show the user from Call 2's output.
+///
+/// Prefers `response.json.text`. If the structured document is missing (e.g. the
+/// model returned a bare object or non-array JSON), it makes one best-effort
+/// parse of the cleaned reply before falling back to the raw text, so the UI is
+/// never left blank.
+fn reply_text_from(response: Option<&Value>, cleaned: &str) -> String {
+    // Preferred: the structured response.json text field.
+    if let Some(text) = response.and_then(|r| r.get("text")).and_then(Value::as_str) {
+        return text.trim().to_string();
     }
+
+    // Fallback: tolerate a bare `{ "text": ... }` object or an array the
+    // document extractor declined (it requires a leading `[`).
+    if let Ok(value) = serde_json::from_str::<Value>(cleaned) {
+        if let Some(text) = value
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|first| first.get("text"))
+            .and_then(Value::as_str)
+        {
+            return text.trim().to_string();
+        }
+        if let Some(text) = value.get("text").and_then(Value::as_str) {
+            return text.trim().to_string();
+        }
+    }
+
+    // Not parseable JSON at all: show the raw text rather than nothing.
+    cleaned.to_string()
 }
 
-/// Write a markdown summary table for the run, mirroring `tests/LLM1/TestSummary.md`.
-fn write_summary_md(dir: &Path, all: &[TurnMetrics], pass: bool) -> io::Result<()> {
-    let mut md = String::new();
-    md.push_str("# Data-Execution Self-Test Summary\n\n");
-    md.push_str(&format!(
-        "**Overall: {}**\n\n",
-        if pass { "PASS ✅" } else { "FAIL ❌" }
-    ));
-    md.push_str(
-        "| # | Question | LLM | WhatsApp | Push | Actuate | Stores | Multimodal | Result |\n",
-    );
-    md.push_str(
-        "|---|----------|-----|----------|------|---------|--------|------------|--------|\n",
-    );
-    for (i, m) in all.iter().enumerate() {
-        let question = truncate(&m.question, 60);
-        md.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {}/4 | {} | {} |\n",
-            i + 1,
-            question,
-            if m.llm_ok { "ok" } else { "fail" },
-            yes_no(m.whatsapp_ok),
-            yes_no(m.push_ok),
-            yes_no(m.actuate_ok),
-            m.stores_covered,
-            yes_no(m.multimodal),
-            if m.success { "PASS ✅" } else { "FAIL ❌" },
-        ));
-    }
-    std::fs::write(dir.join("TestSummary.md"), md)
-}
-
-/// Truncate a string to `max` characters, appending `…` when shortened.
-fn truncate(text: &str, max: usize) -> String {
-    let trimmed: String = text.chars().take(max).collect();
-    if trimmed.chars().count() < text.chars().count() {
-        format!("{trimmed}…")
-    } else {
-        trimmed
-    }
+/// Strip a leading/trailing Markdown code fence (```/```json) if present.
+fn strip_code_fences(text: &str) -> &str {
+    let trimmed = text.trim();
+    let Some(after_open) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    // Drop an optional language tag on the opening fence's line.
+    let after_lang = match after_open.split_once('\n') {
+        Some((_lang, rest)) => rest,
+        None => after_open,
+    };
+    after_lang
+        .trim_end()
+        .strip_suffix("```")
+        .unwrap_or(after_lang)
+        .trim()
 }
 
 #[cfg(test)]
@@ -983,18 +698,6 @@ mod tests {
         let above = json!({ "target": "Push", "message": "x", "urgency": 0.34 });
         assert!(!audit_actions(&json!({ "actions": [at_threshold] })).push[0].delivered);
         assert!(audit_actions(&json!({ "actions": [above] })).push[0].delivered);
-    }
-
-    #[test]
-    fn parse_question_reads_the_marker_line() {
-        let context = "# Response Data Context\n\n- **user_id:** threadkeeper\n\
-                       - **question:** What do you know about hiking?\n- **requested_at:** now\n";
-        assert_eq!(parse_question(context), "What do you know about hiking?");
-    }
-
-    #[test]
-    fn parse_question_is_empty_when_absent() {
-        assert_eq!(parse_question("no marker here"), "");
     }
 
     #[test]
@@ -1108,8 +811,88 @@ mod tests {
     }
 
     #[test]
-    fn truncate_appends_ellipsis_only_when_shortened() {
-        assert_eq!(truncate("short", 10), "short");
-        assert_eq!(truncate("abcdefghij", 5), "abcde…");
+    fn build_prompt_uses_the_controllers_contacts() {
+        let controller = PushDataController::new(vec![WhatsAppContact {
+            name: "Mara".to_string(),
+            phone: "+27123456789".to_string(),
+            role: "friend".to_string(),
+        }]);
+        let prompt = controller.build_prompt("u", "q", "ctx", "t");
+        assert!(prompt.system.contains("Mara"));
+        assert!(prompt.system.contains("+27123456789"));
+    }
+
+    #[test]
+    fn process_extracts_text_from_response_array() {
+        let raw = r#"[{"text":"Hi there","emote":"warm","medium":"console"},{"version":"1.0"}]"#;
+        let result = PushDataController::process(raw);
+        assert!(result.parsed);
+        assert_eq!(result.reply_text, "Hi there");
+        assert_eq!(result.response_text(), "Hi there");
+    }
+
+    #[test]
+    fn process_extracts_text_from_bare_object() {
+        // A bare response.json object (no array) still yields the reply text via
+        // the fallback, even though no document array could be extracted.
+        let result = PushDataController::process(r#"{"text":"hello"}"#);
+        assert!(!result.parsed);
+        assert_eq!(result.reply_text, "hello");
+    }
+
+    #[test]
+    fn process_strips_code_fences_before_parsing() {
+        let raw = "```json\n[{\"text\":\"fenced\"}]\n```";
+        let result = PushDataController::process(raw);
+        assert!(result.parsed);
+        assert_eq!(result.reply_text, "fenced");
+    }
+
+    #[test]
+    fn process_falls_back_to_raw_text_when_not_json() {
+        let result = PushDataController::process("just words");
+        assert!(!result.parsed);
+        assert_eq!(result.reply_text, "just words");
+    }
+
+    #[test]
+    fn process_detects_multimodal_media() {
+        let raw = r#"[
+          { "text": "look", "media": [ { "type": "image", "description": "a cat" } ] },
+          { "actions": [] }
+        ]"#;
+        let result = PushDataController::process(raw);
+        assert!(result.multimodal);
+    }
+
+    #[test]
+    fn process_audits_actions_and_summarizes() {
+        // A well-formed [response.json, actions.json] reply yields an audit and a
+        // summary that names each planned side effect.
+        let raw = r#"[
+          { "text": "Hello" },
+          { "actions": [
+            { "id": "a1", "kind": "send", "target": "WhatsApp",
+              "to_name": "Jonty", "message": "Hi", "urgency": 0.7 },
+            { "id": "a4", "kind": "upsert", "target": "GaiaDiary", "payload": {} }
+          ] }
+        ]"#;
+        let result = PushDataController::process(raw);
+        assert_eq!(result.audit.whatsapp.len(), 1);
+        let summary = result.actions_summary().expect("a summary");
+        assert!(summary.contains("WhatsApp to Jonty: sent"));
+        assert!(summary.contains("Saved to: GaiaDiary"));
+    }
+
+    #[test]
+    fn process_returns_none_summary_without_actions() {
+        // Only response.json present (no second element): nothing to summarize.
+        assert!(PushDataController::process(r#"[{ "text": "Hi" }]"#)
+            .actions_summary()
+            .is_none());
+        // Not parseable as a JSON array at all.
+        assert!(PushDataController::process("just words")
+            .actions_summary()
+            .is_none());
     }
 }

@@ -96,18 +96,37 @@ pub fn parse_call1_actions(reply: &str) -> Option<ActionsFile> {
 /// LLM Call 1 emits a single JSON array of four documents (in order:
 /// `actions.json`, `analysis.json`, `facts.json`, `newContext.json`). This finds
 /// that array by its outer brackets — tolerating any code fences or stray prose
-/// around it — parses it, and returns its elements. Returns `None` when no
-/// balanced array is present or it is not valid JSON, so callers can degrade
-/// gracefully. Both [`parse_call1_actions`] and the Response Data Context
-/// builder share this so they always read the *same* array the same way.
+/// around it — parses it, and returns its elements. When the strict parse fails,
+/// it makes one best-effort [`crate::json_repair::repair_json`] attempt to fix
+/// the common structural defects models emit (a dropped element brace, a
+/// trailing comma, a truncated tail) before giving up. Returns `None` only when
+/// no array can be recovered, so callers can degrade gracefully. Both
+/// [`parse_call1_actions`] and the Response Data Context builder share this so
+/// they always read the *same* array the same way.
 pub fn extract_call1_array(reply: &str) -> Option<Vec<serde_json::Value>> {
     // Walk forward from the first `[` counting brackets (and respecting string
     // literals) to find the matching `]`; the model sometimes appends extra
     // prose after the array, so a first-`[`-to-last-`]` scan would be invalid.
+    // When the closing bracket cannot be located (e.g. the reply was truncated)
+    // we fall back to the whole tail and let the repair pass close it.
     let start = reply.find('[')?;
-    let end = find_balanced_bracket(&reply[start..])? + start;
-    let json = reply.get(start..=end)?;
-    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let rest = &reply[start..];
+    let candidate = match find_balanced_bracket(rest) {
+        Some(end) => &rest[..=end],
+        None => rest,
+    };
+
+    // Fast path: the reply is already well-formed.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
+        return value.as_array().cloned();
+    }
+
+    // Fallback: language models occasionally drop a single structural character
+    // at an element boundary (most often the opening `{` of an array element).
+    // Repair that family of defects and try once more, so one dropped brace does
+    // not throw away an otherwise-good turn. The repair is a no-op on valid JSON.
+    let repaired = crate::json_repair::repair_json(candidate);
+    let value: serde_json::Value = serde_json::from_str(&repaired).ok()?;
     value.as_array().cloned()
 }
 
@@ -366,5 +385,28 @@ mod tests {
         let parsed = parse_call1_actions(reply).expect("should parse despite trailing garbage");
         assert_eq!(parsed.actions.len(), 1);
         assert_eq!(parsed.actions[0].target, "GaiaDiary");
+    }
+
+    #[test]
+    fn parse_call1_actions_recovers_from_a_dropped_element_brace() {
+        // The model occasionally drops the opening `{` of an array element. Here
+        // the actions document is element 0 of the outer array but its own
+        // opening brace is missing (`[ "version" …` instead of `[ { "version" …`).
+        // The repair fallback should restore it so the turn is not lost.
+        let reply = r#"["version":"1.0","session":{"user_id":"threadkeeper","requested_at":"2026-06-20T10:00:00Z"},"actions":[{"id":"q1","kind":"query","target":"GaiaKB","user_id":"threadkeeper","entity":"threadkeeper","intent":"x","top":3,"filters":{}}]},{"analysis":true}]"#;
+
+        let parsed = parse_call1_actions(reply).expect("repair should rescue the dropped brace");
+        assert_eq!(parsed.actions.len(), 1);
+        assert_eq!(parsed.actions[0].target, "GaiaKB");
+    }
+
+    #[test]
+    fn extract_call1_array_recovers_from_a_dropped_brace_between_elements() {
+        // A dropped `{` before the SECOND document object (`},{` became `},`).
+        let reply = r#"[{"actions":[]},"analysis":{"emotion":"warm"}}]"#;
+
+        let docs = extract_call1_array(reply).expect("repair should restore the brace");
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[1]["analysis"]["emotion"], "warm");
     }
 }

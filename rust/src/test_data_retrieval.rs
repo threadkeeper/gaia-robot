@@ -28,14 +28,12 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use crate::actions::{ActionPlan, ActionsFile, SessionContext};
+use crate::actions::ActionsFile;
 use crate::cosmos::CosmosClient;
 use crate::embeddings::EmbeddingClient;
-use crate::executor::Executor;
 use crate::llm::LlmClient;
 use crate::prompt::{now_rfc3339, Call1Prompt};
-use crate::search_history::SearchResult;
-use crate::storage::Record;
+use crate::pull_data_controller::{PullDataController, QueryAudit};
 use crate::web_search::BraveClient;
 
 /// The user every probe question is scoped to. Matches the `threadkeeper`
@@ -133,35 +131,12 @@ struct ProbeArtifacts {
     actions: Option<ActionsFile>,
     /// The exact Cosmos SQL that ran for each query action, so the artifact can
     /// be verified against what the model authored (keyword vs semantic).
-    queries: Vec<PlannedQueryArtifact>,
+    queries: Vec<QueryAudit>,
     /// Per-action retrieval results keyed by `(action_id, container)`.
     results: Vec<(String, String, Vec<serde_json::Value>)>,
-    /// The user question this turn answered (for the Response Data Context).
-    question: String,
-    /// The RFC 3339 timestamp the turn was requested at.
-    requested_at: String,
-    /// Call 1's non-action documents (analysis, facts, newContext summary),
-    /// folded into the Response Data Context handed to LLM Call 2.
-    extras: crate::response_context::Call1Extras,
-}
-
-/// The actually-executed Cosmos query for one action, written to `queries.json`.
-///
-/// This makes the retrieval mode auditable: a `VectorDistance(...)` SQL proves
-/// semantic search ran, while a `CONTAINS(...)` SQL proves keyword search ran —
-/// regardless of what the raw model reply originally authored.
-#[derive(serde::Serialize)]
-struct PlannedQueryArtifact {
-    /// The action id (e.g. `q3`).
-    id: String,
-    /// The target container (e.g. `GaiaKB`).
-    target: String,
-    /// The resolved retrieval mode label (`semantic` or `keyword`).
-    mode: String,
-    /// The single logical partition the query is pinned to.
-    partition_value: String,
-    /// The exact parameterised Cosmos SQL sent to the account.
-    sql: String,
+    /// The Response Data Context the shared pull controller assembled this turn
+    /// — the exact grounding document LLM Call 2 would receive in the cloud app.
+    context: String,
 }
 
 impl ProbeArtifacts {
@@ -171,9 +146,7 @@ impl ProbeArtifacts {
             actions: None,
             queries: Vec::new(),
             results: Vec::new(),
-            question: String::new(),
-            requested_at: String::new(),
-            extras: crate::response_context::Call1Extras::default(),
+            context: String::new(),
         }
     }
 
@@ -211,29 +184,10 @@ impl ProbeArtifacts {
             std::fs::write(&path, json)?;
         }
 
-        // Deterministically assemble the Response Data Context that bridges LLM
-        // Call 1 and Call 2 from everything gathered this turn. This is a pure
-        // string build (no extra LLM call), written alongside the JSON
-        // artifacts as `responsedatacontext.md`.
-        let groups: Vec<crate::response_context::RetrievalGroup> = self
-            .results
-            .iter()
-            .map(
-                |(action_id, container, records)| crate::response_context::RetrievalGroup {
-                    action_id: action_id.clone(),
-                    container: container.clone(),
-                    records: records.clone(),
-                },
-            )
-            .collect();
-        let context = crate::response_context::build_response_data_context(
-            PROBE_USER_ID,
-            &self.question,
-            &self.requested_at,
-            &self.extras,
-            &groups,
-        );
-        std::fs::write(dir.join("responsedatacontext.md"), context)?;
+        // The Response Data Context was already assembled by the shared pull
+        // controller (the same builder the cloud app uses); write it verbatim
+        // alongside the JSON artifacts as `responsedatacontext.md`.
+        std::fs::write(dir.join("responsedatacontext.md"), &self.context)?;
 
         Ok(())
     }
@@ -434,8 +388,10 @@ impl DataRetrievalProbe {
     /// parse failure, missing-but-needed client, or query error fails the
     /// question (with an explanatory note) but never aborts the other questions.
     ///
-    /// Returns the metrics **and** the raw artifacts so the caller can write
-    /// them to disk for human review.
+    /// The actual retrieval is delegated to [`PullDataController`] — the exact
+    /// same code the live cloud app runs — so this self-test validates the real
+    /// pull pass, not a copy of it. Returns the metrics **and** the raw
+    /// artifacts so the caller can write them to disk for human review.
     fn probe_one(&self, question: &str) -> (QuestionMetrics, ProbeArtifacts) {
         let mut metrics = QuestionMetrics {
             question: question.to_string(),
@@ -455,9 +411,6 @@ impl DataRetrievalProbe {
 
         // --- LLM Call 1: ask the model what to retrieve -------------------
         let requested_at = now_rfc3339();
-        // Record the turn details so the Response Data Context can be built.
-        artifacts.question = question.to_string();
-        artifacts.requested_at = requested_at.clone();
         let call1 = Call1Prompt::build(PROBE_USER_ID, question, "", &requested_at);
         let reply = match self.llm.complete(&call1.system, &call1.user) {
             Ok(reply) => reply,
@@ -468,35 +421,35 @@ impl DataRetrievalProbe {
         };
         metrics.llm_ok = true;
         artifacts.raw_reply = Some(reply.clone());
-        // Parse Call 1's non-action documents (analysis, facts, newContext)
-        // so they can be folded into the Response Data Context.
-        artifacts.extras = crate::response_context::parse_call1_extras(&reply);
 
-        // --- Parse actions.json out of the reply --------------------------
-        let mut actions = match crate::actions::parse_call1_actions(&reply) {
-            Some(actions) => actions,
-            None => {
-                metrics
-                    .notes
-                    .push("could not parse actions.json from the reply".to_string());
-                metrics
-                    .notes
-                    .push(format!("raw LLM reply:\n{}", pretty_print_reply(&reply)));
-                return (metrics, artifacts);
-            }
+        // --- Retrieval via the shared pull controller --------------------
+        // This is the live cloud path. We ask it to capture the per-query SQL
+        // (`capture_queries = true`) so the `queries.json` artifact can prove
+        // whether keyword or semantic search ran.
+        let controller = PullDataController::new(
+            self.cosmos.as_ref(),
+            self.embedder.as_ref(),
+            self.web.as_ref(),
+        );
+        let result = controller.execute(PROBE_USER_ID, question, &requested_at, &reply, true);
+
+        // Save the assembled Response Data Context (what Call 2 would receive).
+        artifacts.context = result.context;
+
+        // The model returned no parseable actions.json: nothing to retrieve.
+        let Some(plan) = result.plan else {
+            metrics
+                .notes
+                .push("could not parse actions.json from the reply".to_string());
+            metrics
+                .notes
+                .push(format!("raw LLM reply:\n{}", pretty_print_reply(&reply)));
+            return (metrics, artifacts);
         };
 
-        // When GAIA_FORCE_SEMANTIC is set, rewrite every supported action to
-        // semantic retrieval *before* we save the artifact or execute, so both
-        // the written actions.json and the query that runs reflect the override
-        // (the model tends to author keyword CONTAINS queries by default).
-        if crate::executor::force_semantic() {
-            crate::executor::force_semantic_on(&mut actions);
-        }
-
-        artifacts.actions = Some(actions.clone());
-        metrics.actions_parsed = actions.actions.len();
-        if actions.actions.is_empty() {
+        artifacts.actions = Some(plan.clone());
+        metrics.actions_parsed = plan.actions.len();
+        if plan.actions.is_empty() {
             // The model decided no data retrieval is needed (e.g. a simple
             // greeting). That is a valid outcome — not a failure.
             metrics
@@ -506,154 +459,33 @@ impl DataRetrievalProbe {
             return (metrics, artifacts);
         }
 
-        // Split the plan into the Cosmos-backed queries and the Web searches.
-        let (web_actions, cosmos_actions): (Vec<ActionPlan>, Vec<ActionPlan>) = actions
-            .actions
-            .into_iter()
-            .partition(|action| action.target.eq_ignore_ascii_case("Web"));
+        // --- Fold the controller's results into metrics + artifacts ------
+        metrics.cosmos_actions = result.cosmos_actions;
+        metrics.web_actions = result.web_actions;
+        artifacts.queries = result.planned_queries;
 
-        // Track whether every attempted retrieval succeeded.
-        let mut all_ok = true;
-
-        // --- Cosmos retrieval --------------------------------------------
-        metrics.cosmos_actions = cosmos_actions.len();
-        if !cosmos_actions.is_empty() {
-            match &self.cosmos {
-                Some(client) => {
-                    // Save target names before moving actions into the plan.
-                    let targets: Vec<String> =
-                        cosmos_actions.iter().map(|a| a.target.clone()).collect();
-                    let action_ids: Vec<String> =
-                        cosmos_actions.iter().map(|a| a.id.clone()).collect();
-                    let plan = ActionsFile {
-                        version: actions.version.clone(),
-                        session: SessionContext {
-                            user_id: PROBE_USER_ID.to_string(),
-                            requested_at: requested_at.clone(),
-                        },
-                        actions: cosmos_actions,
-                    };
-
-                    // Capture the exact SQL each query will run, so the artifact
-                    // is auditable: a `VectorDistance(...)` query proves semantic
-                    // search ran and a `CONTAINS(...)` query proves keyword search
-                    // ran, independent of what the raw model reply authored.
-                    let embedder_ref = self.embedder.as_ref();
-                    for action in &plan.actions {
-                        if let Ok(planned) = crate::executor::plan_for(action, embedder_ref) {
-                            let mode = if planned.sql.contains("VectorDistance") {
-                                "semantic"
-                            } else {
-                                "keyword"
-                            };
-                            artifacts.queries.push(PlannedQueryArtifact {
-                                id: action.id.clone(),
-                                target: action.target.clone(),
-                                mode: mode.to_string(),
-                                partition_value: planned.partition_value,
-                                sql: planned.sql,
-                            });
-                        }
-                    }
-
-                    let outcomes = if let Some(embedder) = &self.embedder {
-                        Executor::with_embedder(client, Some(embedder.clone())).run(&plan)
-                    } else {
-                        Executor::new(client).run(&plan)
-                    };
-                    for ((target, action_id), outcome) in
-                        targets.iter().zip(action_ids.iter()).zip(outcomes.iter())
-                    {
-                        match &outcome.result {
-                            Ok(records) => {
-                                let rows = records.len();
-                                let bytes = records_bytes(records);
-                                metrics.cosmos_rows += rows;
-                                metrics.cosmos_bytes += bytes;
-                                metrics.record_container(target, rows, bytes);
-                                // Collect result artifacts as generic JSON values.
-                                let values: Vec<serde_json::Value> = records
-                                    .iter()
-                                    .filter_map(|r| serde_json::to_value(r).ok())
-                                    .collect();
-                                artifacts
-                                    .results
-                                    .push((action_id.clone(), target.clone(), values));
-                            }
-                            Err(err) => {
-                                all_ok = false;
-                                metrics
-                                    .notes
-                                    .push(format!("Cosmos action {} failed: {err}", outcome.id));
-                            }
-                        }
-                    }
-                }
-                None => {
-                    all_ok = false;
-                    metrics.notes.push(format!(
-                        "{} Cosmos action(s) requested but Cosmos is not configured",
-                        metrics.cosmos_actions
-                    ));
-                }
+        for group in result.groups {
+            let rows = group.records.len();
+            let bytes = values_bytes(&group.records);
+            if group.container.eq_ignore_ascii_case("Web") {
+                metrics.web_rows += rows;
+                metrics.web_bytes += bytes;
+            } else {
+                metrics.cosmos_rows += rows;
+                metrics.cosmos_bytes += bytes;
             }
+            metrics.record_container(&group.container, rows, bytes);
+            artifacts
+                .results
+                .push((group.action_id, group.container, group.records));
         }
 
-        // --- Web (Brave) retrieval ---------------------------------------
-        metrics.web_actions = web_actions.len();
-        if !web_actions.is_empty() {
-            match &self.web {
-                Some(client) => {
-                    for action in &web_actions {
-                        if let Err(err) = action.validate() {
-                            all_ok = false;
-                            metrics
-                                .notes
-                                .push(format!("Web action {} failed validation: {err}", action.id));
-                            continue;
-                        }
-
-                        let query = web_query_for(action, question);
-                        match client.search(&query, action.effective_top()) {
-                            Ok(results) => {
-                                let rows = results.len();
-                                let bytes = results_bytes(&results);
-                                metrics.web_rows += rows;
-                                metrics.web_bytes += bytes;
-                                metrics.record_container("Web", rows, bytes);
-                                // Collect Brave results as generic JSON values.
-                                let values: Vec<serde_json::Value> = results
-                                    .iter()
-                                    .filter_map(|r| serde_json::to_value(r).ok())
-                                    .collect();
-                                artifacts.results.push((
-                                    action.id.clone(),
-                                    "Web".to_string(),
-                                    values,
-                                ));
-                            }
-                            Err(err) => {
-                                all_ok = false;
-                                metrics
-                                    .notes
-                                    .push(format!("Brave action {} failed: {err}", action.id));
-                            }
-                        }
-                    }
-                }
-                None => {
-                    all_ok = false;
-                    metrics.notes.push(format!(
-                        "{} Web action(s) requested but Brave is not configured",
-                        metrics.web_actions
-                    ));
-                }
-            }
-        }
+        // Carry over the controller's per-action failure notes.
+        metrics.notes.extend(result.notes);
 
         // A question is a success only when the model replied, something was
         // retrieved, and no attempted retrieval errored.
-        metrics.success = metrics.llm_ok && metrics.actions_parsed > 0 && all_ok;
+        metrics.success = metrics.llm_ok && metrics.actions_parsed > 0 && result.all_ok;
         (metrics, artifacts)
     }
 }
@@ -689,44 +521,16 @@ fn pretty_print_reply(reply: &str) -> String {
     reply.to_string()
 }
 
-/// Choose the text to search the web with for a `Web` action.
+/// Sum the serialized JSON byte size of a slice of retrieval records.
 ///
-/// The model's free-text `text` filter is the most precise signal, then its
-/// `intent`; if neither is present we fall back to the user's question so a Web
-/// action always has *something* to search for.
-fn web_query_for(action: &ActionPlan, question: &str) -> String {
-    if let Some(text) = action
-        .filters
-        .text
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-    {
-        return text.to_string();
-    }
-    let intent = action.intent.trim();
-    if !intent.is_empty() {
-        return intent.to_string();
-    }
-    question.trim().to_string()
-}
-
-/// Sum the serialized JSON byte size of a slice of Cosmos records.
-///
-/// Serialized length is a faithful stand-in for "how much data came back": it
-/// counts the actual document payload (text + metadata) the model would consume.
-fn records_bytes(records: &[Record]) -> usize {
-    records
+/// The records arrive from [`PullDataController`] already serialized to generic
+/// JSON values (Cosmos documents and Brave results alike). Serialized length is
+/// a faithful stand-in for "how much data came back": it counts the actual
+/// payload (text + metadata) the model would consume.
+fn values_bytes(values: &[serde_json::Value]) -> usize {
+    values
         .iter()
-        .map(|record| serde_json::to_string(record).map(|s| s.len()).unwrap_or(0))
-        .sum()
-}
-
-/// Sum the serialized JSON byte size of a slice of Brave search results.
-fn results_bytes(results: &[SearchResult]) -> usize {
-    results
-        .iter()
-        .map(|result| serde_json::to_string(result).map(|s| s.len()).unwrap_or(0))
+        .map(|value| serde_json::to_string(value).map(|s| s.len()).unwrap_or(0))
         .sum()
 }
 
@@ -874,25 +678,7 @@ fn write_summary_md(dir: &Path, metrics: &[QuestionMetrics], pass: bool) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actions::ActionFilters;
-
-    /// Build a minimal action for the pure-helper tests.
-    fn action(target: &str, intent: &str, text: Option<&str>) -> ActionPlan {
-        ActionPlan {
-            id: "q1".to_string(),
-            kind: "query".to_string(),
-            target: target.to_string(),
-            user_id: Some(PROBE_USER_ID.to_string()),
-            entity: Some(PROBE_USER_ID.to_string()),
-            intent: intent.to_string(),
-            top: 3,
-            query: None,
-            filters: ActionFilters {
-                text: text.map(str::to_string),
-                ..ActionFilters::default()
-            },
-        }
-    }
+    use crate::actions::SessionContext;
 
     /// Build a metrics row that is either a clean pass or a clean fail.
     fn metrics(success: bool) -> QuestionMetrics {
@@ -916,42 +702,15 @@ mod tests {
     }
 
     #[test]
-    fn web_query_prefers_text_then_intent_then_question() {
-        // The free-text filter wins when present.
-        let with_text = action("Web", "broad intent", Some("  mars rovers  "));
-        assert_eq!(web_query_for(&with_text, "the question"), "mars rovers");
-
-        // Otherwise the intent is used.
-        let with_intent = action("Web", "latest mars news", None);
-        assert_eq!(
-            web_query_for(&with_intent, "the question"),
-            "latest mars news"
-        );
-
-        // With neither, fall back to the user's question.
-        let bare = action("Web", "   ", None);
-        assert_eq!(web_query_for(&bare, "  the question  "), "the question");
-    }
-
-    #[test]
-    fn record_and_result_bytes_count_serialized_payloads() {
-        let record = Record::new(
-            "GaiaKB|rust|2026-05-10",
-            "rust",
-            "",
-            "2026-05-10",
-            crate::storage::RecordKind::KnowledgeBase,
-            "the borrow checker is strict",
-            Vec::new(),
-        );
+    fn values_bytes_counts_serialized_payloads() {
         // A populated record serializes to a non-trivial number of bytes.
-        assert!(records_bytes(std::slice::from_ref(&record)) > 0);
+        let record = serde_json::json!({
+            "id": "GaiaKB|rust|2026-05-10",
+            "data": "the borrow checker is strict",
+        });
+        assert!(values_bytes(std::slice::from_ref(&record)) > 0);
         // An empty slice has zero size.
-        assert_eq!(records_bytes(&[]), 0);
-
-        let result = SearchResult::new("Title", "https://example.com", "snippet");
-        assert!(results_bytes(std::slice::from_ref(&result)) > 0);
-        assert_eq!(results_bytes(&[]), 0);
+        assert_eq!(values_bytes(&[]), 0);
     }
 
     #[test]
@@ -1024,9 +783,7 @@ mod tests {
             }),
             queries: Vec::new(),
             results: Vec::new(),
-            question: "hello?".to_string(),
-            requested_at: "2026-06-20T00:00:00Z".to_string(),
-            extras: crate::response_context::Call1Extras::default(),
+            context: "# Response Data Context\n\n## WebSearchResults\n".to_string(),
         };
 
         artifacts

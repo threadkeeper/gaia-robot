@@ -331,7 +331,12 @@ impl Call2Prompt {
              Ground every claim in the Response Data Context - never invent facts \
              that are not present there. Only output a single JSON array containing \
              the 2 JSON documents in this order: response.json, actions.json. Output \
-             nothing else - no prose and no markdown code fences."
+             nothing else - no prose and no markdown code fences. The output MUST be \
+             strictly well-formed JSON: wrap every object in matching braces, \
+             separate every array element and object member with a comma, quote all \
+             keys and string values with double quotes, and do not emit trailing \
+             commas. Double-check that the array and every object is closed before \
+             you finish."
         );
 
         // User message: the per-turn payload plus the assembled research results.
@@ -580,6 +585,8 @@ mod tests {
         }
         // The single-array output rule must be present and unambiguous.
         assert!(prompt.system.contains("single JSON array"));
+        // The model must be reminded to emit strictly well-formed JSON.
+        assert!(prompt.system.contains("well-formed JSON"));
     }
 
     #[test]

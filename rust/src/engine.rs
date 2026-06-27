@@ -24,13 +24,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::actions::{ActionPlan, ActionsFile, SessionContext};
 use crate::cosmos::CosmosClient;
 use crate::embeddings::EmbeddingClient;
-use crate::executor::Executor;
 use crate::llm::LlmClient;
 use crate::prompt::{now_rfc3339, Call1Prompt, Call2Prompt};
-use crate::response_context::{build_response_data_context, parse_call1_extras, RetrievalGroup};
+use crate::pull_data_controller::PullDataController;
+use crate::push_data_controller::PushDataController;
 use crate::web_search::BraveClient;
 
 /// The result of one turn, serialized as the front end's `ReplyResult`.
@@ -229,20 +228,29 @@ impl Engine {
         // --- LLM Call 2: the push / answer pass ----------------------------
         let call2 = Call2Prompt::build(user_id, input, &response_data_context, &requested_at);
         match client.complete(&call2.system, &call2.user) {
-            Ok(call2_raw) => TurnResult {
-                reply: extract_reply_text(&call2_raw),
-                verdict: "allow".to_string(),
-                routing: client.model().to_string(),
-                attention: 0.0,
-                thought_id,
-                searches: if searches.is_empty() {
-                    None
-                } else {
-                    Some(searches)
-                },
-                // Audit Call 2's actions.json and surface a short summary bubble.
-                actions_summary: summarize_call2_actions(&call2_raw),
-            },
+            Ok(call2_raw) => {
+                // Drive the shared push controller — the exact same parsing and
+                // audit the data-execution self-test runs. It yields both the
+                // reply text to show and the planned-side-effects summary bubble.
+                let push = PushDataController::process(&call2_raw);
+                // Capture the actions summary before moving the reply text into
+                // the result struct (both borrow `push`).
+                let actions_summary = push.actions_summary();
+                TurnResult {
+                    reply: push.reply_text,
+                    verdict: "allow".to_string(),
+                    routing: client.model().to_string(),
+                    attention: 0.0,
+                    thought_id,
+                    searches: if searches.is_empty() {
+                        None
+                    } else {
+                        Some(searches)
+                    },
+                    // Audit Call 2's actions.json and surface a short summary bubble.
+                    actions_summary,
+                }
+            }
             Err(err) => TurnResult {
                 reply: format!("Sorry, I could not complete my reply: {err}"),
                 verdict: "error".to_string(),
@@ -279,93 +287,19 @@ impl Engine {
         requested_at: &str,
         call1_raw: &str,
     ) -> (String, Vec<String>) {
-        // Call 1's non-action documents always parse (degrading to defaults).
-        let extras = parse_call1_extras(call1_raw);
-
-        let mut groups: Vec<RetrievalGroup> = Vec::new();
-        let mut searches: Vec<String> = Vec::new();
-
-        // Parse the action plan; without one we still emit a deterministic (but
-        // result-free) context from the extras alone.
-        if let Some(mut actions) = crate::actions::parse_call1_actions(call1_raw) {
-            // Honour the GAIA_FORCE_SEMANTIC override exactly as the self-test does.
-            if crate::executor::force_semantic() {
-                crate::executor::force_semantic_on(&mut actions);
-            }
-
-            // Split the plan into Cosmos-backed queries and Web searches.
-            let (web_actions, cosmos_actions): (Vec<ActionPlan>, Vec<ActionPlan>) = actions
-                .actions
-                .into_iter()
-                .partition(|action| action.target.eq_ignore_ascii_case("Web"));
-
-            // --- Cosmos retrieval ---------------------------------------
-            if !cosmos_actions.is_empty() {
-                if let Some(cosmos) = &self.cosmos {
-                    // Preserve the action id + target alongside each outcome.
-                    let targets: Vec<String> =
-                        cosmos_actions.iter().map(|a| a.target.clone()).collect();
-                    let action_ids: Vec<String> =
-                        cosmos_actions.iter().map(|a| a.id.clone()).collect();
-                    let plan = ActionsFile {
-                        version: actions.version.clone(),
-                        session: SessionContext {
-                            user_id: user_id.to_string(),
-                            requested_at: requested_at.to_string(),
-                        },
-                        actions: cosmos_actions,
-                    };
-                    let outcomes = match &self.embedder {
-                        Some(embedder) => {
-                            Executor::with_embedder(cosmos, Some(embedder.clone())).run(&plan)
-                        }
-                        None => Executor::new(cosmos).run(&plan),
-                    };
-                    for ((target, action_id), outcome) in
-                        targets.iter().zip(action_ids.iter()).zip(outcomes.iter())
-                    {
-                        if let Ok(records) = &outcome.result {
-                            let records: Vec<serde_json::Value> = records
-                                .iter()
-                                .filter_map(|r| serde_json::to_value(r).ok())
-                                .collect();
-                            groups.push(RetrievalGroup {
-                                action_id: action_id.clone(),
-                                container: target.clone(),
-                                records,
-                            });
-                        }
-                    }
-                }
-            }
-
-            // --- Web (Brave) retrieval ----------------------------------
-            if !web_actions.is_empty() {
-                if let Some(brave) = &self.web_search {
-                    for action in &web_actions {
-                        if action.validate().is_err() {
-                            continue;
-                        }
-                        let query = web_query_for(action, input);
-                        if let Ok(results) = brave.search(&query, action.effective_top()) {
-                            searches.push(query);
-                            let records: Vec<serde_json::Value> = results
-                                .iter()
-                                .filter_map(|r| serde_json::to_value(r).ok())
-                                .collect();
-                            groups.push(RetrievalGroup {
-                                action_id: action.id.clone(),
-                                container: "Web".to_string(),
-                                records,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        let context = build_response_data_context(user_id, input, requested_at, &extras, &groups);
-        (context, searches)
+        // Drive the shared pull controller — the exact same code the
+        // data-retrieval self-test runs — and keep only what the reply needs:
+        // the assembled context and the web queries that ran. We pass
+        // `capture_queries = false` because the cloud app does not need the
+        // per-query SQL audit (and capturing it would cost an extra embedding
+        // call per semantic action).
+        let result = PullDataController::new(
+            self.cosmos.as_ref(),
+            self.embedder.as_ref(),
+            self.web_search.as_ref(),
+        )
+        .execute(user_id, input, requested_at, call1_raw, false);
+        (result.context, result.searches)
     }
 }
 
@@ -381,97 +315,6 @@ fn skeleton_reply(user_id: &str, input: &str) -> String {
              real thought sequence."
         )
     }
-}
-
-/// Choose the query string for a `Web` action.
-///
-/// The model's free-text `text` filter is the most precise signal, then its
-/// `intent`; if neither is present we fall back to the user's input so a Web
-/// action always has *something* to search for. Mirrors the self-test's
-/// `web_query_for` so the cloud app and the probe behave identically.
-fn web_query_for(action: &ActionPlan, input: &str) -> String {
-    if let Some(text) = action
-        .filters
-        .text
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-    {
-        return text.to_string();
-    }
-    let intent = action.intent.trim();
-    if !intent.is_empty() {
-        return intent.to_string();
-    }
-    input.trim().to_string()
-}
-
-/// Summarize the side effects LLM Call 2 planned in its `actions.json`.
-///
-/// Call 2 emits `[response.json, actions.json]`; this reads the second document,
-/// audits it with the exact same classifier the push-pass self-test uses
-/// ([`crate::data_execution::audit_actions`]), and renders a short multi-line
-/// summary ([`crate::data_execution::summarize_actions`]). Returns `None` when
-/// the reply has no parseable actions document or planned nothing actionable, so
-/// the [`TurnResult::actions_summary`] field is simply omitted.
-fn summarize_call2_actions(raw: &str) -> Option<String> {
-    let cleaned = strip_code_fences(raw.trim());
-    let documents = crate::actions::extract_call1_array(cleaned)?;
-    let actions = documents.get(1)?;
-    let audit = crate::data_execution::audit_actions(actions);
-    let summary = crate::data_execution::summarize_actions(&audit);
-    if summary.trim().is_empty() {
-        None
-    } else {
-        Some(summary)
-    }
-}
-
-/// Pull Gaia's reply text out of LLM Call 2's raw output.
-///
-/// Call 2 is asked to emit `[response.json, actions.json]`. We try to honour
-/// that structure: parse the (fence-stripped) output as JSON and read
-/// `response.json.text`. If the model strayed from the format, we fall back to
-/// the raw text so the user still sees *something* rather than an empty bubble.
-fn extract_reply_text(raw: &str) -> String {
-    let cleaned = strip_code_fences(raw.trim());
-
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(cleaned) {
-        // Preferred shape: a JSON array whose first element is response.json.
-        if let Some(text) = value
-            .as_array()
-            .and_then(|a| a.first())
-            .and_then(|first| first.get("text"))
-            .and_then(|t| t.as_str())
-        {
-            return text.trim().to_string();
-        }
-        // Tolerate a bare response.json object: { "text": ... }.
-        if let Some(text) = value.get("text").and_then(|t| t.as_str()) {
-            return text.trim().to_string();
-        }
-    }
-
-    // The model did not return parseable JSON; show its raw text.
-    cleaned.to_string()
-}
-
-/// Strip a leading/trailing Markdown code fence (```/```json) if present.
-fn strip_code_fences(text: &str) -> &str {
-    let trimmed = text.trim();
-    let Some(after_open) = trimmed.strip_prefix("```") else {
-        return trimmed;
-    };
-    // Drop an optional language tag on the opening fence's line.
-    let after_lang = match after_open.split_once('\n') {
-        Some((_lang, rest)) => rest,
-        None => after_open,
-    };
-    after_lang
-        .trim_end()
-        .strip_suffix("```")
-        .unwrap_or(after_lang)
-        .trim()
 }
 
 /// Process-wide counter making generated ids unique even within the same
@@ -504,53 +347,6 @@ mod tests {
         assert!(result.reply.contains("hello"));
         assert!(result.reply.contains("alice"));
         assert!(result.thought_id.starts_with("th_"));
-    }
-
-    #[test]
-    fn extracts_text_from_response_array() {
-        let raw = r#"[{"text":"Hi there","emote":"warm","medium":"console"},{"version":"1.0"}]"#;
-        assert_eq!(extract_reply_text(raw), "Hi there");
-    }
-
-    #[test]
-    fn extracts_text_from_bare_object() {
-        assert_eq!(extract_reply_text(r#"{"text":"hello"}"#), "hello");
-    }
-
-    #[test]
-    fn strips_code_fences_before_parsing() {
-        let raw = "```json\n[{\"text\":\"fenced\"}]\n```";
-        assert_eq!(extract_reply_text(raw), "fenced");
-    }
-
-    #[test]
-    fn falls_back_to_raw_text_when_not_json() {
-        assert_eq!(extract_reply_text("just words"), "just words");
-    }
-
-    #[test]
-    fn summarizes_call2_actions_from_the_second_document() {
-        // A well-formed [response.json, actions.json] reply yields a summary that
-        // names each planned side effect.
-        let raw = r#"[
-          { "text": "Hello" },
-          { "actions": [
-            { "id": "a1", "kind": "send", "target": "WhatsApp",
-              "to_name": "Jonty", "message": "Hi", "urgency": 0.7 },
-            { "id": "a4", "kind": "upsert", "target": "GaiaDiary", "payload": {} }
-          ] }
-        ]"#;
-        let summary = summarize_call2_actions(raw).expect("a summary");
-        assert!(summary.contains("WhatsApp to Jonty: sent"));
-        assert!(summary.contains("Saved to: GaiaDiary"));
-    }
-
-    #[test]
-    fn summarizes_call2_actions_returns_none_without_actions() {
-        // Only response.json present (no second element): nothing to summarize.
-        assert!(summarize_call2_actions(r#"[{ "text": "Hi" }]"#).is_none());
-        // Not parseable as a JSON array at all.
-        assert!(summarize_call2_actions("just words").is_none());
     }
 
     #[test]
