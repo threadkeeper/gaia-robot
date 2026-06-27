@@ -126,6 +126,22 @@ pub struct LlmClient {
     auth: AuthScheme,
 }
 
+/// The result of a single chat completion.
+///
+/// Carries both the assistant's text and the model that actually produced it.
+/// For the Azure Foundry model-router, [`Completion::model`] reports the
+/// *underlying* model the router chose (e.g. `gpt-4.1-2025-04-14`) rather than
+/// the `model-router` deployment name in the request, so debug output can
+/// surface the real model that ran each call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    /// The assistant's reply text, already trimmed.
+    pub content: String,
+    /// The model the backend reported in its response, when present. `None`
+    /// when the backend omitted the `model` field from the response body.
+    pub model: Option<String>,
+}
+
 impl LlmClient {
     /// Build a client from the environment, or return `Ok(None)` when dev/local
     /// LLM mode is not enabled.
@@ -222,11 +238,13 @@ impl LlmClient {
         &self.endpoint
     }
 
-    /// Send a single-turn chat completion and return the assistant's text.
+    /// Send a single-turn chat completion and return the assistant's reply.
     ///
     /// `system` carries Gaia's context/instructions; `user` is the end user's
-    /// input. The call is blocking and returns the trimmed message content.
-    pub fn complete(&self, system: &str, user: &str) -> Result<String, LlmError> {
+    /// input. The call is blocking. The returned [`Completion`] holds the
+    /// trimmed message content plus the model the backend reported producing it
+    /// — for the model-router that is the underlying model it selected.
+    pub fn complete(&self, system: &str, user: &str) -> Result<Completion, LlmError> {
         let body = build_request_body(&self.model, system, user, DEFAULT_MAX_TOKENS);
 
         // Serialize with serde_json directly (rather than ureq's optional json
@@ -634,10 +652,20 @@ fn build_request_body<'a>(
     }
 }
 
-/// Extract the assistant's message text from a chat-completions JSON body.
-fn parse_completion(body: &str) -> Result<String, LlmError> {
+/// Extract the assistant's reply (text + reported model) from a
+/// chat-completions JSON body.
+fn parse_completion(body: &str) -> Result<Completion, LlmError> {
     let parsed: ChatResponse =
         serde_json::from_str(body).map_err(|e| LlmError::Decode(e.to_string()))?;
+
+    // The model the backend actually used. For the model-router this is the
+    // underlying model it picked; for plain backends it's the model we asked
+    // for. Normalised to `None` if absent or blank so callers don't surface an
+    // empty string.
+    let model = parsed
+        .model
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
 
     let content = parsed
         .choices
@@ -650,7 +678,7 @@ fn parse_completion(body: &str) -> Result<String, LlmError> {
     if content.is_empty() {
         Err(LlmError::EmptyResponse)
     } else {
-        Ok(content)
+        Ok(Completion { content, model })
     }
 }
 
@@ -684,6 +712,12 @@ struct ChatMessage<'a> {
 /// The subset of the chat-completions response we care about.
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
+    /// The model that actually produced the completion. For the Azure Foundry
+    /// model-router this is the *underlying* model the router selected (e.g.
+    /// `gpt-4.1-2025-04-14`), not the `model-router` deployment name we sent.
+    /// Optional because not every OpenAI-compatible backend echoes it.
+    #[serde(default)]
+    model: Option<String>,
     choices: Vec<ChatChoice>,
 }
 
@@ -911,7 +945,26 @@ COSMOS_ENDPOINT=https://example.documents.azure.com:443/\n\
     #[test]
     fn parse_completion_extracts_first_choice_content() {
         let body = r#"{"choices":[{"message":{"role":"assistant","content":"  pong  "}}]}"#;
-        assert_eq!(parse_completion(body).unwrap(), "pong");
+        assert_eq!(parse_completion(body).unwrap().content, "pong");
+    }
+
+    #[test]
+    fn parse_completion_surfaces_the_underlying_router_model() {
+        // The model-router echoes the model it actually selected in `model`;
+        // parse_completion must surface that, not the deployment name we sent.
+        let body = r#"{"model":"gpt-4.1-2025-04-14","choices":[{"message":{"content":"hi"}}]}"#;
+        let completion = parse_completion(body).unwrap();
+        assert_eq!(completion.content, "hi");
+        assert_eq!(completion.model.as_deref(), Some("gpt-4.1-2025-04-14"));
+    }
+
+    #[test]
+    fn parse_completion_reports_no_model_when_absent_or_blank() {
+        let body = r#"{"choices":[{"message":{"content":"hi"}}]}"#;
+        assert_eq!(parse_completion(body).unwrap().model, None);
+
+        let blank = r#"{"model":"   ","choices":[{"message":{"content":"hi"}}]}"#;
+        assert_eq!(parse_completion(blank).unwrap().model, None);
     }
 
     #[test]
@@ -1003,7 +1056,7 @@ COSMOS_ENDPOINT=https://example.documents.azure.com:443/\n\
             .expect("complete succeeds against the mock");
 
         // The content is trimmed before being returned.
-        assert_eq!(text, "hello there");
+        assert_eq!(text.content, "hello there");
         handle.join().expect("mock server thread joins");
     }
 

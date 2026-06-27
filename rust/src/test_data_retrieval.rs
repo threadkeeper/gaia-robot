@@ -413,7 +413,8 @@ impl DataRetrievalProbe {
         let requested_at = now_rfc3339();
         let call1 = Call1Prompt::build(PROBE_USER_ID, question, "", &requested_at);
         let reply = match self.llm.complete(&call1.system, &call1.user) {
-            Ok(reply) => reply,
+            // Self-tests only need the reply text, not the reported model.
+            Ok(reply) => reply.content,
             Err(err) => {
                 metrics.notes.push(format!("LLM Call 1 failed: {err}"));
                 return (metrics, artifacts);

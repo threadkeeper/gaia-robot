@@ -303,16 +303,21 @@ impl Engine {
         };
 
         let requested_at = now_rfc3339();
+        // The configured deployment name (e.g. `model-router`). Used as the
+        // routing label and as a fallback when a response doesn't report which
+        // underlying model actually ran.
         let model = client.model().to_string();
 
         // --- LLM Call 1: the pull / research pass --------------------------
         let call1 = Call1Prompt::build(user_id, input, "", &requested_at);
         let call1_start = Instant::now();
-        let call1_raw = match client.complete(&call1.system, &call1.user) {
-            Ok(text) => text,
+        // Capture both the text and the model the backend reported. For the
+        // model-router, `call1_model` is the underlying model it selected.
+        let (call1_raw, call1_model) = match client.complete(&call1.system, &call1.user) {
+            Ok(completion) => (completion.content, completion.model),
             Err(err) => {
                 // Call 1 failed: we can still answer, just without a research plan.
-                format!("(LLM Call 1 failed: {err})")
+                (format!("(LLM Call 1 failed: {err})"), None)
             }
         };
         let call1_ms = call1_start.elapsed().as_millis() as u64;
@@ -327,9 +332,11 @@ impl Engine {
             self.assemble_context(user_id, input, &requested_at, &call1_raw);
 
         // Diagnostics for the pull pass shown in the UI debug panel: which model
-        // ran Call 1, how long it took, and the retrieval actions it chose.
+        // ran Call 1, how long it took, and the retrieval actions it chose. Use
+        // the underlying model the router actually selected, falling back to the
+        // deployment name when the response didn't report one.
         let pull_debug = PullDebug {
-            model: model.clone(),
+            model: call1_model.clone().unwrap_or_else(|| model.clone()),
             llm_ms: call1_ms,
             actions: pull_actions,
         };
@@ -340,7 +347,11 @@ impl Engine {
         let call2_result = client.complete(&call2.system, &call2.user);
         let call2_ms = call2_start.elapsed().as_millis() as u64;
         match call2_result {
-            Ok(call2_raw) => {
+            Ok(call2) => {
+                // The underlying model the router selected for Call 2 (falls back
+                // to the deployment name when the response didn't report one).
+                let call2_model = call2.model.clone().unwrap_or_else(|| model.clone());
+                let call2_raw = call2.content;
                 // Drive the shared push controller — the exact same parsing and
                 // audit the data-execution self-test runs. It yields both the
                 // reply text to show and the planned-side-effects summary bubble.
@@ -374,7 +385,7 @@ impl Engine {
                     actions_summary,
                     pull_debug: Some(pull_debug),
                     push_debug: Some(PushDebug {
-                        model,
+                        model: call2_model,
                         llm_ms: call2_ms,
                         actions: push_action_timings,
                     }),
@@ -641,6 +652,50 @@ mod tests {
     fn completion(content: &str) -> String {
         let escaped = content.replace('\\', "\\\\").replace('"', "\\\"");
         format!(r#"{{"choices":[{{"message":{{"content":"{escaped}"}}}}]}}"#)
+    }
+
+    /// Like [`completion`], but also includes the `model` field the Azure
+    /// model-router echoes to report the underlying model it selected.
+    fn completion_with_model(content: &str, model: &str) -> String {
+        let escaped = content.replace('\\', "\\\\").replace('"', "\\\"");
+        format!(
+            r#"{{"model":"{model}","choices":[{{"message":{{"content":"{escaped}"}}}}]}}"#
+        )
+    }
+
+    #[test]
+    fn run_turn_surfaces_the_underlying_router_model_in_debug() {
+        // When the (router) backend reports which underlying model actually ran,
+        // the pull/push debug panels must show that model — not the configured
+        // `model-router`/`gpt-test` deployment name. `routing` keeps the
+        // deployment label.
+        let (endpoint, handle) = crate::test_http::spawn_mock_http_sequence(vec![
+            (
+                "200 OK".to_string(),
+                completion_with_model("call-1 analysis", "gpt-4.1-2025-04-14"),
+            ),
+            (
+                "200 OK".to_string(),
+                completion_with_model("Final answer.", "gpt-5-mini-2025-08-07"),
+            ),
+        ]);
+        let llm = LlmClient::for_test(endpoint);
+        let engine = Engine::new(Some(llm), None);
+
+        let result = engine.run_turn("alice", "what's up?");
+
+        // Routing still names the configured deployment.
+        assert_eq!(result.routing, "gpt-test");
+        // Each debug panel reports the underlying model that ran that call.
+        assert_eq!(
+            result.pull_debug.expect("pull debug present").model,
+            "gpt-4.1-2025-04-14"
+        );
+        assert_eq!(
+            result.push_debug.expect("push debug present").model,
+            "gpt-5-mini-2025-08-07"
+        );
+        handle.join().expect("mock server thread joins");
     }
 
     #[test]

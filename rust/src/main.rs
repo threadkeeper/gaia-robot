@@ -441,7 +441,14 @@ fn main() -> ExitCode {
 
                     let completion = client.complete(&system, &user);
                     let rendered = match &completion {
-                        Ok(reply) => format!("[{} via {}]\n{reply}", step.title(), client.model()),
+                        // Surface the model the backend reported running. For the
+                        // model-router this is the underlying model it selected;
+                        // fall back to the configured deployment name only when
+                        // the response omitted a model.
+                        Ok(reply) => {
+                            let model = reply.model.as_deref().unwrap_or_else(|| client.model());
+                            format!("[{} via {}]\n{}", step.title(), model, reply.content)
+                        }
                         Err(err) => format!("[{} failed] {err}", step.title()),
                     };
                     if writeln!(output, "{rendered}").is_err() {
@@ -457,7 +464,7 @@ fn main() -> ExitCode {
                     if step.title() == "LLM Call 1" {
                         if let (Ok(reply), Some(cosmos)) = (&completion, &cosmos_client) {
                             let (context, log) =
-                                run_pull_actions(cosmos, embedding_client.as_ref(), reply);
+                                run_pull_actions(cosmos, embedding_client.as_ref(), &reply.content);
                             if writeln!(output, "{log}").is_err() {
                                 return ExitCode::FAILURE;
                             }

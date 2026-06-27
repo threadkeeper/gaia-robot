@@ -335,7 +335,8 @@ impl DataExecutionProbe {
             self.controller
                 .build_prompt(PROBE_USER_ID, &question, &context, &requested_at);
         let reply = match self.llm.complete(&prompt.system, &prompt.user) {
-            Ok(reply) => reply,
+            // Self-tests only need the reply text, not the reported model.
+            Ok(reply) => reply.content,
             Err(err) => {
                 metrics.notes.push(format!("LLM Call 2 failed: {err}"));
                 return (metrics, artifacts);
