@@ -30,6 +30,17 @@ use crate::executor::Executor;
 use crate::response_context::{build_response_data_context, parse_call1_extras, RetrievalGroup};
 use crate::web_search::BraveClient;
 
+/// Minimum number of results to fetch for a `Web` action.
+///
+/// Web search snippets are noisy: the single top-ranked page is often a
+/// JavaScript-rendered landing page (e.g. a weather site) whose description is a
+/// run-on of forecast phrases with no usable numbers, while the concrete facts
+/// (a temperature, a "no rain expected") live in results #2–#5. The model's
+/// `top` is tuned for Cosmos top-N reads, so for `Web` actions we ignore a tiny
+/// `top` and always request at least this many results to give LLM Call 2 enough
+/// grounding to actually answer. A larger model-chosen `top` is still honoured.
+const MIN_WEB_RESULT_COUNT: usize = 5;
+
 /// The exact Cosmos query that was planned for one retrieval action.
 ///
 /// This makes the retrieval mode auditable: a `VectorDistance(...)` SQL proves
@@ -320,7 +331,9 @@ impl<'a> PullDataController<'a> {
             }
 
             let query = web_query_for(action, input);
-            match client.search(&query, action.effective_top()) {
+            // Fetch at least MIN_WEB_RESULT_COUNT results so a noisy top snippet
+            // does not starve the context; honour a larger model-chosen top.
+            match client.search(&query, web_result_count(action)) {
                 Ok(results) => {
                     searches.push(query);
                     let values: Vec<serde_json::Value> = results
@@ -365,6 +378,18 @@ pub fn web_query_for(action: &ActionPlan, fallback: &str) -> String {
     fallback.trim().to_string()
 }
 
+/// Decide how many results to request from Brave for one `Web` action.
+///
+/// The model's `top` is tuned for Cosmos top-N reads and is frequently `1` for a
+/// "give me the current X" web question. A single web snippet is unreliable
+/// grounding — the top-ranked page is often a script-rendered landing page whose
+/// description carries no usable facts — so we request at least
+/// [`MIN_WEB_RESULT_COUNT`] results, while still honouring a larger model-chosen
+/// `top`.
+fn web_result_count(action: &ActionPlan) -> usize {
+    action.effective_top().max(MIN_WEB_RESULT_COUNT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,6 +429,27 @@ mod tests {
         // With neither, fall back to the caller's input.
         let bare = web_action("   ", None);
         assert_eq!(web_query_for(&bare, "  the question  "), "the question");
+    }
+
+    #[test]
+    fn web_result_count_enforces_a_minimum_floor() {
+        // A tiny model-chosen top (the common "give me the current X" case) is
+        // raised to the floor so a single noisy snippet cannot starve grounding.
+        let mut action = web_action("current weather", None);
+        action.top = 1;
+        assert_eq!(web_result_count(&action), MIN_WEB_RESULT_COUNT);
+
+        // top = 0 means "unset"; effective_top() makes it 3, still below the floor.
+        action.top = 0;
+        assert_eq!(web_result_count(&action), MIN_WEB_RESULT_COUNT);
+    }
+
+    #[test]
+    fn web_result_count_honours_a_larger_model_choice() {
+        // When the model deliberately asks for more than the floor, respect it.
+        let mut action = web_action("broad survey", None);
+        action.top = 12;
+        assert_eq!(web_result_count(&action), 12);
     }
 
     #[test]

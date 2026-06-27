@@ -5,7 +5,7 @@
 //! *retrieval* half of a turn actually works against live infrastructure before
 //! we ship a new build:
 //!
-//! 1. Ask the model **five** fixed questions of varying length and subject, each
+//! 1. Ask the model **six** fixed questions of varying length and subject, each
 //!    scoped to the `threadkeeper` user (user isolation).
 //! 2. Parse the `actions.json` document out of each LLM Call 1 reply (the same
 //!    [`crate::actions::parse_call1_actions`] parser the console pull pass uses).
@@ -40,10 +40,10 @@ use crate::web_search::BraveClient;
 /// exports under `migrations/`, so the queries run against real seeded data.
 const PROBE_USER_ID: &str = "threadkeeper";
 
-/// The five fixed probe questions, chosen to vary in **length** and **subject**
+/// The six fixed probe questions, chosen to vary in **length** and **subject**
 /// so the model authors a spread of retrieval actions (personal recall, durable
 /// facts, fresh web facts, and relationship/diary lookups).
-const PROBE_QUESTIONS: [&str; 5] = [
+const PROBE_QUESTIONS: [&str; 6] = [
     // 1. Double-barrelled: GaiaKB facts + GaiaDataLake conversation recall.
     "What do you know about Jonty's hobbies and interests and can you look up what you told \
      me about hiking recently?",
@@ -59,6 +59,9 @@ const PROBE_QUESTIONS: [&str; 5] = [
     // 5. Relationship / diary lookup.
     "How has our friendship been going lately, and is there anything you noted in your diary \
      about me?",
+    // 6. Fresh web facts: live weather, exercising the Brave web-search action.
+    "Hi Gaia , please can you check what the temperature and the chance of rain is right now \
+     in Cape Town South Africa",
 ];
 
 /// Per-question retrieval metrics gathered by the probe.
@@ -271,7 +274,7 @@ impl DataRetrievalProbe {
     /// self-test passed.
     ///
     /// When `only` is `Some(n)`, run only question `n` (1-based). When `None`,
-    /// run all five. When `output_dir` is set, write pretty-printed JSON
+    /// run all six. When `output_dir` is set, write pretty-printed JSON
     /// artifacts into `output_dir/q1/`, `output_dir/q2/`, etc. The boolean is
     /// the gate: `true` only when every executed question succeeded. The caller
     /// maps it to the process exit code.

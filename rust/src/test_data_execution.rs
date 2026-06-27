@@ -45,7 +45,7 @@ use crate::push_data_controller::{urgency_in_range, ActionAudit, PushDataControl
 const PROBE_USER_ID: &str = "threadkeeper";
 
 /// The number of turns the probe runs, one per `tests/LLM1/t{N}/` folder.
-const TURN_COUNT: usize = 5;
+const TURN_COUNT: usize = 6;
 
 /// Per-turn outcome of the push-pass probe.
 #[derive(Debug, Clone)]
@@ -207,7 +207,7 @@ impl DataExecutionProbe {
     ///
     /// `input_dir` is where each turn's `responsedatacontext.md` is read from
     /// (the `tests/LLM1` folder). When `output_dir` is set, per-turn artifacts
-    /// are written into `output_dir/t1 … t5`. When `only` is `Some(n)`, run only
+    /// are written into `output_dir/t1 … t6`. When `only` is `Some(n)`, run only
     /// turn `n` (1-based). The boolean is the gate: `true` only when every
     /// executed turn passed.
     pub fn run(
