@@ -196,7 +196,9 @@ impl EmbeddingClient {
         let payload =
             serde_json::to_vec(&body).map_err(|e| EmbeddingError::Decode(e.to_string()))?;
 
-        let request = ureq::post(&self.endpoint).set("Content-Type", "application/json");
+        let request = ureq::post(&self.endpoint)
+            .timeout(crate::llm::HTTP_TIMEOUT)
+            .set("Content-Type", "application/json");
         let request = match self.auth_scheme {
             AuthScheme::ApiKey => request.set("api-key", &self.auth_token),
             AuthScheme::Bearer => {

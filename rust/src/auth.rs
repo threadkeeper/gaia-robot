@@ -216,6 +216,7 @@ impl Auth {
         // implement local JWKS validation.
         let url = format!("{GOOGLE_TOKENINFO}?id_token={id_token}");
         let resp = ureq::get(&url)
+            .timeout(crate::llm::TOKEN_HTTP_TIMEOUT)
             .call()
             .map_err(|e| format!("google tokeninfo request failed: {e}"))?;
 
@@ -285,6 +286,7 @@ impl Auth {
             .map_err(|e| format!("failed to serialize github token request: {e}"))?;
 
         let token_resp = ureq::post(GITHUB_TOKEN_URL)
+            .timeout(crate::llm::TOKEN_HTTP_TIMEOUT)
             .set("Accept", "application/json")
             .set("Content-Type", "application/json")
             .set("User-Agent", GITHUB_USER_AGENT)
@@ -306,6 +308,7 @@ impl Auth {
 
         // 2. Fetch the authenticated user's profile with the access token.
         let user_resp = ureq::get(GITHUB_USER_URL)
+            .timeout(crate::llm::TOKEN_HTTP_TIMEOUT)
             .set("Authorization", &format!("Bearer {access_token}"))
             .set("Accept", "application/vnd.github+json")
             .set("User-Agent", GITHUB_USER_AGENT)

@@ -38,6 +38,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +57,29 @@ const DEFAULT_USER_ID: &str = "threadkeeper";
 /// limit (32768) so we don't truncate completions; the router bills only for
 /// tokens actually produced, so a high ceiling costs nothing on short replies.
 const DEFAULT_MAX_TOKENS: u32 = 32_768;
+
+/// Overall timeout for a single outbound HTTP call to an upstream *data* service
+/// (embeddings, Cosmos, or web search).
+///
+/// This is the most important safety valve in the server: while a turn runs, the
+/// thread is blocked on an upstream socket and is **not** touching the client
+/// socket, so the per-connection client timeout cannot fire. Without an explicit
+/// bound here a stalled upstream would hang the whole turn — and the user's UI —
+/// indefinitely with no error. 30s is ample for a point read, query, embedding,
+/// or web search while still guaranteeing the turn eventually fails loudly.
+pub const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Overall timeout for a single outbound *model* HTTP call (an LLM chat
+/// completion). Model-router completions — especially Call 1's reasoning-heavy
+/// planning pass — can legitimately take far longer than a data call, so they
+/// get their own, more generous 2-minute bound rather than the 30s data limit.
+pub const LLM_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Overall timeout for a single outbound *token/identity* HTTP call (managed
+/// identity / IMDS / OAuth token exchange). These must be quick, and the IMDS
+/// fallback address (169.254.169.254) is unroutable off-Azure, so a short bound
+/// keeps a misconfigured host from stalling on a dead metadata endpoint.
+pub const TOKEN_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Errors that can occur while configuring or calling the LLM.
 #[derive(Debug)]
@@ -255,7 +279,9 @@ impl LlmClient {
         // Choose the authentication header based on the credential scheme:
         // Foundry API keys go in the Azure `api-key` header, while bearer tokens
         // (GitHub Models, Foundry AAD) use the standard `Authorization` header.
-        let request = ureq::post(&self.endpoint).set("Content-Type", "application/json");
+        let request = ureq::post(&self.endpoint)
+            .timeout(LLM_HTTP_TIMEOUT)
+            .set("Content-Type", "application/json");
         let request = match self.auth {
             AuthScheme::ApiKey => request.set("api-key", &self.token),
             AuthScheme::Bearer => request.set("Authorization", &format!("Bearer {}", self.token)),
@@ -287,7 +313,9 @@ impl LlmClient {
         let body = build_request_body(&self.model, "health check", "ping", DEFAULT_MAX_TOKENS);
         let payload = serde_json::to_vec(&body).map_err(|e| LlmError::Decode(e.to_string()))?;
 
-        let request = ureq::post(&self.endpoint).set("Content-Type", "application/json");
+        let request = ureq::post(&self.endpoint)
+            .timeout(LLM_HTTP_TIMEOUT)
+            .set("Content-Type", "application/json");
         let request = match self.auth {
             AuthScheme::ApiKey => request.set("api-key", &self.token),
             AuthScheme::Bearer => request.set("Authorization", &format!("Bearer {}", self.token)),
@@ -484,7 +512,11 @@ pub fn managed_identity_token(resource: &str) -> Option<String> {
                     endpoint,
                     percent_encode_query_value(resource_value)
                 );
-                if let Ok(response) = ureq::get(&url).set("X-IDENTITY-HEADER", &header).call() {
+                if let Ok(response) = ureq::get(&url)
+                    .timeout(TOKEN_HTTP_TIMEOUT)
+                    .set("X-IDENTITY-HEADER", &header)
+                    .call()
+                {
                     if let Ok(body) = response.into_string() {
                         if let Some(token) = parse_managed_identity_access_token(&body) {
                             return Some(token);
@@ -505,7 +537,11 @@ pub fn managed_identity_token(resource: &str) -> Option<String> {
                     endpoint,
                     percent_encode_query_value(resource_value)
                 );
-                if let Ok(response) = ureq::get(&url).set("secret", &secret).call() {
+                if let Ok(response) = ureq::get(&url)
+                    .timeout(TOKEN_HTTP_TIMEOUT)
+                    .set("secret", &secret)
+                    .call()
+                {
                     if let Ok(body) = response.into_string() {
                         if let Some(token) = parse_managed_identity_access_token(&body) {
                             return Some(token);
@@ -523,7 +559,11 @@ pub fn managed_identity_token(resource: &str) -> Option<String> {
             "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource={}",
             percent_encode_query_value(resource_value)
         );
-        if let Ok(response) = ureq::get(&imds_url).set("Metadata", "true").call() {
+        if let Ok(response) = ureq::get(&imds_url)
+            .timeout(TOKEN_HTTP_TIMEOUT)
+            .set("Metadata", "true")
+            .call()
+        {
             if let Ok(body) = response.into_string() {
                 if let Some(token) = parse_managed_identity_access_token(&body) {
                     return Some(token);

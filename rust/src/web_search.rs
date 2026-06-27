@@ -114,6 +114,7 @@ impl BraveClient {
         let url = build_search_url(&self.endpoint, query, count);
 
         let response = ureq::get(&url)
+            .timeout(crate::llm::HTTP_TIMEOUT)
             // Brave authenticates with a subscription token, not a bearer token.
             .set("X-Subscription-Token", &self.api_key)
             .set("Accept", "application/json")

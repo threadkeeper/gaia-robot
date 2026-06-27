@@ -336,6 +336,7 @@ impl CosmosClient {
         let url = format!("{}dbs/{}", self.endpoint, self.database);
         let auth = aad_auth_header(&self.bearer()?);
         ureq::get(&url)
+            .timeout(crate::llm::HTTP_TIMEOUT)
             .set("Authorization", &auth)
             .set("x-ms-date", &now_rfc1123())
             .set("x-ms-version", API_VERSION)
@@ -398,6 +399,7 @@ impl CosmosClient {
 
         let auth = aad_auth_header(&self.bearer()?);
         let response = ureq::post(&url)
+            .timeout(crate::llm::HTTP_TIMEOUT)
             .set("Authorization", &auth)
             .set("x-ms-date", &now_rfc1123())
             .set("x-ms-version", API_VERSION)
@@ -452,6 +454,7 @@ impl CosmosClient {
 
         let auth = aad_auth_header(&self.bearer()?);
         ureq::post(&url)
+            .timeout(crate::llm::HTTP_TIMEOUT)
             .set("Authorization", &auth)
             .set("x-ms-date", &now_rfc1123())
             .set("x-ms-version", API_VERSION)
@@ -526,6 +529,7 @@ impl CosmosClient {
 
         let auth = aad_auth_header(&self.bearer()?);
         let result = ureq::post(&url)
+            .timeout(crate::llm::HTTP_TIMEOUT)
             .set("Authorization", &auth)
             .set("x-ms-date", &now_rfc1123())
             .set("x-ms-version", API_VERSION)
@@ -558,6 +562,7 @@ impl CosmosClient {
 
         let auth = aad_auth_header(&self.bearer()?);
         let result = ureq::get(&url)
+            .timeout(crate::llm::HTTP_TIMEOUT)
             .set("Authorization", &auth)
             .set("x-ms-date", &now_rfc1123())
             .set("x-ms-version", API_VERSION)
@@ -601,6 +606,7 @@ impl CosmosClient {
 
         let auth = aad_auth_header(&self.bearer()?);
         let result = ureq::get(&url)
+            .timeout(crate::llm::HTTP_TIMEOUT)
             .set("Authorization", &auth)
             .set("x-ms-date", &now_rfc1123())
             .set("x-ms-version", API_VERSION)

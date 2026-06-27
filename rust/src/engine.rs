@@ -363,6 +363,14 @@ impl Engine {
         };
 
         let requested_at = now_rfc3339();
+        // A concise turn-start marker: WebSocket turns produce no access-log line
+        // (the upgrade returns before the logger), so this is the only signal
+        // that a turn was entered. It also bookends the per-phase timings below,
+        // making a hang easy to localise to Call 1, retrieval, Call 2, or write.
+        eprintln!(
+            "turn start: user={user_id} thought={thought_id} ({} input chars)",
+            input.len()
+        );
         // The configured deployment name (e.g. `model-router`). Used as the
         // routing label and as a fallback when a response doesn't report which
         // underlying model actually ran.
@@ -381,6 +389,7 @@ impl Engine {
             }
         };
         let call1_ms = call1_start.elapsed().as_millis() as u64;
+        eprintln!("turn {thought_id}: Call 1 done in {call1_ms}ms");
 
         // --- Retrieval + deterministic Response Data Context ---------------
         // Execute every retrieval action Call 1 planned and fold the results,
@@ -390,6 +399,10 @@ impl Engine {
         // in lock-step. It never makes an extra LLM call.
         let (response_data_context, searches, pull_actions) =
             self.assemble_context(user_id, input, &requested_at, &call1_raw);
+        eprintln!(
+            "turn {thought_id}: context assembled ({} web searches)",
+            searches.len()
+        );
 
         // Diagnostics for the pull pass shown in the UI debug panel: which model
         // ran Call 1, how long it took, and the retrieval actions it chose. Use
@@ -406,6 +419,7 @@ impl Engine {
         let call2_start = Instant::now();
         let call2_result = client.complete(&call2.system, &call2.user);
         let call2_ms = call2_start.elapsed().as_millis() as u64;
+        eprintln!("turn {thought_id}: Call 2 done in {call2_ms}ms");
         match call2_result {
             Ok(call2) => {
                 // The underlying model the router selected for Call 2 (falls back
