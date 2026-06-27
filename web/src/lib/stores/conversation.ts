@@ -103,7 +103,9 @@ function createConversation() {
             actionsSummary: result.actionsSummary,
             routerRounds: result.routerRounds,
             debug: result.debug,
-            flow: result.flow
+            flow: result.flow,
+            pullDebug: result.pullDebug,
+            pushDebug: result.pushDebug
           }
         });
 

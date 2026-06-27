@@ -73,6 +73,34 @@ export interface ActionTile {
   detail?: string;
 }
 
+/** Diagnostics for the pull pass (LLM Call 1 + retrieval), shown in the debug panel. */
+export interface PullDebug {
+  /** The model that produced LLM Call 1. */
+  model: string;
+  /** Wall-clock milliseconds spent in the LLM Call 1 request. */
+  llmMs: number;
+  /** The retrieval actions Call 1 chose this turn, e.g. `q1 → Web`. */
+  actions: string[];
+}
+
+/** One planned push action's type and time-to-process, in milliseconds. */
+export interface PushActionTiming {
+  /** Short label, e.g. `WhatsApp`, `Push`, `Actuate`, `Upsert GaiaKB`. */
+  type: string;
+  /** Milliseconds spent processing this one action (may be fractional). */
+  ms: number;
+}
+
+/** Diagnostics for the push pass (LLM Call 2 + side effects), shown in the debug panel. */
+export interface PushDebug {
+  /** The model that produced LLM Call 2. */
+  model: string;
+  /** Wall-clock milliseconds spent in the LLM Call 2 request. */
+  llmMs: number;
+  /** One entry per planned side effect: its type and processing time. */
+  actions: PushActionTiming[];
+}
+
 /** One ordered operation event emitted by Gaia internals. */
 export interface OperationEvent {
   seq: number;
@@ -118,6 +146,10 @@ export interface ReplyResult {
   debug?: DebugEntry[];
   /** Ordered operation flow for this turn. */
   flow?: OperationEvent[];
+  /** Pull-pass diagnostics (model, llm time, actions chosen). */
+  pullDebug?: PullDebug;
+  /** Push-pass diagnostics (model, llm time, per-action type + time). */
+  pushDebug?: PushDebug;
 }
 
 /** Subset of {@link ReplyResult} kept on a rendered message. */
@@ -136,6 +168,10 @@ export interface ReplyMeta {
   routerRounds?: RouterRound[];
   debug?: DebugEntry[];
   flow?: OperationEvent[];
+  /** Pull-pass diagnostics (model, llm time, actions chosen). */
+  pullDebug?: PullDebug;
+  /** Push-pass diagnostics (model, llm time, per-action type + time). */
+  pushDebug?: PushDebug;
 }
 
 /** SSE event frames emitted by /v1/conversations/{conv_id}/stream. */
