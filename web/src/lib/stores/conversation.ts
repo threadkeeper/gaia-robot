@@ -5,7 +5,7 @@
 import { browser } from '$app/environment';
 import { ApiError, sendMessage, streamWS } from '$lib/api/client';
 import { STREAM_TRANSPORT } from '$lib/config';
-import type { ChatMessage, ReplyResult } from '$lib/types';
+import type { ChatMessage, ReplyResult, TurnEvent } from '$lib/types';
 import { get, writable } from 'svelte/store';
 
 /**
@@ -88,10 +88,15 @@ function createConversation() {
      */
     async function runTurn(token: string): Promise<void> {
       let acc = '';
+      // Live process-log: events stream in as the engine moves through phases.
+      // We keep them on the message so the debug panel updates in real time,
+      // then fold the authoritative copy into `meta` when the turn completes.
+      const liveEvents: TurnEvent[] = [];
       const applyDone = (result: ReplyResult) =>
         patchMessage(replyId, {
           text: result.reply || acc,
           streaming: false,
+          events: result.events ?? liveEvents,
           meta: {
             verdict: result.verdict,
             routing: result.routing,
@@ -106,7 +111,8 @@ function createConversation() {
             flow: result.flow,
             pullDebug: result.pullDebug,
             pushDebug: result.pushDebug,
-            write: result.write
+            write: result.write,
+            events: result.events ?? liveEvents
           }
         });
 
@@ -117,6 +123,10 @@ function createConversation() {
             if (evt.kind === 'token') {
               acc += evt.token;
               patchMessage(replyId, { text: acc });
+            } else if (evt.kind === 'event') {
+              // Process-log entry — append and surface immediately.
+              liveEvents.push(evt.event);
+              patchMessage(replyId, { events: [...liveEvents] });
             } else if (evt.kind === 'done') {
               applyDone(evt.result);
             } else if (evt.kind === 'error') {

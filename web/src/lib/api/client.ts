@@ -214,6 +214,7 @@ export async function* streamWS(
     try {
       const msg = JSON.parse(ev.data);
       if (msg.type === 'token') queue.push({ kind: 'token', token: String(msg.token ?? '') });
+      else if (msg.type === 'event') queue.push({ kind: 'event', event: msg.event });
       else if (msg.type === 'done') {
         queue.push({ kind: 'done', result: msg.result as ReplyResult });
         socket.close();

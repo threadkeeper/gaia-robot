@@ -77,6 +77,38 @@ pub struct TurnResult {
     /// persist) and when Call 2 failed before producing a reply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub write: Option<WriteStatus>,
+    /// The live process-log for this turn: one ordered [`TurnEvent`] per phase
+    /// (pull model, retrieval, push model, persistence) plus any warning or
+    /// error encountered. These are streamed to the client as they happen (over
+    /// the WebSocket) and also returned in full so the debug panel can replay
+    /// them after the fact. Omitted from the JSON when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<TurnEvent>,
+}
+
+/// One streamed entry in a turn's live process-log.
+///
+/// Serialized as the front end's `TurnEvent`. The engine emits these as it moves
+/// through a turn so the user can see *what Gaia is doing right now* — running
+/// the pull model, assembling context, running the push model, persisting — and
+/// any warning or error is surfaced immediately rather than hidden in stderr.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TurnEvent {
+    /// Monotonic 0-based sequence number within the turn, for stable ordering.
+    pub seq: u64,
+    /// Which phase produced the event, e.g. `turn`, `pull`, `retrieval`,
+    /// `push`, or `persist`.
+    pub phase: String,
+    /// Severity: `info` for normal progress, `warn` for a non-fatal degradation,
+    /// or `error` for a failure that changed the outcome.
+    pub level: String,
+    /// Human-readable description of what just happened.
+    pub message: String,
+    /// Wall-clock milliseconds for the operation this event closes, when the
+    /// event marks the end of a timed step (e.g. the pull model call). Omitted
+    /// for plain progress markers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ms: Option<f64>,
 }
 
 /// Visible persistence status for the turn's Cosmos write-back.
@@ -93,6 +125,110 @@ pub struct WriteStatus {
     /// Human-readable detail: a short confirmation on success (id, action,
     /// size), or the underlying error on failure.
     pub detail: String,
+    /// Per-operation write latency — one [`WriteTiming`] for every Cosmos write
+    /// this turn (the `UsersDataLake` exchange record, each planned store
+    /// upsert, and each connection-ledger delta), in execution order, with the
+    /// actual wall-clock milliseconds it took. Lets the UI show the real latency
+    /// of every write rather than a single aggregate. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub operations: Vec<WriteTiming>,
+}
+
+/// The actual wall-clock latency of one Cosmos write, surfaced to the UI.
+///
+/// Serialized as the front end's `WriteTiming`. Unlike the push-pass
+/// [`PushActionTiming`] (which times the in-memory *audit* of a planned action),
+/// this measures the real network round-trip of the write itself.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WriteTiming {
+    /// A short label for the write, e.g. `UsersDataLake`, `Upsert GaiaDiary`,
+    /// or `GaiaConnections delta`.
+    #[serde(rename = "type")]
+    pub label: String,
+    /// Wall-clock milliseconds the write took (may be fractional).
+    pub ms: f64,
+    /// `true` when the write succeeded, `false` when it failed.
+    pub ok: bool,
+}
+
+/// Collects and (optionally) streams a turn's [`TurnEvent`] process-log.
+///
+/// The engine threads one reporter through a turn. Every `info`/`warn`/`error`
+/// call assigns the next sequence number, hands the event to the streaming
+/// `sink` (so the WebSocket route can forward it to the client immediately), and
+/// keeps a copy so the finished [`TurnResult`] carries the whole log for replay.
+/// Non-streaming callers pass a no-op sink and simply receive the collected log.
+struct TurnReporter<'a> {
+    /// The next sequence number to assign.
+    seq: u64,
+    /// Every event emitted so far, in order.
+    events: Vec<TurnEvent>,
+    /// Live sink invoked with each event as it is emitted.
+    sink: &'a mut dyn FnMut(&TurnEvent),
+}
+
+impl<'a> TurnReporter<'a> {
+    /// Create a reporter that streams to `sink` and collects every event.
+    fn new(sink: &'a mut dyn FnMut(&TurnEvent)) -> Self {
+        TurnReporter {
+            seq: 0,
+            events: Vec::new(),
+            sink,
+        }
+    }
+
+    /// Emit one event: assign its sequence number, stream it, and keep it.
+    fn emit(&mut self, phase: &str, level: &str, message: String, ms: Option<f64>) {
+        let event = TurnEvent {
+            seq: self.seq,
+            phase: phase.to_string(),
+            level: level.to_string(),
+            message,
+            ms,
+        };
+        self.seq += 1;
+        // Hand the event to the live stream first so the client sees it with the
+        // least delay, then retain a copy for the final result.
+        (self.sink)(&event);
+        self.events.push(event);
+    }
+
+    /// Emit a normal progress marker.
+    fn info(&mut self, phase: &str, message: String) {
+        self.emit(phase, "info", message, None);
+    }
+
+    /// Emit a progress marker that closes a timed step (carries its `ms`).
+    fn timed(&mut self, phase: &str, message: String, ms: u64) {
+        self.emit(phase, "info", message, Some(ms as f64));
+    }
+
+    /// Emit a non-fatal warning that closes a timed step.
+    fn warn_timed(&mut self, phase: &str, message: String, ms: u64) {
+        self.emit(phase, "warn", message, Some(ms as f64));
+    }
+
+    /// Emit a failure that closes a timed step.
+    fn error_timed(&mut self, phase: &str, message: String, ms: u64) {
+        self.emit(phase, "error", message, Some(ms as f64));
+    }
+
+    /// Emit a warning with no associated duration.
+    fn warn(&mut self, phase: &str, message: String) {
+        self.emit(phase, "warn", message, None);
+    }
+
+    /// Record one finished Cosmos write as a `persist`-phase event, choosing the
+    /// severity from whether it succeeded and carrying its real latency.
+    fn persist_write(&mut self, status: &WriteStatus, ms: f64) {
+        let level = if status.ok { "info" } else { "error" };
+        self.emit("persist", level, status.detail.clone(), Some(ms));
+    }
+
+    /// Drain and return every collected event (used once, when the turn ends).
+    fn take_events(&mut self) -> Vec<TurnEvent> {
+        std::mem::take(&mut self.events)
+    }
 }
 
 /// Debug diagnostics for the pull pass (LLM Call 1 + retrieval).
@@ -342,12 +478,35 @@ impl Engine {
     /// The call is blocking and always returns a [`TurnResult`]; failures are
     /// folded into the reply rather than surfaced as an error.
     pub fn run_turn(&self, user_id: &str, input: &str) -> TurnResult {
+        // Non-streaming callers (the POST route and tests) don't observe the
+        // process-log live; they still receive every event on the result via
+        // [`TurnResult::events`]. A no-op sink keeps the same code path.
+        self.run_turn_reported(user_id, input, &mut |_event| {})
+    }
+
+    /// Like [`Engine::run_turn`], but reports each phase to `sink` as a
+    /// [`TurnEvent`] the moment it happens.
+    ///
+    /// The WebSocket route passes a sink that forwards every event to the client
+    /// as a frame, so the user sees a live process-log ("running pull model…",
+    /// "context assembled", warnings, errors). Every event is also collected on
+    /// the returned [`TurnResult::events`] for later replay in the debug panel.
+    pub fn run_turn_reported(
+        &self,
+        user_id: &str,
+        input: &str,
+        sink: &mut dyn FnMut(&TurnEvent),
+    ) -> TurnResult {
         let thought_id = new_thought_id();
         let input = input.trim();
+        // One reporter threads the whole turn: it streams each event to `sink`
+        // and keeps a copy for the finished result.
+        let mut reporter = TurnReporter::new(sink);
 
         // No model configured: return a clear, friendly skeleton reply so the
         // front end is still usable without any Azure/GitHub credentials.
         let Some(client) = &self.llm else {
+            reporter.info("turn", "Skeleton mode: no model configured.".to_string());
             return TurnResult {
                 reply: skeleton_reply(user_id, input),
                 verdict: "allow".to_string(),
@@ -360,6 +519,7 @@ impl Engine {
                 push_debug: None,
                 // Skeleton mode persists nothing (no model, nothing to save).
                 write: None,
+                events: reporter.take_events(),
             };
         };
 
@@ -372,6 +532,7 @@ impl Engine {
             "turn start: user={user_id} thought={thought_id} ({} input chars)",
             input.len()
         );
+        reporter.info("turn", "Turn started.".to_string());
         // The configured deployment name (e.g. `model-router`). Used as the
         // routing label and as a fallback when a response doesn't report which
         // underlying model actually ran.
@@ -379,18 +540,24 @@ impl Engine {
 
         // --- LLM Call 1: the pull / research pass --------------------------
         let call1 = Call1Prompt::build(user_id, input, "", &requested_at);
+        reporter.info("pull", "Running pull model (LLM Call 1)…".to_string());
         let call1_start = Instant::now();
         // Capture both the text and the model the backend reported. For the
         // model-router, `call1_model` is the underlying model it selected.
-        let (call1_raw, call1_model) = match client.complete(&call1.system, &call1.user) {
-            Ok(completion) => (completion.content, completion.model),
+        let call1_outcome = client.complete(&call1.system, &call1.user);
+        let call1_ms = call1_start.elapsed().as_millis() as u64;
+        eprintln!("turn {thought_id}: Call 1 done in {call1_ms}ms");
+        let (call1_raw, call1_model) = match call1_outcome {
+            Ok(completion) => {
+                reporter.timed("pull", "Pull model responded.".to_string(), call1_ms);
+                (completion.content, completion.model)
+            }
             Err(err) => {
                 // Call 1 failed: we can still answer, just without a research plan.
+                reporter.warn_timed("pull", format!("LLM Call 1 failed: {err}"), call1_ms);
                 (format!("(LLM Call 1 failed: {err})"), None)
             }
         };
-        let call1_ms = call1_start.elapsed().as_millis() as u64;
-        eprintln!("turn {thought_id}: Call 1 done in {call1_ms}ms");
 
         // --- Retrieval + deterministic Response Data Context ---------------
         // Execute every retrieval action Call 1 planned and fold the results,
@@ -398,11 +565,19 @@ impl Engine {
         // section markdown that grounds Call 2. This is the exact same builder
         // the data-retrieval self-test uses, so the cloud app and the test stay
         // in lock-step. It never makes an extra LLM call.
+        reporter.info(
+            "retrieval",
+            "Assembling context (running retrieval)…".to_string(),
+        );
         let (response_data_context, searches, pull_actions) =
             self.assemble_context(user_id, input, &requested_at, &call1_raw);
         eprintln!(
             "turn {thought_id}: context assembled ({} web searches)",
             searches.len()
+        );
+        reporter.info(
+            "retrieval",
+            format!("Context assembled ({} web searches).", searches.len()),
         );
 
         // Diagnostics for the pull pass shown in the UI debug panel: which model
@@ -417,12 +592,14 @@ impl Engine {
 
         // --- LLM Call 2: the push / answer pass ----------------------------
         let call2 = Call2Prompt::build(user_id, input, &response_data_context, &requested_at);
+        reporter.info("push", "Running push model (LLM Call 2)…".to_string());
         let call2_start = Instant::now();
         let call2_result = client.complete(&call2.system, &call2.user);
         let call2_ms = call2_start.elapsed().as_millis() as u64;
         eprintln!("turn {thought_id}: Call 2 done in {call2_ms}ms");
-        match call2_result {
+        let mut result = match call2_result {
             Ok(call2) => {
+                reporter.timed("push", "Push model responded.".to_string(), call2_ms);
                 // The underlying model the router selected for Call 2 (falls back
                 // to the deployment name when the response didn't report one).
                 let call2_model = call2.model.clone().unwrap_or_else(|| model.clone());
@@ -443,9 +620,16 @@ impl Engine {
                 // Persist this completed exchange to the user's personal data
                 // lake (append-and-re-embed). Writes are mandatory: the returned
                 // status is surfaced to the user so a Cosmos connection or write
-                // failure is visible rather than silently dropped.
-                let write =
-                    self.persist_turn(user_id, input, &push.reply_text, &requested_at, &push.audit);
+                // failure is visible rather than silently dropped. Each write is
+                // timed and reported live through the same reporter.
+                let write = self.persist_turn(
+                    &mut reporter,
+                    user_id,
+                    input,
+                    &push.reply_text,
+                    &requested_at,
+                    &push.audit,
+                );
                 TurnResult {
                     reply: push.reply_text,
                     verdict: "allow".to_string(),
@@ -466,31 +650,44 @@ impl Engine {
                         actions: push_action_timings,
                     }),
                     write: Some(write),
+                    // Filled in after the match from the reporter's full log.
+                    events: Vec::new(),
                 }
             }
-            Err(err) => TurnResult {
-                reply: format!("Sorry, I could not complete my reply: {err}"),
-                verdict: "error".to_string(),
-                routing: model.clone(),
-                attention: 0.0,
-                thought_id,
-                searches: if searches.is_empty() {
-                    None
-                } else {
-                    Some(searches)
-                },
-                actions_summary: None,
-                pull_debug: Some(pull_debug),
-                // Call 2 failed: report the model and call time, but no actions.
-                push_debug: Some(PushDebug {
-                    model,
-                    llm_ms: call2_ms,
-                    actions: Vec::new(),
-                }),
-                // No reply was produced, so there is nothing to persist this turn.
-                write: None,
-            },
-        }
+            Err(err) => {
+                reporter.error_timed("push", format!("LLM Call 2 failed: {err}"), call2_ms);
+                TurnResult {
+                    reply: format!("Sorry, I could not complete my reply: {err}"),
+                    verdict: "error".to_string(),
+                    routing: model.clone(),
+                    attention: 0.0,
+                    thought_id,
+                    searches: if searches.is_empty() {
+                        None
+                    } else {
+                        Some(searches)
+                    },
+                    actions_summary: None,
+                    pull_debug: Some(pull_debug),
+                    // Call 2 failed: report the model and call time, but no actions.
+                    push_debug: Some(PushDebug {
+                        model,
+                        llm_ms: call2_ms,
+                        actions: Vec::new(),
+                    }),
+                    // No reply was produced, so there is nothing to persist this turn.
+                    write: None,
+                    // Filled in after the match from the reporter's full log.
+                    events: Vec::new(),
+                }
+            }
+        };
+
+        // Bookend the turn and hand the complete process-log to the result so
+        // non-streaming callers (and the debug panel on replay) see every phase.
+        reporter.info("turn", "Turn complete.".to_string());
+        result.events = reporter.take_events();
+        result
     }
 
     /// Execute this turn's retrieval plan and deterministically assemble the
@@ -552,6 +749,7 @@ impl Engine {
     /// turn. The reply text itself is never altered by a write failure.
     fn persist_turn(
         &self,
+        reporter: &mut TurnReporter,
         user_id: &str,
         input: &str,
         reply: &str,
@@ -564,15 +762,27 @@ impl Engine {
             let detail = "Cosmos write-back is not configured (no Cosmos and/or embedding client)"
                 .to_string();
             eprintln!("persist turn skipped for user {user_id}: {detail}");
-            return WriteStatus { ok: false, detail };
+            reporter.warn("persist", detail.clone());
+            return WriteStatus {
+                ok: false,
+                detail,
+                operations: Vec::new(),
+            };
         };
         if !writer.is_online() {
             let detail =
                 "Cosmos write-back is offline (Cosmos and/or embedding client not connected)"
                     .to_string();
             eprintln!("persist turn skipped for user {user_id}: {detail}");
-            return WriteStatus { ok: false, detail };
+            reporter.warn("persist", detail.clone());
+            return WriteStatus {
+                ok: false,
+                detail,
+                operations: Vec::new(),
+            };
         }
+
+        reporter.info("persist", "Persisting turn to Cosmos…".to_string());
 
         // One readable line capturing both sides of the exchange. The controller
         // timestamps and appends it under today's record.
@@ -601,20 +811,37 @@ impl Engine {
                         outcome.data_bytes,
                         users_ms,
                     ),
+                    operations: Vec::new(),
                 }
             }
             Err(err) => {
                 let detail = format!("Cosmos write failed: {err}");
                 eprintln!("persist turn failed for user {user_id}: {detail}");
-                WriteStatus { ok: false, detail }
+                WriteStatus {
+                    ok: false,
+                    detail,
+                    operations: Vec::new(),
+                }
             }
         };
+        // Report the always-on data-lake write with its real latency so the
+        // live process-log shows it the moment it lands (or fails).
+        reporter.persist_write(&users_status, users_ms);
 
         // The personal data lake is the always-on record of the exchange. If it
         // failed (typically a connection problem), the shared-store upserts would
-        // fail the same way, so report that one error rather than piling on.
+        // fail the same way, so report that one error rather than piling on — but
+        // still carry its measured latency so the UI shows the failed write.
         if !users_status.ok {
-            return users_status;
+            return WriteStatus {
+                ok: false,
+                detail: users_status.detail,
+                operations: vec![WriteTiming {
+                    label: "UsersDataLake".to_string(),
+                    ms: users_ms,
+                    ok: false,
+                }],
+            };
         }
 
         // Now execute the *shared* knowledge/data-lake/diary upserts LLM Call 2
@@ -622,47 +849,62 @@ impl Engine {
         // debug panel and never written, so GaiaKB/GaiaDataLake/GaiaDiary silently
         // stopped receiving updates. Run them through the same append-and-re-embed
         // path, scoped to the authenticated `user_id` (their `/entity` partition,
-        // matching how they are read back).
-        let mut statuses = vec![users_status];
-        statuses.extend(self.persist_planned_stores(writer, user_id, now_rfc3339, audit));
-        statuses.extend(self.persist_planned_connections(writer, user_id, now_rfc3339, audit));
+        // matching how they are read back). Each `(status, timing)` pair carries
+        // both the UI detail line and the real write latency.
+        let mut ops: Vec<(WriteStatus, WriteTiming)> = vec![(
+            users_status,
+            WriteTiming {
+                label: "UsersDataLake".to_string(),
+                ms: users_ms,
+                ok: true,
+            },
+        )];
+        ops.extend(self.persist_planned_stores(reporter, writer, user_id, now_rfc3339, audit));
+        ops.extend(self.persist_planned_connections(reporter, writer, user_id, now_rfc3339, audit));
 
         // Persistence is mandatory: the turn's status is `ok` only when *every*
-        // planned write landed, and the detail concatenates each store's line so
-        // the UI can show exactly what saved (or which store failed).
-        let ok = statuses.iter().all(|status| status.ok);
-        let detail = statuses
+        // planned write landed. The detail concatenates each store's line, and the
+        // operations vector carries the real per-write latency for the UI panel.
+        let ok = ops.iter().all(|(status, _)| status.ok);
+        let detail = ops
             .iter()
-            .map(|status| status.detail.clone())
+            .map(|(status, _)| status.detail.clone())
             .collect::<Vec<_>>()
             .join("; ");
-        WriteStatus { ok, detail }
+        let operations = ops.into_iter().map(|(_, timing)| timing).collect();
+        WriteStatus {
+            ok,
+            detail,
+            operations,
+        }
     }
 
     /// Execute the daily-store upserts LLM Call 2 planned this turn and return
-    /// one [`WriteStatus`] per store, in plan order.
+    /// one `(status, timing)` pair per store, in plan order.
     ///
     /// Covers the shared `GaiaKB`, `GaiaDataLake`, and `GaiaDiary` stores (the
     /// friendship ledger `GaiaConnections` is handled separately and excluded by
     /// [`crate::push_data_controller::planned_store_writes`]). Each write reuses
     /// the controller's append-and-re-embed [`WriteDataController::upsert_daily`]
     /// and is scoped to the authenticated `user_id`, which is the `/entity`
-    /// partition key these shared stores are both written and read under. A
-    /// per-store failure is reported (and logged) but never aborts the others.
+    /// partition key these shared stores are both written and read under. Every
+    /// write is timed, reported live through `reporter`, and a per-store failure
+    /// is reported (and logged) but never aborts the others.
     fn persist_planned_stores(
         &self,
+        reporter: &mut TurnReporter,
         writer: &WriteDataController,
         user_id: &str,
         now_rfc3339: &str,
         audit: &crate::push_data_controller::ActionAudit,
-    ) -> Vec<WriteStatus> {
+    ) -> Vec<(WriteStatus, WriteTiming)> {
         crate::push_data_controller::planned_store_writes(audit)
             .into_iter()
             .map(|(store, data)| {
                 let start = Instant::now();
                 let result = writer.upsert_daily(store, user_id, now_rfc3339, &data);
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
-                match result {
+                let status = match result {
                     Ok(outcome) => {
                         eprintln!(
                             "persisted store write: {} ({}, {} bytes, vector {}d, {:.1} ms)",
@@ -682,33 +924,48 @@ impl Engine {
                                 outcome.data_bytes,
                                 ms,
                             ),
+                            operations: Vec::new(),
                         }
                     }
                     Err(err) => {
                         let detail = format!("Cosmos write to {store} failed: {err}");
                         eprintln!("store write failed for user {user_id}: {detail}");
-                        WriteStatus { ok: false, detail }
+                        WriteStatus {
+                            ok: false,
+                            detail,
+                            operations: Vec::new(),
+                        }
                     }
-                }
+                };
+                reporter.persist_write(&status, ms);
+                let timing = WriteTiming {
+                    label: format!("Upsert {store}"),
+                    ms,
+                    ok: status.ok,
+                };
+                (status, timing)
             })
             .collect()
     }
 
     /// Append the friendship-ledger deltas LLM Call 2 planned this turn to
-    /// `GaiaConnections`, returning one [`WriteStatus`] per delta, in plan order.
+    /// `GaiaConnections`, returning one `(status, timing)` pair per delta, in
+    /// plan order.
     ///
     /// The ledger is append-only and balance-carrying, so this uses the
     /// dedicated [`WriteDataController::append_connection_delta`] path rather
     /// than `upsert_daily`. Like the snapshot stores it is scoped to the
-    /// authenticated `user_id` (the `/entity` partition), and a per-delta failure
-    /// is reported (and logged) without aborting the others.
+    /// authenticated `user_id` (the `/entity` partition), each write is timed and
+    /// reported live, and a per-delta failure is reported (and logged) without
+    /// aborting the others.
     fn persist_planned_connections(
         &self,
+        reporter: &mut TurnReporter,
         writer: &WriteDataController,
         user_id: &str,
         now_rfc3339: &str,
         audit: &crate::push_data_controller::ActionAudit,
-    ) -> Vec<WriteStatus> {
+    ) -> Vec<(WriteStatus, WriteTiming)> {
         crate::push_data_controller::planned_connection_deltas(audit)
             .into_iter()
             .map(|(change_amount, note)| {
@@ -716,7 +973,7 @@ impl Engine {
                 let result =
                     writer.append_connection_delta(user_id, now_rfc3339, change_amount, &note);
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
-                match result {
+                let status = match result {
                     Ok(outcome) => {
                         eprintln!(
                             "recorded connection delta: {} ({:+}, balance {}, {:.1} ms)",
@@ -728,14 +985,26 @@ impl Engine {
                                 "saved to Cosmos GaiaConnections: {} ({:+}, balance {}, {:.1} ms)",
                                 outcome.id, outcome.change_amount, outcome.new_balance, ms,
                             ),
+                            operations: Vec::new(),
                         }
                     }
                     Err(err) => {
                         let detail = format!("Cosmos write to GaiaConnections failed: {err}");
                         eprintln!("connection write failed for user {user_id}: {detail}");
-                        WriteStatus { ok: false, detail }
+                        WriteStatus {
+                            ok: false,
+                            detail,
+                            operations: Vec::new(),
+                        }
                     }
-                }
+                };
+                reporter.persist_write(&status, ms);
+                let timing = WriteTiming {
+                    label: "GaiaConnections delta".to_string(),
+                    ms,
+                    ok: status.ok,
+                };
+                (status, timing)
             })
             .collect()
     }
@@ -809,12 +1078,37 @@ mod tests {
     }
 
     #[test]
+    fn run_turn_reported_streams_skeleton_events_in_order() {
+        // Even with no model configured, a turn must stream a live process-log
+        // so the UI always knows where Gaia is. The sink receives each event as
+        // it happens, and the same events are returned on the result.
+        let engine = Engine::new(None, None);
+        let mut streamed = Vec::new();
+        let result =
+            engine.run_turn_reported("alice", "hello", &mut |event| streamed.push(event.clone()));
+
+        // The skeleton path emits exactly one event, on the `turn` phase.
+        assert_eq!(streamed.len(), 1, "skeleton turn should emit one event");
+        assert_eq!(streamed[0].phase, "turn");
+        assert_eq!(streamed[0].level, "info");
+        assert_eq!(streamed[0].seq, 0, "the first event is sequence zero");
+
+        // The streamed events and the result's copy must match exactly.
+        assert_eq!(result.events, streamed, "result must carry the same events");
+    }
+
+    #[test]
     fn persist_turn_reports_a_visible_error_without_an_online_writer() {
         // Writes are mandatory: the skeleton engine has no writer configured, so
         // persisting a turn must not silently skip. It returns a visible failure
         // status (never panics) the front end can show to the user.
         let engine = Engine::new(None, None);
+        let mut events = Vec::new();
+        // Bind the sink closure to a `let` so it outlives the reporter borrow.
+        let mut sink = |event: &TurnEvent| events.push(event.clone());
+        let mut reporter = TurnReporter::new(&mut sink);
         let status = engine.persist_turn(
+            &mut reporter,
             "alice",
             "hello",
             "hi alice",
@@ -826,6 +1120,13 @@ mod tests {
             status.detail.to_lowercase().contains("cosmos"),
             "detail should name Cosmos, got: {}",
             status.detail
+        );
+        // The failure is surfaced live as a `persist` warning, not swallowed.
+        assert!(
+            events
+                .iter()
+                .any(|e: &TurnEvent| e.phase == "persist" && e.level == "warn"),
+            "a missing writer must emit a persist warning event"
         );
     }
 

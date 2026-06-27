@@ -98,6 +98,31 @@
       <span class="text">{message.text}</span>{#if message.streaming}<span class="caret"></span>{/if}
     {/if}
 
+    {#if $debug && !message.error}
+      <!-- Live process-log: where Gaia is right now. Streams in during the
+           turn (from `message.events`) and is replaced by the authoritative
+           copy on `meta.events` once the turn completes. Warnings and errors
+           are colour-coded so they can't be missed. -->
+      {@const log = message.meta?.events ?? message.events ?? []}
+      {#if log.length}
+        <details class="debug process-log" open>
+          <summary>process log ({log.length} step{log.length === 1 ? '' : 's'})</summary>
+          <div class="proc-list">
+            {#each log as ev}
+              <div class="proc-row proc-{ev.level}" title={ev.phase}>
+                <span class="proc-seq">#{ev.seq}</span>
+                <span class="proc-phase">{ev.phase}</span>
+                <span class="proc-msg">{ev.message}</span>
+                {#if ev.ms !== undefined}
+                  <span class="proc-ms">{ev.ms.toFixed(1)} ms</span>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        </details>
+      {/if}
+    {/if}
+
     {#if message.meta && !message.error}
       {@const searches = message.meta.searches ?? []}
       {#if searches.length}
@@ -338,6 +363,18 @@
         {message.meta.write.ok ? '✓ Saved to Cosmos' : '⚠ Cosmos write failed'}
       </span>
       <span class="write-body">{message.meta.write.detail}</span>
+      {#if message.meta.write.operations && message.meta.write.operations.length}
+        <!-- Real per-operation Cosmos write latency (wall-clock), one chip per
+             write in execution order. Failed writes are flagged in red. -->
+        <div class="write-ops">
+          {#each message.meta.write.operations as op}
+            <span class="write-op" class:write-op-err={!op.ok} title="Wall-clock latency of this Cosmos write">
+              <span>{op.type}</span>
+              <span class="write-op-ms">{op.ms.toFixed(1)} ms</span>
+            </span>
+          {/each}
+        </div>
+      {/if}
     </div>
   </div>
 {/if}
@@ -718,5 +755,75 @@
     color: var(--text-dim);
     border-color: var(--border);
     opacity: 0.85;
+  }
+  /* Live process-log: a compact, monospace ledger of every phase the turn
+     entered. Rows are colour-coded by severity so warnings/errors stand out. */
+  .proc-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-top: 8px;
+  }
+  .proc-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 2px 4px;
+    border-radius: 4px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .proc-seq {
+    color: var(--text-dim);
+    flex: 0 0 auto;
+    min-width: 2.5ch;
+    text-align: right;
+  }
+  .proc-phase {
+    flex: 0 0 auto;
+    min-width: 7ch;
+    font-weight: 600;
+    opacity: 0.85;
+  }
+  .proc-msg {
+    flex: 1 1 auto;
+  }
+  .proc-ms {
+    flex: 0 0 auto;
+    color: var(--text-dim);
+  }
+  .proc-row.proc-warn {
+    color: var(--warn, #d08a00);
+    background: color-mix(in srgb, var(--warn, #d08a00) 10%, transparent);
+  }
+  .proc-row.proc-error {
+    color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
+  }
+  /* Per-operation Cosmos write latency chips inside the write-back banner. */
+  .write-ops {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-top: 6px;
+  }
+  .write-op {
+    display: inline-flex;
+    gap: 6px;
+    align-items: baseline;
+    font-family: var(--mono);
+    font-size: 0.92em;
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-elev-2);
+  }
+  .write-op.write-op-err {
+    border-color: var(--danger);
+    color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+  }
+  .write-op-ms {
+    color: var(--text-dim);
   }
 </style>

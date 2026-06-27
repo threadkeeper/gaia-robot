@@ -28,6 +28,8 @@ export interface ChatMessage {
   streaming?: boolean;
   /** Metadata returned with the final Gaia reply. */
   meta?: ReplyMeta;
+  /** Live process-log streamed during the turn (before {@link meta} arrives). */
+  events?: TurnEvent[];
   /** Set when the turn failed. */
   error?: string;
 }
@@ -104,12 +106,42 @@ export interface PushDebug {
   actions: PushActionTiming[];
 }
 
+/** The real wall-clock latency of one Cosmos write this turn. */
+export interface WriteTiming {
+  /** Short label, e.g. `UsersDataLake`, `Upsert GaiaDiary`, `GaiaConnections delta`. */
+  type: string;
+  /** Wall-clock milliseconds the write took (may be fractional). */
+  ms: number;
+  /** True when the write succeeded, false when it failed. */
+  ok: boolean;
+}
+
 /** Visible persistence status for the turn's mandatory Cosmos write-back. */
 export interface WriteStatus {
   /** True when the turn was saved (or was an idempotent replay no-op). */
   ok: boolean;
   /** Confirmation on success (id, action, size), or the error detail on failure. */
   detail: string;
+  /** Per-operation write latency, one entry per Cosmos write in execution order. */
+  operations?: WriteTiming[];
+}
+
+/**
+ * One entry in a turn's live process-log, streamed as the engine moves through
+ * each phase so the UI can show where Gaia is right now (pull model, retrieval,
+ * push model, persistence) and surface any warning or error immediately.
+ */
+export interface TurnEvent {
+  /** Monotonic 0-based sequence number within the turn, for stable ordering. */
+  seq: number;
+  /** Phase that produced the event, e.g. `turn`, `pull`, `retrieval`, `push`, `persist`. */
+  phase: string;
+  /** Severity of the event. */
+  level: 'info' | 'warn' | 'error';
+  /** Human-readable description of what just happened. */
+  message: string;
+  /** Wall-clock milliseconds for the step this event closes, when timed. */
+  ms?: number;
 }
 
 /** One ordered operation event emitted by Gaia internals. */
@@ -163,6 +195,8 @@ export interface ReplyResult {
   pushDebug?: PushDebug;
   /** Mandatory Cosmos write-back status; surfaced visibly so failures aren't silent. */
   write?: WriteStatus;
+  /** Live process-log of every phase this turn entered, plus warnings/errors. */
+  events?: TurnEvent[];
 }
 
 /** Subset of {@link ReplyResult} kept on a rendered message. */
@@ -187,12 +221,15 @@ export interface ReplyMeta {
   pushDebug?: PushDebug;
   /** Mandatory Cosmos write-back status; surfaced visibly so failures aren't silent. */
   write?: WriteStatus;
+  /** Live process-log of every phase this turn entered, plus warnings/errors. */
+  events?: TurnEvent[];
 }
 
-/** SSE event frames emitted by /v1/conversations/{conv_id}/stream. */
+/** Streaming frames delivered over the WebSocket transport (`streamWS`). */
 export type StreamEvent =
   | { kind: 'token'; token: string }
   | { kind: 'done'; result: ReplyResult }
+  | { kind: 'event'; event: TurnEvent }
   | { kind: 'error'; error: string };
 
 /** Authenticated identity surfaced to the UI. */

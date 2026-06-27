@@ -266,9 +266,10 @@ fn handle_message(request: &HttpRequest, engine: &Engine, auth: &Auth) -> HttpRe
 /// Upgrade the connection to a WebSocket and stream one turn's reply.
 ///
 /// Protocol (mirrors the front end's `streamWS`): the client sends a hello
-/// `{"token":"<bearer>"}` then `{"text":"<message>"}`. We reply with a single
-/// `{"type":"token","token":"<full reply>"}` frame followed by
-/// `{"type":"done","result":<ReplyResult>}`, then close.
+/// `{"token":"<bearer>"}` then `{"text":"<message>"}`. While the turn runs we
+/// stream `{"type":"event","event":<TurnEvent>}` frames (the live process-log),
+/// then reply with a single `{"type":"token","token":"<full reply>"}` frame
+/// followed by `{"type":"done","result":<ReplyResult>}`, then close.
 fn handle_websocket(
     reader: &mut BufReader<TcpStream>,
     writer: &mut TcpStream,
@@ -311,7 +312,25 @@ fn handle_websocket(
                 if let Some(input) = value.get("text").and_then(|t| t.as_str()) {
                     match &user_id {
                         Some(id) => {
-                            let result = engine.run_turn(id, input);
+                            // Run the turn while streaming each process-log event
+                            // to the client the instant it happens, so the user
+                            // can see where Gaia is (pull model, retrieval, push
+                            // model, persistence) and any warning or error live.
+                            // The sink borrows `writer` only for the duration of
+                            // the call; it is dropped before `stream_turn` reuses
+                            // `writer` for the token/done frames.
+                            let result = {
+                                let mut sink = |event: &crate::engine::TurnEvent| {
+                                    let frame = EventFrame {
+                                        kind: "event",
+                                        event,
+                                    };
+                                    // Best-effort: a failed event write (client
+                                    // gone) must not abort the turn itself.
+                                    let _ = websocket::write_text(writer, &to_json(&frame));
+                                };
+                                engine.run_turn_reported(id, input, &mut sink)
+                            };
                             stream_turn(writer, &result)?;
                         }
                         None => {
@@ -368,6 +387,18 @@ struct DoneFrame<'a> {
     #[serde(rename = "type")]
     kind: &'a str,
     result: &'a crate::engine::TurnResult,
+}
+
+/// A `{type:'event', event:<TurnEvent>}` WebSocket frame.
+///
+/// Streamed live, before the `token`/`done` frames, one per phase the engine
+/// enters (pull model, retrieval, push model, persistence) plus any warning or
+/// error, so the client can show a real-time process-log of where Gaia is.
+#[derive(serde::Serialize)]
+struct EventFrame<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    event: &'a crate::engine::TurnEvent,
 }
 
 /// Serialize a frame to a JSON string, degrading to an error frame on the
