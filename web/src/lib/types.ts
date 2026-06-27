@@ -73,23 +73,26 @@ export interface ActionTile {
   detail?: string;
 }
 
+/** One planned/executed action's label and time-to-process, in milliseconds. */
+export interface ActionTiming {
+  /** Short label, e.g. `q3 → GaiaKB`, `q1 → Web`, `WhatsApp`, `Upsert GaiaKB`. */
+  type: string;
+  /** Milliseconds spent processing this one action (may be fractional). */
+  ms: number;
+}
+
 /** Diagnostics for the pull pass (LLM Call 1 + retrieval), shown in the debug panel. */
 export interface PullDebug {
   /** The model that produced LLM Call 1. */
   model: string;
   /** Wall-clock milliseconds spent in the LLM Call 1 request. */
   llmMs: number;
-  /** The retrieval actions Call 1 chose this turn, e.g. `q1 → Web`. */
-  actions: string[];
+  /** The retrieval actions Call 1 chose this turn, each with the ms it took. */
+  actions: ActionTiming[];
 }
 
 /** One planned push action's type and time-to-process, in milliseconds. */
-export interface PushActionTiming {
-  /** Short label, e.g. `WhatsApp`, `Push`, `Actuate`, `Upsert GaiaKB`. */
-  type: string;
-  /** Milliseconds spent processing this one action (may be fractional). */
-  ms: number;
-}
+export type PushActionTiming = ActionTiming;
 
 /** Diagnostics for the push pass (LLM Call 2 + side effects), shown in the debug panel. */
 export interface PushDebug {

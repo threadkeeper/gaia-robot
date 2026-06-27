@@ -36,6 +36,10 @@ pub struct ActionOutcome {
     pub id: String,
     /// The retrieved records, or an error message describing what failed.
     pub result: Result<Vec<Record>, String>,
+    /// Wall-clock milliseconds this single action's Cosmos read took (may be
+    /// fractional). Surfaced in the UI debug panel so every retrieval shows the
+    /// time it cost, alongside the push-pass action timings.
+    pub ms: f64,
 }
 
 /// A planned, ready-to-run Cosmos query derived from an [`ActionPlan`].
@@ -78,9 +82,17 @@ impl<'a> Executor<'a> {
         actions
             .actions
             .iter()
-            .map(|action| ActionOutcome {
-                id: action.id.clone(),
-                result: self.run_one(action),
+            .map(|action| {
+                // Time each action individually so the debug panel can attribute
+                // the millisecond cost to exactly one retrieval.
+                let start = std::time::Instant::now();
+                let result = self.run_one(action);
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                ActionOutcome {
+                    id: action.id.clone(),
+                    result,
+                    ms,
+                }
             })
             .collect()
     }

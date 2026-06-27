@@ -61,6 +61,21 @@ pub struct QueryAudit {
     pub sql: String,
 }
 
+/// One retrieval action's label and the wall-clock time it took.
+///
+/// Mirrors the push pass's `PushActionTiming` so the UI debug panel can render
+/// every action — Cosmos reads (`q3 → GaiaKB`) and web searches
+/// (`q1 → Web`) — with the milliseconds it cost. `ms` may be fractional for a
+/// sub-millisecond read.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PullActionTiming {
+    /// A short label for the action, e.g. `q3 → GaiaKB` or `q1 → Web`.
+    #[serde(rename = "type")]
+    pub action_type: String,
+    /// Milliseconds spent executing this one retrieval (may be fractional).
+    pub ms: f64,
+}
+
 /// Everything the pull pass produced for one turn.
 ///
 /// Callers take only the fields they need. The engine reads `context` and
@@ -80,6 +95,10 @@ pub struct PullResult {
     /// The exact SQL planned per Cosmos action. Empty unless `capture_queries`
     /// was requested (capturing semantic queries costs an extra embedding call).
     pub planned_queries: Vec<QueryAudit>,
+    /// Per-action label + wall-clock milliseconds for every retrieval that ran
+    /// this turn (Cosmos reads and web searches), in plan order. The cloud app
+    /// surfaces these in the debug panel so each action shows the time it cost.
+    pub action_timings: Vec<PullActionTiming>,
     /// The fully-assembled, eight-section Response Data Context markdown.
     pub context: String,
     /// How many Cosmos-backed (non-`Web`) actions were attempted.
@@ -145,6 +164,7 @@ impl<'a> PullDataController<'a> {
         let mut groups: Vec<RetrievalGroup> = Vec::new();
         let mut searches: Vec<String> = Vec::new();
         let mut planned_queries: Vec<QueryAudit> = Vec::new();
+        let mut action_timings: Vec<PullActionTiming> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
         let mut all_ok = true;
         let mut cosmos_action_count = 0;
@@ -191,6 +211,7 @@ impl<'a> PullDataController<'a> {
                 capture_queries,
                 &mut groups,
                 &mut planned_queries,
+                &mut action_timings,
                 &mut notes,
                 &mut all_ok,
             );
@@ -200,9 +221,17 @@ impl<'a> PullDataController<'a> {
                 web_actions,
                 &mut groups,
                 &mut searches,
+                &mut action_timings,
                 &mut notes,
                 &mut all_ok,
             );
+        }
+
+        // Re-order the timings into the original plan order so the debug panel
+        // lists them exactly as Call 1 authored them, even though Cosmos reads
+        // and web searches were executed in separate batches above.
+        if let Some(actions) = &plan {
+            action_timings = order_timings_by_plan(actions, action_timings);
         }
 
         let context = build_response_data_context(user_id, input, requested_at, &extras, &groups);
@@ -212,6 +241,7 @@ impl<'a> PullDataController<'a> {
             groups,
             searches,
             planned_queries,
+            action_timings,
             context,
             cosmos_actions: cosmos_action_count,
             web_actions: web_action_count,
@@ -232,6 +262,7 @@ impl<'a> PullDataController<'a> {
         capture_queries: bool,
         groups: &mut Vec<RetrievalGroup>,
         planned_queries: &mut Vec<QueryAudit>,
+        action_timings: &mut Vec<PullActionTiming>,
         notes: &mut Vec<String>,
         all_ok: &mut bool,
     ) {
@@ -245,6 +276,14 @@ impl<'a> PullDataController<'a> {
                 "{} Cosmos action(s) requested but Cosmos is not configured",
                 cosmos_actions.len()
             ));
+            // Still list every planned action (with 0 ms) so the debug panel
+            // shows what Call 1 intended to read even though no read ran.
+            for action in &cosmos_actions {
+                action_timings.push(PullActionTiming {
+                    action_type: format!("{} → {}", action.id, action.target),
+                    ms: 0.0,
+                });
+            }
             return;
         };
 
@@ -289,6 +328,12 @@ impl<'a> PullDataController<'a> {
         for ((target, action_id), outcome) in
             targets.iter().zip(action_ids.iter()).zip(outcomes.iter())
         {
+            // Record the per-action read time regardless of success/failure so
+            // the debug panel always shows what each retrieval cost.
+            action_timings.push(PullActionTiming {
+                action_type: format!("{action_id} → {target}"),
+                ms: outcome.ms,
+            });
             match &outcome.result {
                 Ok(records) => {
                     let values: Vec<serde_json::Value> = records
@@ -311,12 +356,14 @@ impl<'a> PullDataController<'a> {
 
     /// Execute the `Web` actions against Brave, appending their results to
     /// `groups`, the issued queries to `searches`, and any failures to `notes`.
+    #[allow(clippy::too_many_arguments)] // Threading the shared accumulators keeps `execute` readable.
     fn run_web(
         &self,
         input: &str,
         web_actions: Vec<ActionPlan>,
         groups: &mut Vec<RetrievalGroup>,
         searches: &mut Vec<String>,
+        action_timings: &mut Vec<PullActionTiming>,
         notes: &mut Vec<String>,
         all_ok: &mut bool,
     ) {
@@ -330,6 +377,14 @@ impl<'a> PullDataController<'a> {
                 "{} Web action(s) requested but Brave is not configured",
                 web_actions.len()
             ));
+            // Still list every planned web action (with 0 ms) so the debug panel
+            // shows what Call 1 intended to search even though no search ran.
+            for action in &web_actions {
+                action_timings.push(PullActionTiming {
+                    action_type: format!("{} → Web", action.id),
+                    ms: 0.0,
+                });
+            }
             return;
         };
 
@@ -343,7 +398,16 @@ impl<'a> PullDataController<'a> {
             let query = web_query_for(action, input);
             // Fetch at least MIN_WEB_RESULT_COUNT results so a noisy top snippet
             // does not starve the context; honour a larger model-chosen top.
-            match client.search(&query, web_result_count(action)) {
+            // Time the call so the web search reports its latency like the
+            // Cosmos reads do.
+            let start = std::time::Instant::now();
+            let outcome = client.search(&query, web_result_count(action));
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            action_timings.push(PullActionTiming {
+                action_type: format!("{} → Web", action.id),
+                ms,
+            });
+            match outcome {
                 Ok(results) => {
                     searches.push(query);
                     let values: Vec<serde_json::Value> = results
@@ -363,6 +427,31 @@ impl<'a> PullDataController<'a> {
             }
         }
     }
+}
+
+/// Re-order the collected per-action timings to match the plan's action order.
+///
+/// `run_cosmos` and `run_web` execute in two separate batches (Cosmos reads
+/// first, then web searches), so the timings are gathered grouped by kind. This
+/// restores the original Call 1 order by walking the plan and pulling each
+/// action's timing out by its `id → target` label, so the debug panel lists the
+/// actions exactly as the model authored them. Any timing whose label does not
+/// match a plan action (there should be none) is appended at the end so nothing
+/// is silently dropped.
+fn order_timings_by_plan(
+    plan: &ActionsFile,
+    mut timings: Vec<PullActionTiming>,
+) -> Vec<PullActionTiming> {
+    let mut ordered = Vec::with_capacity(timings.len());
+    for action in &plan.actions {
+        let label = format!("{} → {}", action.id, action.target);
+        if let Some(pos) = timings.iter().position(|t| t.action_type == label) {
+            ordered.push(timings.remove(pos));
+        }
+    }
+    // Preserve any unmatched timings rather than losing them.
+    ordered.append(&mut timings);
+    ordered
 }
 
 /// Choose the text to search the web with for a `Web` action.
@@ -550,6 +639,85 @@ mod tests {
             .iter()
             .any(|n| n.contains("Cosmos is not configured")));
         assert!(result.context.contains("## WebSearchResults"));
+    }
+
+    #[test]
+    fn execute_records_a_timing_for_every_planned_action_in_plan_order() {
+        // Even with no clients (so nothing actually runs), every planned action
+        // must appear in `action_timings` so the debug panel can attach a ms to
+        // each one. The Web action is authored first, then the three forced
+        // core-user Cosmos reads, and the timings must follow that plan order.
+        let controller = PullDataController::new(None, None, None);
+        let reply = r#"[
+          { "version": "1.0",
+            "session": { "user_id": "alice", "requested_at": "2026-06-21T00:00:00Z" },
+            "actions": [ { "id": "q1", "kind": "search", "target": "Web", "intent": "mars news", "top": 3, "filters": {} } ] },
+          {}, [], {}
+        ]"#;
+
+        let result = controller.execute("alice", "hi", "2026-06-21T00:00:00Z", reply, false);
+
+        let labels: Vec<&str> = result
+            .action_timings
+            .iter()
+            .map(|t| t.action_type.as_str())
+            .collect();
+        // Web first (plan order), then the three forced core-user reads.
+        assert_eq!(
+            labels,
+            vec![
+                "q1 → Web",
+                "core-gaiakb → GaiaKB",
+                "core-gaiadiary → GaiaDiary",
+                "core-gaiaconnections → GaiaConnections",
+            ]
+        );
+        // No client ran, so each timing is a deterministic 0 ms placeholder.
+        assert!(result.action_timings.iter().all(|t| t.ms == 0.0));
+    }
+
+    #[test]
+    fn order_timings_by_plan_restores_authored_order() {
+        // Timings gathered Cosmos-first then web are re-sorted into the order the
+        // model authored the actions, and unmatched timings are kept at the end.
+        let plan = ActionsFile {
+            version: "1.0".to_string(),
+            session: SessionContext::default(),
+            actions: vec![
+                web_action("mars", None), // id q1, target Web
+                ActionPlan {
+                    id: "q2".to_string(),
+                    kind: "query".to_string(),
+                    target: "GaiaKB".to_string(),
+                    user_id: Some("alice".to_string()),
+                    entity: Some("alice".to_string()),
+                    intent: "kb".to_string(),
+                    top: 3,
+                    query: None,
+                    filters: ActionFilters::default(),
+                },
+            ],
+        };
+        // Gathered out of order: Cosmos (q2) before web (q1), plus a stray.
+        let gathered = vec![
+            PullActionTiming {
+                action_type: "q2 → GaiaKB".to_string(),
+                ms: 5.0,
+            },
+            PullActionTiming {
+                action_type: "q1 → Web".to_string(),
+                ms: 9.0,
+            },
+            PullActionTiming {
+                action_type: "qX → Unknown".to_string(),
+                ms: 1.0,
+            },
+        ];
+
+        let ordered = order_timings_by_plan(&plan, gathered);
+        let labels: Vec<&str> = ordered.iter().map(|t| t.action_type.as_str()).collect();
+        // Plan order first (q1 then q2), then any unmatched timing.
+        assert_eq!(labels, vec!["q1 → Web", "q2 → GaiaKB", "qX → Unknown"]);
     }
 
     #[test]

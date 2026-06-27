@@ -1402,10 +1402,12 @@ thanks"#;
             executor::ActionOutcome {
                 id: "q1".to_string(),
                 result: Ok(vec![record]),
+                ms: 0.0,
             },
             executor::ActionOutcome {
                 id: "q2".to_string(),
                 result: Err("partition not found".to_string()),
+                ms: 0.0,
             },
         ];
 

@@ -29,7 +29,7 @@ use crate::embeddings::EmbeddingClient;
 use crate::health::{DependencyHealth, HealthReport};
 use crate::llm::LlmClient;
 use crate::prompt::{now_rfc3339, Call1Prompt, Call2Prompt};
-use crate::pull_data_controller::PullDataController;
+use crate::pull_data_controller::{PullActionTiming, PullDataController};
 use crate::push_data_controller::{PushActionTiming, PushDataController};
 use crate::web_search::BraveClient;
 use crate::write_data_controller::{WriteDataController, DEFAULT_INDEX_DIMS};
@@ -106,9 +106,10 @@ pub struct PullDebug {
     /// Wall-clock milliseconds spent in the LLM Call 1 request.
     #[serde(rename = "llmMs")]
     pub llm_ms: u64,
-    /// The retrieval actions Call 1 planned, e.g. `q1 → Web`, `q3 → GaiaKB`.
-    /// Empty when Call 1 produced no parseable action plan.
-    pub actions: Vec<String>,
+    /// The retrieval actions Call 1 planned, each with its label (e.g.
+    /// `q3 → GaiaKB`) and the wall-clock milliseconds the read took. Empty when
+    /// Call 1 produced no parseable action plan.
+    pub actions: Vec<PullActionTiming>,
 }
 
 /// Debug diagnostics for the push pass (LLM Call 2 + planned side effects).
@@ -504,15 +505,16 @@ impl Engine {
     /// sections, so Call 2 always receives a stable, predictable structure.
     ///
     /// Returns the context markdown, the web queries that actually ran (for the
-    /// [`TurnResult::searches`] field), and a short label per retrieval action
-    /// the plan chose (for the pull-pass debug panel, e.g. `q1 → Web`).
+    /// [`TurnResult::searches`] field), and a per-action timing for every
+    /// retrieval the plan executed (for the pull-pass debug panel, e.g.
+    /// `q1 → Web` with the milliseconds it cost).
     fn assemble_context(
         &self,
         user_id: &str,
         input: &str,
         requested_at: &str,
         call1_raw: &str,
-    ) -> (String, Vec<String>, Vec<String>) {
+    ) -> (String, Vec<String>, Vec<PullActionTiming>) {
         // Drive the shared pull controller — the exact same code the
         // data-retrieval self-test runs — and keep only what the reply needs:
         // the assembled context and the web queries that ran. We pass
@@ -526,18 +528,10 @@ impl Engine {
         )
         .execute(user_id, input, requested_at, call1_raw, false);
 
-        // One readable label per planned retrieval action (`id → target`), in
-        // plan order, so the debug panel shows exactly what Call 1 chose to fetch.
-        let actions = result
-            .plan
-            .as_ref()
-            .map(|plan| {
-                plan.actions
-                    .iter()
-                    .map(|a| format!("{} → {}", a.id, a.target))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // One timed entry per planned retrieval action (`id → target` plus the
+        // milliseconds it cost), in plan order, so the debug panel shows exactly
+        // what Call 1 chose to fetch and how long each read took.
+        let actions = result.action_timings;
 
         (result.context, result.searches, actions)
     }
@@ -583,25 +577,29 @@ impl Engine {
         // One readable line capturing both sides of the exchange. The controller
         // timestamps and appends it under today's record.
         let chunk = format!("User: {input}\nGaia: {reply}");
-        let users_status = match writer.upsert_daily("UsersDataLake", user_id, now_rfc3339, &chunk)
-        {
+        let users_start = Instant::now();
+        let users_result = writer.upsert_daily("UsersDataLake", user_id, now_rfc3339, &chunk);
+        let users_ms = users_start.elapsed().as_secs_f64() * 1000.0;
+        let users_status = match users_result {
             Ok(outcome) => {
                 // A lightweight, secret-free trace so operators can see writes
                 // landing without inspecting Cosmos directly.
                 eprintln!(
-                    "persisted turn: {} ({}, {} bytes, vector {}d)",
+                    "persisted turn: {} ({}, {} bytes, vector {}d, {:.1} ms)",
                     outcome.id,
                     outcome.action.label(),
                     outcome.data_bytes,
                     outcome.vector_dims,
+                    users_ms,
                 );
                 WriteStatus {
                     ok: true,
                     detail: format!(
-                        "saved to Cosmos UsersDataLake: {} ({}, {} bytes)",
+                        "saved to Cosmos UsersDataLake: {} ({}, {} bytes, {:.1} ms)",
                         outcome.id,
                         outcome.action.label(),
                         outcome.data_bytes,
+                        users_ms,
                     ),
                 }
             }
@@ -660,24 +658,29 @@ impl Engine {
     ) -> Vec<WriteStatus> {
         crate::push_data_controller::planned_store_writes(audit)
             .into_iter()
-            .map(
-                |(store, data)| match writer.upsert_daily(store, user_id, now_rfc3339, &data) {
+            .map(|(store, data)| {
+                let start = Instant::now();
+                let result = writer.upsert_daily(store, user_id, now_rfc3339, &data);
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                match result {
                     Ok(outcome) => {
                         eprintln!(
-                            "persisted store write: {} ({}, {} bytes, vector {}d)",
+                            "persisted store write: {} ({}, {} bytes, vector {}d, {:.1} ms)",
                             outcome.id,
                             outcome.action.label(),
                             outcome.data_bytes,
                             outcome.vector_dims,
+                            ms,
                         );
                         WriteStatus {
                             ok: true,
                             detail: format!(
-                                "saved to Cosmos {}: {} ({}, {} bytes)",
+                                "saved to Cosmos {}: {} ({}, {} bytes, {:.1} ms)",
                                 store,
                                 outcome.id,
                                 outcome.action.label(),
                                 outcome.data_bytes,
+                                ms,
                             ),
                         }
                     }
@@ -686,8 +689,8 @@ impl Engine {
                         eprintln!("store write failed for user {user_id}: {detail}");
                         WriteStatus { ok: false, detail }
                     }
-                },
-            )
+                }
+            })
             .collect()
     }
 
@@ -709,17 +712,21 @@ impl Engine {
         crate::push_data_controller::planned_connection_deltas(audit)
             .into_iter()
             .map(|(change_amount, note)| {
-                match writer.append_connection_delta(user_id, now_rfc3339, change_amount, &note) {
+                let start = Instant::now();
+                let result =
+                    writer.append_connection_delta(user_id, now_rfc3339, change_amount, &note);
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                match result {
                     Ok(outcome) => {
                         eprintln!(
-                            "recorded connection delta: {} ({:+}, balance {})",
-                            outcome.id, outcome.change_amount, outcome.new_balance,
+                            "recorded connection delta: {} ({:+}, balance {}, {:.1} ms)",
+                            outcome.id, outcome.change_amount, outcome.new_balance, ms,
                         );
                         WriteStatus {
                             ok: true,
                             detail: format!(
-                                "saved to Cosmos GaiaConnections: {} ({:+}, balance {})",
-                                outcome.id, outcome.change_amount, outcome.new_balance,
+                                "saved to Cosmos GaiaConnections: {} ({:+}, balance {}, {:.1} ms)",
+                                outcome.id, outcome.change_amount, outcome.new_balance, ms,
                             ),
                         }
                     }

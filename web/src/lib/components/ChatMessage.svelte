@@ -151,8 +151,9 @@
                 {#if pullDebug.actions.length}
                   <div class="skills-grid">
                     {#each pullDebug.actions as act}
-                      <span class="chip skill used" title="Retrieval action chosen by Call 1">
-                        <span>{act}</span>
+                      <span class="chip skill used" title="Retrieval action chosen by Call 1 and the time it took">
+                        <span>{act.type}</span>
+                        <span class="kb">{act.ms.toFixed(2)} ms</span>
                       </span>
                     {/each}
                   </div>
