@@ -272,15 +272,19 @@ impl LlmClient {
 
     /// Probe model (model-router) connectivity and RBAC with a tiny completion.
     ///
-    /// Sends a deliberately minimal chat completion (`max_tokens = 1`) so it
-    /// exercises the full production path — endpoint reachability, the auth
-    /// scheme (managed-identity bearer or Foundry API key), and the configured
-    /// deployment — for a negligible token cost. Only the HTTP outcome matters,
-    /// so the response body is discarded: `Ok(())` means the backend accepted
-    /// and answered the request, while an [`LlmError`] surfaces an auth/RBAC or
-    /// connectivity failure for the readiness probe to report.
+    /// Sends a minimal chat completion so it exercises the full production path —
+    /// endpoint reachability, the auth scheme (managed-identity bearer or Foundry
+    /// API key), and the configured deployment. It uses the same
+    /// [`DEFAULT_MAX_TOKENS`] cap real completions use: `max_tokens` is an upper
+    /// bound, not a target, so the model answers the one-word prompt in a handful
+    /// of tokens and stops — using a tiny cap instead makes the model-router
+    /// reject the request with "max_tokens too low" before it can answer. Only
+    /// the HTTP outcome matters, so the response body is discarded: `Ok(())`
+    /// means the backend accepted and answered the request, while an
+    /// [`LlmError`] surfaces an auth/RBAC or connectivity failure for the
+    /// readiness probe to report.
     pub fn ping(&self) -> Result<(), LlmError> {
-        let body = build_request_body(&self.model, "health check", "ping", 1);
+        let body = build_request_body(&self.model, "health check", "ping", DEFAULT_MAX_TOKENS);
         let payload = serde_json::to_vec(&body).map_err(|e| LlmError::Decode(e.to_string()))?;
 
         let request = ureq::post(&self.endpoint).set("Content-Type", "application/json");
