@@ -12,6 +12,11 @@
 //! | `POST` | `/v1/auth/github` | exchange a GitHub OAuth code for a session |
 //! | `POST` | `/v1/auth/refresh` | exchange a refresh token for a fresh session |
 //!
+//! When `GAIA_WEB_DIR` is set it also serves the bundled PWA front end: any
+//! non-API `GET` returns a built static file, falling back to `index.html` for
+//! client-side routes. That lets a single Container App host both the API and the
+//! installable web app on one origin (no CORS, no separate Static Web App).
+//!
 //! It is a small, blocking, thread-per-connection server built directly on
 //! [`std::net`] — no async runtime and no web framework — matching the project's
 //! preference for the standard library and its hand-rolled protocol code
@@ -35,6 +40,7 @@ use crate::auth::Auth;
 use crate::engine::Engine;
 use crate::http_request::HttpRequest;
 use crate::http_response::HttpResponse;
+use crate::static_files::StaticSite;
 use crate::websocket::{self, Message};
 
 /// How long a single connection may stay idle before we give up on it. Keeps
@@ -44,19 +50,27 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(120);
 /// Gaia's backend HTTP/WebSocket server.
 ///
 /// Holds a shared [`Engine`] (the turn runner) and [`Auth`] (session manager)
-/// behind [`Arc`]s so every connection thread can run turns concurrently.
+/// behind [`Arc`]s so every connection thread can run turns concurrently. When a
+/// [`StaticSite`] is configured it also serves the bundled PWA front end from the
+/// same origin, so one Container App hosts both the API and the web app.
 #[derive(Debug, Clone)]
 pub struct Server {
     engine: Arc<Engine>,
     auth: Arc<Auth>,
+    /// The bundled PWA, served for non-API GET requests when present.
+    site: Option<Arc<StaticSite>>,
 }
 
 impl Server {
     /// Build a server around an already-configured engine and auth manager.
-    pub fn new(engine: Engine, auth: Auth) -> Self {
+    ///
+    /// `site` is the optional static front end (from `GAIA_WEB_DIR`); pass `None`
+    /// to run API-only.
+    pub fn new(engine: Engine, auth: Auth, site: Option<StaticSite>) -> Self {
         Server {
             engine: Arc::new(engine),
             auth: Arc::new(auth),
+            site: site.map(Arc::new),
         }
     }
 
@@ -76,9 +90,11 @@ impl Server {
                 Ok(stream) => {
                     let engine = Arc::clone(&self.engine);
                     let auth = Arc::clone(&self.auth);
+                    let site = self.site.clone();
                     // One thread per connection keeps the model blocking-simple.
                     std::thread::spawn(move || {
-                        if let Err(err) = handle_connection(stream, &engine, &auth) {
+                        if let Err(err) = handle_connection(stream, &engine, &auth, site.as_deref())
+                        {
                             // Connection-level failures are expected (clients drop,
                             // time out, send garbage); log and move on.
                             eprintln!("connection error: {err}");
@@ -106,7 +122,12 @@ pub fn http_addr_from_env() -> Option<String> {
 }
 
 /// Handle one client connection: parse a request, dispatch it, write the reply.
-fn handle_connection(stream: TcpStream, engine: &Engine, auth: &Auth) -> std::io::Result<()> {
+fn handle_connection(
+    stream: TcpStream,
+    engine: &Engine,
+    auth: &Auth,
+    site: Option<&StaticSite>,
+) -> std::io::Result<()> {
     stream.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
     stream.set_write_timeout(Some(CONNECTION_TIMEOUT))?;
 
@@ -130,7 +151,7 @@ fn handle_connection(stream: TcpStream, engine: &Engine, auth: &Auth) -> std::io
         return handle_websocket(&mut reader, &mut writer, &request, engine, auth);
     }
 
-    let response = cors(route(&request, engine, auth));
+    let response = cors(route(&request, engine, auth, site));
     // A concise access-log line aids local debugging of the front end wiring.
     println!(
         "{} {} -> {}",
@@ -142,7 +163,12 @@ fn handle_connection(stream: TcpStream, engine: &Engine, auth: &Auth) -> std::io
 }
 
 /// Map a parsed request to a response (non-WebSocket routes).
-fn route(request: &HttpRequest, engine: &Engine, auth: &Auth) -> HttpResponse {
+fn route(
+    request: &HttpRequest,
+    engine: &Engine,
+    auth: &Auth,
+    site: Option<&StaticSite>,
+) -> HttpResponse {
     match (request.method.as_str(), request.path.as_str()) {
         // Health / readiness probes (no auth).
         ("GET", "/healthz") | ("GET", "/readyz") => HttpResponse::text(200, "OK", "ok"),
@@ -158,6 +184,14 @@ fn route(request: &HttpRequest, engine: &Engine, auth: &Auth) -> HttpResponse {
 
         // Refresh an expired access token.
         ("POST", "/v1/auth/refresh") => handle_auth_refresh(request, auth),
+
+        // Static front end: serve the bundled PWA for any non-API GET. API paths
+        // (/v1/...) are intentionally excluded so a missing API route still 404s
+        // as JSON rather than silently returning the app shell.
+        ("GET", path) if !path.starts_with("/v1/") => match site {
+            Some(site) => site.response_for(path),
+            None => HttpResponse::with_status_json(404, "Not Found", r#"{"error":"not found"}"#),
+        },
 
         // Unknown route.
         _ => HttpResponse::with_status_json(404, "Not Found", r#"{"error":"not found"}"#),
@@ -491,7 +525,7 @@ mod tests {
             path: "/healthz".to_string(),
             ..Default::default()
         };
-        let response = route(&request, &engine, &auth);
+        let response = route(&request, &engine, &auth, None);
         assert_eq!(response.status(), 200);
     }
 
@@ -504,7 +538,42 @@ mod tests {
             path: "/nope".to_string(),
             ..Default::default()
         };
-        assert_eq!(route(&request, &engine, &auth).status(), 404);
+        assert_eq!(route(&request, &engine, &auth, None).status(), 404);
+    }
+
+    #[test]
+    fn non_api_get_is_served_by_the_static_site_when_present() {
+        // With a static site configured, a non-API GET that has no matching file
+        // returns the SPA shell (200) instead of a 404. API paths still 404.
+        let mut root = std::env::temp_dir();
+        root.push(format!("gaia-server-static-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("index.html"), b"<!doctype html>").unwrap();
+        let site = StaticSite::new(root.clone());
+
+        let engine = Engine::new(None, None);
+        let auth = dev_auth();
+        let app_request = HttpRequest {
+            method: "GET".to_string(),
+            path: "/some/client/route".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            route(&app_request, &engine, &auth, Some(&site)).status(),
+            200
+        );
+
+        // An unknown API path must NOT be masked by the SPA fallback.
+        let api_request = HttpRequest {
+            method: "GET".to_string(),
+            path: "/v1/unknown".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            route(&api_request, &engine, &auth, Some(&site)).status(),
+            404
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -532,7 +601,7 @@ mod tests {
             headers,
             ..Default::default()
         };
-        let response = route(&request, &engine, &auth);
+        let response = route(&request, &engine, &auth, None);
         assert_eq!(response.status(), 200);
     }
 
@@ -546,7 +615,7 @@ mod tests {
             body: br#"{"text":"hello"}"#.to_vec(),
             ..Default::default()
         };
-        assert_eq!(route(&request, &engine, &auth).status(), 401);
+        assert_eq!(route(&request, &engine, &auth, None).status(), 401);
     }
 
     #[test]
@@ -559,7 +628,7 @@ mod tests {
             body: b"{}".to_vec(),
             ..Default::default()
         };
-        assert_eq!(route(&request, &engine, &auth).status(), 400);
+        assert_eq!(route(&request, &engine, &auth, None).status(), 400);
     }
 
     #[test]
@@ -572,7 +641,7 @@ mod tests {
             body: b"{}".to_vec(),
             ..Default::default()
         };
-        assert_eq!(route(&request, &engine, &auth).status(), 400);
+        assert_eq!(route(&request, &engine, &auth, None).status(), 400);
     }
 
     #[test]
@@ -585,7 +654,7 @@ mod tests {
             body: b"{}".to_vec(),
             ..Default::default()
         };
-        assert_eq!(route(&request, &engine, &auth).status(), 400);
+        assert_eq!(route(&request, &engine, &auth, None).status(), 400);
     }
 
     #[test]
@@ -608,7 +677,7 @@ mod tests {
             body: body.into_bytes(),
             ..Default::default()
         };
-        assert_eq!(route(&request, &engine, &auth).status(), 200);
+        assert_eq!(route(&request, &engine, &auth, None).status(), 200);
     }
 
     #[test]

@@ -76,6 +76,7 @@ mod response_context;
 mod search_history;
 mod server;
 mod sha1;
+mod static_files;
 mod storage;
 mod test_data_execution;
 mod test_data_persistance;
@@ -691,7 +692,14 @@ fn run_server(addr: &str) -> ExitCode {
     // otherwise dev-auth (Bearer dev:<name>).
     let auth = auth::Auth::from_env();
 
-    let server = server::Server::new(engine, auth);
+    // Optionally serve the bundled PWA front end (when GAIA_WEB_DIR is set), so a
+    // single Container App hosts both the API and the installable web app.
+    let site = static_files::StaticSite::from_env();
+    if let Some(site) = &site {
+        eprintln!("serving PWA front end from {}", site.describe());
+    }
+
+    let server = server::Server::new(engine, auth, site);
     match server.serve(addr) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

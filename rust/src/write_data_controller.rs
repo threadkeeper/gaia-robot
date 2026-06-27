@@ -32,7 +32,7 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
-use crate::cosmos::{CosmosClient, CosmosError};
+use crate::cosmos::{CosmosClient, CosmosError, QueryParam};
 use crate::embeddings::{EmbeddingClient, EmbeddingError};
 use crate::storage::{Record, RecordKind};
 
@@ -41,6 +41,15 @@ pub const DATALAKE_INDEX_CONTAINER: &str = "DataLakeIndex";
 
 /// The DataLake container whose writes also feed [`DATALAKE_INDEX_CONTAINER`].
 pub const DATALAKE_CONTAINER: &str = "GaiaDataLake";
+
+/// The append-only friendship ledger container.
+///
+/// Unlike the [`WRITER_CONTAINERS`], this store is **not** a daily
+/// append-and-re-embed snapshot: each turn that changes the balance writes one
+/// new immutable row keyed by an ISO-8601 `timestamp`, carrying the signed
+/// `changeAmount` and the running `previousBalance`/`newBalance`. It is written
+/// through [`WriteDataController::append_connection_delta`], never `upsert_daily`.
+pub const CONNECTIONS_CONTAINER: &str = "GaiaConnections";
 
 /// The default dimensionality of the derived `DataLakeIndex` vector (half of the
 /// 1536-d source embedding). Overridable via `DATALAKE_INDEX_VECTOR_DIMS`.
@@ -162,6 +171,46 @@ struct DataLakeIndexDoc {
     /// The truncated + re-normalized half-size embedding.
     #[serde(rename = "indexVector")]
     index_vector: Vec<f32>,
+}
+
+/// A structured summary of one friendship-ledger append, returned so callers
+/// (the engine) can report the running balance without re-querying it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConnectionOutcome {
+    /// The deterministic ledger id, e.g. `GaiaConnections|<entity>|<timestamp>`.
+    pub id: String,
+    /// The signed delta applied this turn (`+` gain, `-` loss).
+    pub change_amount: f64,
+    /// The running balance before this change.
+    pub previous_balance: f64,
+    /// The running balance after this change.
+    pub new_balance: f64,
+}
+
+/// The on-the-wire shape of a `GaiaConnections` ledger row.
+///
+/// One immutable entry per balance change, keyed within its `/entity` partition
+/// by the ISO-8601 `timestamp`. It carries no `data`/`dataVector`/`metadata` —
+/// only the signed delta and the running balance before and after it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct ConnectionLedgerDoc {
+    /// Unique id `GaiaConnections|<entity>|<timestamp>`.
+    id: String,
+    /// Partition key — the subject/user whose friendship balance changed.
+    entity: String,
+    /// The ISO-8601 instant of this change; the per-partition unique key.
+    timestamp: String,
+    /// The signed delta applied this turn (`+` gain, `-` loss).
+    #[serde(rename = "changeAmount")]
+    change_amount: f64,
+    /// The running balance before this change.
+    #[serde(rename = "previousBalance")]
+    previous_balance: f64,
+    /// The running balance after this change.
+    #[serde(rename = "newBalance")]
+    new_balance: f64,
+    /// Why the balance changed this turn.
+    notes: String,
 }
 
 /// Gaia's shared daily-write controller.
@@ -359,9 +408,85 @@ impl WriteDataController {
             index_dims,
         })
     }
+
+    /// Append one signed-delta entry to the `GaiaConnections` friendship ledger.
+    ///
+    /// Unlike [`upsert_daily`](WriteDataController::upsert_daily), the ledger is
+    /// **append-only**: this reads the entity's current running balance (the
+    /// newest row's `newBalance`, or `0` when the ledger is empty), adds
+    /// `change_amount`, and writes a brand-new immutable row keyed by
+    /// `now_rfc3339`. It carries no embedding, so only a Cosmos client is needed
+    /// (no embedder); a missing client yields [`WriteError::Offline`].
+    ///
+    /// `entity` is the `/entity` partition (the authenticated user id, matching
+    /// how the ledger is read back). Returns the new id plus the before/after
+    /// balance so the caller can surface the running total.
+    pub fn append_connection_delta(
+        &self,
+        entity: &str,
+        now_rfc3339: &str,
+        change_amount: f64,
+        notes: &str,
+    ) -> Result<ConnectionOutcome, WriteError> {
+        let cosmos = self.cosmos.as_ref().ok_or(WriteError::Offline)?;
+
+        // 1. Read the current running balance (the newest ledger row's
+        //    newBalance). An empty ledger starts the running total at zero.
+        let previous_balance = latest_connection_balance(cosmos, entity)?;
+        let new_balance = previous_balance + change_amount;
+
+        // 2. Append a new immutable row keyed by this instant. The timestamp is
+        //    the per-partition unique key, so each change is its own document.
+        let id = connection_id(entity, now_rfc3339);
+        let doc = ConnectionLedgerDoc {
+            id: id.clone(),
+            entity: entity.to_string(),
+            timestamp: now_rfc3339.to_string(),
+            change_amount,
+            previous_balance,
+            new_balance,
+            notes: notes.to_string(),
+        };
+        cosmos.upsert_doc(CONNECTIONS_CONTAINER, entity, &doc)?;
+
+        Ok(ConnectionOutcome {
+            id,
+            change_amount,
+            previous_balance,
+            new_balance,
+        })
+    }
 }
 
 // --- Pure helpers (no network) ----------------------------------------------
+
+/// Build the deterministic ledger id `GaiaConnections|{entity}|{timestamp}`.
+///
+/// The ISO-8601 `timestamp` is the per-partition unique key, so each balance
+/// change is its own immutable row (mirroring the ids on the live ledger).
+fn connection_id(entity: &str, timestamp: &str) -> String {
+    format!("{CONNECTIONS_CONTAINER}|{entity}|{timestamp}")
+}
+
+/// Read the entity's current friendship balance from the ledger.
+///
+/// Returns the newest row's `newBalance`, or `0.0` when the ledger has no rows
+/// yet for this partition. Projects a single field and reads one row, so the
+/// query stays a cheap, single-partition lookup.
+fn latest_connection_balance(cosmos: &CosmosClient, entity: &str) -> Result<f64, CosmosError> {
+    let rows = cosmos.query_values(
+        CONNECTIONS_CONTAINER,
+        entity,
+        "SELECT TOP 1 c.newBalance FROM c WHERE c.entity = @entity ORDER BY c.timestamp DESC",
+        &[QueryParam::new("@entity", entity)],
+    )?;
+    let balance = rows
+        .first()
+        .and_then(|row| row.get("newBalance"))
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    Ok(balance)
+}
 
 /// The `metadata` key under which the daily content hash is stored, enabling the
 /// idempotent-replay (M1) skip.
@@ -859,6 +984,75 @@ mod tests {
         assert_eq!(outcome.vector_dims, 2);
         cosmos_handle.join().expect("cosmos mock thread joins");
         embed_handle.join().expect("embed mock thread joins");
+    }
+
+    #[test]
+    fn append_connection_delta_adds_to_the_running_balance() {
+        // The ledger already holds a balance, so the new row carries the prior
+        // newBalance as previousBalance and applies the delta on top. Cosmos
+        // serves the balance query, then accepts the append. No embedder is
+        // needed (the ledger has no vector), so we configure none.
+        let balance_query = r#"{"Documents":[{"newBalance":5.0}]}"#.to_string();
+        let (cosmos_url, cosmos_handle) = crate::test_http::spawn_mock_http_sequence(vec![
+            ("200 OK".to_string(), balance_query),
+            ("201 Created".to_string(), "{}".to_string()),
+        ]);
+        let controller = WriteDataController::new(
+            Some(CosmosClient::new(cosmos_url, "GaiaDB", "token")),
+            None,
+            4,
+        );
+
+        let outcome = controller
+            .append_connection_delta(
+                "threadkeeper",
+                "2026-06-27T09:00:00Z",
+                3.0,
+                "shared a laugh",
+            )
+            .expect("the ledger append succeeds against the mocks");
+
+        assert_eq!(
+            outcome.id,
+            "GaiaConnections|threadkeeper|2026-06-27T09:00:00Z"
+        );
+        assert_eq!(outcome.previous_balance, 5.0);
+        assert_eq!(outcome.change_amount, 3.0);
+        assert_eq!(outcome.new_balance, 8.0);
+        cosmos_handle.join().expect("cosmos mock thread joins");
+    }
+
+    #[test]
+    fn append_connection_delta_starts_from_zero_on_an_empty_ledger() {
+        // An empty ledger returns no rows, so the running balance starts at zero
+        // and a negative delta is recorded against it.
+        let empty_query = r#"{"Documents":[]}"#.to_string();
+        let (cosmos_url, cosmos_handle) = crate::test_http::spawn_mock_http_sequence(vec![
+            ("200 OK".to_string(), empty_query),
+            ("201 Created".to_string(), "{}".to_string()),
+        ]);
+        let controller = WriteDataController::new(
+            Some(CosmosClient::new(cosmos_url, "GaiaDB", "token")),
+            None,
+            4,
+        );
+
+        let outcome = controller
+            .append_connection_delta("threadkeeper", "2026-06-27T09:00:00Z", -2.0, "a slight")
+            .expect("the first ledger append succeeds");
+
+        assert_eq!(outcome.previous_balance, 0.0);
+        assert_eq!(outcome.new_balance, -2.0);
+        cosmos_handle.join().expect("cosmos mock thread joins");
+    }
+
+    #[test]
+    fn append_connection_delta_is_offline_without_a_cosmos_client() {
+        let offline = WriteDataController::new(None, None, 4);
+        assert!(matches!(
+            offline.append_connection_delta("e", "2026-06-27T09:00:00Z", 1.0, "note"),
+            Err(WriteError::Offline)
+        ));
     }
 
     #[test]

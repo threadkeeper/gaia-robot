@@ -322,6 +322,39 @@ impl CosmosClient {
         query: &str,
         params: &[QueryParam],
     ) -> Result<Vec<Record>, CosmosError> {
+        let text = self.run_query(container, partition_value, query, params)?;
+        parse_documents(&text)
+    }
+
+    /// Run a parameterised SQL query and return the rows as raw JSON values.
+    ///
+    /// The generic counterpart to [`query`](CosmosClient::query): use it for
+    /// containers whose documents are not [`Record`]-shaped (for example the
+    /// `GaiaConnections` ledger, whose rows carry balance fields and no `data`
+    /// body). `partition_value` scopes the query to a single partition.
+    pub fn query_values(
+        &self,
+        container: &str,
+        partition_value: &str,
+        query: &str,
+        params: &[QueryParam],
+    ) -> Result<Vec<serde_json::Value>, CosmosError> {
+        let text = self.run_query(container, partition_value, query, params)?;
+        parse_document_values(&text)
+    }
+
+    /// Send a single-partition query request and return the raw response body.
+    ///
+    /// Shared by [`query`](CosmosClient::query) and
+    /// [`query_values`](CosmosClient::query_values) so the two parse the same
+    /// wire response into different shapes without duplicating the HTTP call.
+    fn run_query(
+        &self,
+        container: &str,
+        partition_value: &str,
+        query: &str,
+        params: &[QueryParam],
+    ) -> Result<String, CosmosError> {
         let url = docs_url(&self.endpoint, &self.database, container);
         let body = serde_json::to_vec(&QueryBody {
             query,
@@ -345,11 +378,9 @@ impl CosmosClient {
             .send_bytes(&body)
             .map_err(map_ureq_error)?;
 
-        let text = response
+        response
             .into_string()
-            .map_err(|e| CosmosError::Http(e.to_string()))?;
-
-        parse_documents(&text)
+            .map_err(|e| CosmosError::Http(e.to_string()))
     }
 
     /// Upsert (insert-or-replace) one [`Record`] into a container.
@@ -561,6 +592,13 @@ fn parse_documents(body: &str) -> Result<Vec<Record>, CosmosError> {
     Ok(parsed.documents)
 }
 
+/// Parse a Cosmos query response body into raw JSON values (any document shape).
+fn parse_document_values(body: &str) -> Result<Vec<serde_json::Value>, CosmosError> {
+    let parsed: ValuesResponse =
+        serde_json::from_str(body).map_err(|e| CosmosError::Decode(e.to_string()))?;
+    Ok(parsed.documents)
+}
+
 /// Current time as an RFC 1123 GMT string for the `x-ms-date` header.
 fn now_rfc1123() -> String {
     let secs = SystemTime::now()
@@ -723,6 +761,14 @@ struct QueryBody<'a> {
 struct DocumentsResponse {
     #[serde(rename = "Documents")]
     documents: Vec<Record>,
+}
+
+/// The same envelope as [`DocumentsResponse`] but keeping rows as raw JSON, for
+/// containers whose documents are not [`Record`]-shaped.
+#[derive(Debug, serde::Deserialize)]
+struct ValuesResponse {
+    #[serde(rename = "Documents")]
+    documents: Vec<serde_json::Value>,
 }
 
 #[cfg(test)]

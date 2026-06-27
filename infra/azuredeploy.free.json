@@ -26,6 +26,13 @@
         "description": "Set to true to also deploy the text-embedding model (requires embedding model quota)."
       }
     },
+    "enableFreeTier": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Enable the Cosmos DB free tier (one per subscription). IMMUTABLE on an existing account — keep it at the current value when re-deploying. Set false if this subscription already uses its free-tier account elsewhere."
+      }
+    },
     "braveSearchApiKey": {
       "type": "securestring",
       "defaultValue": "",
@@ -53,6 +60,7 @@
           "location": { "value": "[parameters('location')]" },
           "containerImage": { "value": "[parameters('containerImage')]" },
           "deployEmbeddingModel": { "value": "[parameters('deployEmbeddingModel')]" },
+          "enableFreeTier": { "value": "[parameters('enableFreeTier')]" },
           "braveSearchApiKey": { "value": "[parameters('braveSearchApiKey')]" }
         }
       }

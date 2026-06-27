@@ -1,5 +1,6 @@
 # Keep the Docker build context small and free of build outputs / secrets.
-# Only rust/ source is needed to build the backend image.
+# Both the Rust backend (rust/) and the PWA front end (web/) are built in the
+# image; their build outputs and dependencies below are regenerated inside it.
 
 # Rust build outputs (huge).
 **/target

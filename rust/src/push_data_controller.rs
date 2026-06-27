@@ -398,6 +398,89 @@ fn canonical_store(target: &str) -> Option<&'static str> {
     }
 }
 
+/// Extract the executable daily-store writes from an audited turn.
+///
+/// Returns one `(container, data)` pair per `upsert` action LLM Call 2 planned
+/// against a *daily append* writer store — `GaiaKB`, `GaiaDataLake`, or
+/// `GaiaDiary` — pulling the durable text out of the action's `payload.data`.
+///
+/// Two kinds of entries are intentionally dropped so nothing useless reaches
+/// Cosmos:
+/// - The shared friendship ledger `GaiaConnections` is excluded: it is not a
+///   daily append store (it records signed-`delta` entries with a distinct
+///   schema) and must be handled by its own ledger path, not this one. The
+///   exclusion is enforced via [`crate::write_data_controller::is_writer_container`].
+/// - Actions whose `payload.data` is missing or blank are skipped, so an empty
+///   upsert never overwrites a day's record with nothing.
+///
+/// The caller supplies the partition `entity` (the authenticated user id) and
+/// the timestamp, so this function stays pure and easy to unit-test.
+pub fn planned_store_writes(audit: &ActionAudit) -> Vec<(&'static str, String)> {
+    let mut writes = Vec::new();
+    for action in &audit.store_actions {
+        // Re-derive the canonical container from the raw action so the executed
+        // write always agrees with how the audit classified it.
+        let target = string_field(action, "target").to_ascii_lowercase();
+        let Some(store) = canonical_store(&target) else {
+            continue;
+        };
+        // Only daily append stores are executable here; this filters out the
+        // GaiaConnections ledger, which canonical_store still recognises.
+        if !crate::write_data_controller::is_writer_container(store) {
+            continue;
+        }
+        // The durable text to persist lives under `payload.data`. A blank or
+        // missing value means there is nothing to save, so skip it.
+        let data = action
+            .get("payload")
+            .and_then(|payload| payload.get("data"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if data.is_empty() {
+            continue;
+        }
+        writes.push((store, data));
+    }
+    writes
+}
+
+/// Extract the friendship-ledger deltas LLM Call 2 planned this turn.
+///
+/// Returns one `(change_amount, note)` pair per `upsert` action targeting
+/// `GaiaConnections`, reading the signed `payload.delta` and the
+/// `payload.note` explaining it. Actions with a missing or zero delta are
+/// skipped, since a zero change would write a ledger row that leaves the
+/// balance untouched. Kept separate from [`planned_store_writes`] because the
+/// ledger has a distinct (non-daily, balance-carrying) schema and write path.
+pub fn planned_connection_deltas(audit: &ActionAudit) -> Vec<(f64, String)> {
+    let mut deltas = Vec::new();
+    for action in &audit.store_actions {
+        let target = string_field(action, "target").to_ascii_lowercase();
+        if canonical_store(&target) != Some("GaiaConnections") {
+            continue;
+        }
+        let payload = action.get("payload");
+        // A missing or zero delta leaves the balance unchanged, so skip it.
+        let delta = payload
+            .and_then(|payload| payload.get("delta"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        if delta == 0.0 {
+            continue;
+        }
+        let note = payload
+            .and_then(|payload| payload.get("note"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        deltas.push((delta, note));
+    }
+    deltas
+}
+
 /// Read a string field from a JSON object, defaulting to empty.
 fn string_field(action: &Value, key: &str) -> String {
     action
@@ -848,6 +931,69 @@ mod tests {
     fn time_actions_is_empty_without_an_actions_array() {
         assert!(time_actions(&json!({})).is_empty());
         assert!(time_actions(&json!({ "actions": "nope" })).is_empty());
+    }
+
+    #[test]
+    fn planned_store_writes_executes_daily_stores_and_skips_ledger_and_blanks() {
+        let actions = json!({
+            "actions": [
+                { "id": "a4", "kind": "upsert", "target": "GaiaConnections",
+                  "payload": { "entity": "u", "delta": 1, "note": "warmer" } },
+                { "id": "a5", "kind": "upsert", "target": "GaiaKB",
+                  "payload": { "entity": "u", "data": "  prefers tea  " } },
+                { "id": "a6", "kind": "upsert", "target": "GaiaDataLake",
+                  "payload": { "entity": "u", "data": "snapshot of the turn" } },
+                { "id": "a7", "kind": "upsert", "target": "GaiaDiary",
+                  "payload": { "entity": "u", "data": "a private reflection" } },
+                // Blank data must be skipped so we never write an empty record.
+                { "id": "a8", "kind": "upsert", "target": "GaiaKB",
+                  "payload": { "entity": "u", "data": "   " } }
+            ]
+        });
+
+        let writes = planned_store_writes(&audit_actions(&actions));
+
+        // GaiaConnections (ledger) and the blank GaiaKB action are excluded;
+        // the three daily writer stores remain, in document order, with their
+        // `payload.data` trimmed.
+        assert_eq!(
+            writes,
+            vec![
+                ("GaiaKB", "prefers tea".to_string()),
+                ("GaiaDataLake", "snapshot of the turn".to_string()),
+                ("GaiaDiary", "a private reflection".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn planned_store_writes_is_empty_without_store_actions() {
+        let actions = json!({
+            "actions": [
+                { "id": "a1", "kind": "send", "target": "Push",
+                  "message": "ping", "urgency": 0.2 }
+            ]
+        });
+        assert!(planned_store_writes(&audit_actions(&actions)).is_empty());
+    }
+
+    #[test]
+    fn planned_connection_deltas_reads_delta_and_note_and_skips_zero() {
+        let actions = json!({
+            "actions": [
+                { "id": "a4", "kind": "upsert", "target": "GaiaConnections",
+                  "payload": { "entity": "u", "delta": 2, "note": "  shared a laugh  " } },
+                // Zero delta would not move the balance, so it is skipped.
+                { "id": "a5", "kind": "upsert", "target": "GaiaConnections",
+                  "payload": { "entity": "u", "delta": 0, "note": "no change" } },
+                // A daily-store upsert must never be treated as a ledger delta.
+                { "id": "a6", "kind": "upsert", "target": "GaiaKB",
+                  "payload": { "entity": "u", "data": "a fact" } }
+            ]
+        });
+
+        let deltas = planned_connection_deltas(&audit_actions(&actions));
+        assert_eq!(deltas, vec![(2.0, "shared a laugh".to_string())]);
     }
 
     #[test]

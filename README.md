@@ -12,9 +12,11 @@ to follow on your first try.
 
 [![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fthreadkeeper%2Fgaia-robot%2Fmain%2Finfra%2Fazuredeploy.json)
 
-> The **Deploy to Azure** button sets up everything Gaia needs in one click.
-> The default **Free / Lite** tier has **no fixed idle cost**. For the cost
-> breakdown and all the deployment options, see [infra/README.md](infra/README.md).
+> The **Deploy to Azure** button sets up everything Gaia needs in one click —
+> including a single Container App that serves both the API and the web app from
+> one origin. The default **Free / Lite** tier idles at near-zero cost (only a
+> small ~$5/mo container registry). For the full cost breakdown and all the
+> deployment options, see [infra/README.md](infra/README.md).
 
 ## How Gaia thinks
 
@@ -107,6 +109,10 @@ The extra tools install once with
 `cargo install cargo-llvm-cov cargo-audit cargo-deny`. For fast local feedback,
 enable the pre-commit hook once per clone with
 `git config core.hooksPath .githooks`.
+
+For the full testing story — unit tests, integration tests, the coverage gate,
+the supply-chain audit, and the live self-tests that gate deployment — see
+[TESTING.md](TESTING.md).
 
 The full coding standards live in
 [.github/copilot-instructions.md](.github/copilot-instructions.md).

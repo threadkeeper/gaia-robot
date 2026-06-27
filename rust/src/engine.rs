@@ -369,7 +369,8 @@ impl Engine {
                 // lake (append-and-re-embed). Writes are mandatory: the returned
                 // status is surfaced to the user so a Cosmos connection or write
                 // failure is visible rather than silently dropped.
-                let write = self.persist_turn(user_id, input, &push.reply_text, &requested_at);
+                let write =
+                    self.persist_turn(user_id, input, &push.reply_text, &requested_at, &push.audit);
                 TurnResult {
                     reply: push.reply_text,
                     verdict: "allow".to_string(),
@@ -487,6 +488,7 @@ impl Engine {
         input: &str,
         reply: &str,
         now_rfc3339: &str,
+        audit: &crate::push_data_controller::ActionAudit,
     ) -> WriteStatus {
         // A missing or offline writer is a hard, visible error — not a silent
         // skip — because persistence is required for every live turn.
@@ -507,7 +509,8 @@ impl Engine {
         // One readable line capturing both sides of the exchange. The controller
         // timestamps and appends it under today's record.
         let chunk = format!("User: {input}\nGaia: {reply}");
-        match writer.upsert_daily("UsersDataLake", user_id, now_rfc3339, &chunk) {
+        let users_status = match writer.upsert_daily("UsersDataLake", user_id, now_rfc3339, &chunk)
+        {
             Ok(outcome) => {
                 // A lightweight, secret-free trace so operators can see writes
                 // landing without inspecting Cosmos directly.
@@ -533,7 +536,127 @@ impl Engine {
                 eprintln!("persist turn failed for user {user_id}: {detail}");
                 WriteStatus { ok: false, detail }
             }
+        };
+
+        // The personal data lake is the always-on record of the exchange. If it
+        // failed (typically a connection problem), the shared-store upserts would
+        // fail the same way, so report that one error rather than piling on.
+        if !users_status.ok {
+            return users_status;
         }
+
+        // Now execute the *shared* knowledge/data-lake/diary upserts LLM Call 2
+        // planned this turn. Previously these were only audited and timed for the
+        // debug panel and never written, so GaiaKB/GaiaDataLake/GaiaDiary silently
+        // stopped receiving updates. Run them through the same append-and-re-embed
+        // path, scoped to the authenticated `user_id` (their `/entity` partition,
+        // matching how they are read back).
+        let mut statuses = vec![users_status];
+        statuses.extend(self.persist_planned_stores(writer, user_id, now_rfc3339, audit));
+        statuses.extend(self.persist_planned_connections(writer, user_id, now_rfc3339, audit));
+
+        // Persistence is mandatory: the turn's status is `ok` only when *every*
+        // planned write landed, and the detail concatenates each store's line so
+        // the UI can show exactly what saved (or which store failed).
+        let ok = statuses.iter().all(|status| status.ok);
+        let detail = statuses
+            .iter()
+            .map(|status| status.detail.clone())
+            .collect::<Vec<_>>()
+            .join("; ");
+        WriteStatus { ok, detail }
+    }
+
+    /// Execute the daily-store upserts LLM Call 2 planned this turn and return
+    /// one [`WriteStatus`] per store, in plan order.
+    ///
+    /// Covers the shared `GaiaKB`, `GaiaDataLake`, and `GaiaDiary` stores (the
+    /// friendship ledger `GaiaConnections` is handled separately and excluded by
+    /// [`crate::push_data_controller::planned_store_writes`]). Each write reuses
+    /// the controller's append-and-re-embed [`WriteDataController::upsert_daily`]
+    /// and is scoped to the authenticated `user_id`, which is the `/entity`
+    /// partition key these shared stores are both written and read under. A
+    /// per-store failure is reported (and logged) but never aborts the others.
+    fn persist_planned_stores(
+        &self,
+        writer: &WriteDataController,
+        user_id: &str,
+        now_rfc3339: &str,
+        audit: &crate::push_data_controller::ActionAudit,
+    ) -> Vec<WriteStatus> {
+        crate::push_data_controller::planned_store_writes(audit)
+            .into_iter()
+            .map(
+                |(store, data)| match writer.upsert_daily(store, user_id, now_rfc3339, &data) {
+                    Ok(outcome) => {
+                        eprintln!(
+                            "persisted store write: {} ({}, {} bytes, vector {}d)",
+                            outcome.id,
+                            outcome.action.label(),
+                            outcome.data_bytes,
+                            outcome.vector_dims,
+                        );
+                        WriteStatus {
+                            ok: true,
+                            detail: format!(
+                                "saved to Cosmos {}: {} ({}, {} bytes)",
+                                store,
+                                outcome.id,
+                                outcome.action.label(),
+                                outcome.data_bytes,
+                            ),
+                        }
+                    }
+                    Err(err) => {
+                        let detail = format!("Cosmos write to {store} failed: {err}");
+                        eprintln!("store write failed for user {user_id}: {detail}");
+                        WriteStatus { ok: false, detail }
+                    }
+                },
+            )
+            .collect()
+    }
+
+    /// Append the friendship-ledger deltas LLM Call 2 planned this turn to
+    /// `GaiaConnections`, returning one [`WriteStatus`] per delta, in plan order.
+    ///
+    /// The ledger is append-only and balance-carrying, so this uses the
+    /// dedicated [`WriteDataController::append_connection_delta`] path rather
+    /// than `upsert_daily`. Like the snapshot stores it is scoped to the
+    /// authenticated `user_id` (the `/entity` partition), and a per-delta failure
+    /// is reported (and logged) without aborting the others.
+    fn persist_planned_connections(
+        &self,
+        writer: &WriteDataController,
+        user_id: &str,
+        now_rfc3339: &str,
+        audit: &crate::push_data_controller::ActionAudit,
+    ) -> Vec<WriteStatus> {
+        crate::push_data_controller::planned_connection_deltas(audit)
+            .into_iter()
+            .map(|(change_amount, note)| {
+                match writer.append_connection_delta(user_id, now_rfc3339, change_amount, &note) {
+                    Ok(outcome) => {
+                        eprintln!(
+                            "recorded connection delta: {} ({:+}, balance {})",
+                            outcome.id, outcome.change_amount, outcome.new_balance,
+                        );
+                        WriteStatus {
+                            ok: true,
+                            detail: format!(
+                                "saved to Cosmos GaiaConnections: {} ({:+}, balance {})",
+                                outcome.id, outcome.change_amount, outcome.new_balance,
+                            ),
+                        }
+                    }
+                    Err(err) => {
+                        let detail = format!("Cosmos write to GaiaConnections failed: {err}");
+                        eprintln!("connection write failed for user {user_id}: {detail}");
+                        WriteStatus { ok: false, detail }
+                    }
+                }
+            })
+            .collect()
     }
 }
 
@@ -596,7 +719,13 @@ mod tests {
         // persisting a turn must not silently skip. It returns a visible failure
         // status (never panics) the front end can show to the user.
         let engine = Engine::new(None, None);
-        let status = engine.persist_turn("alice", "hello", "hi alice", "2026-06-27T10:00:00Z");
+        let status = engine.persist_turn(
+            "alice",
+            "hello",
+            "hi alice",
+            "2026-06-27T10:00:00Z",
+            &crate::push_data_controller::ActionAudit::default(),
+        );
         assert!(!status.ok, "missing writer must report a failed write");
         assert!(
             status.detail.to_lowercase().contains("cosmos"),

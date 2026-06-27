@@ -20,22 +20,61 @@ Both buttons nest [azuredeploy.json](azuredeploy.json), the base ARM template
   deployed (SKU from `modelRouterSku`; default `auto`) and, when
   `deployEmbeddingModel` is `true`, a high-performance **`text-embedding`**
   deployment used to populate the Cosmos `/dataVector` field;
+- an **Azure Container Registry** (when `deployAcr` is `true`) the CI/CD pipeline
+  builds and pushes the application image to;
 - a **Container App** (plus its managed environment and a Log Analytics
-  workspace), pre-wired with `COSMOS_ENDPOINT`, `COSMOS_DATABASE`,
-  `FOUNDRY_ENDPOINT`, `MODEL_ROUTER_DEPLOYMENT`, `EMBEDDING_DEPLOYMENT`, and
-  `EMBEDDING_DIMENSIONS` environment variables.
+  workspace) that serves **both** the JSON/WebSocket API **and** the installable
+  PWA front end from a single origin (the web bundle is baked into the image — no
+  separate Static Web App). It is pre-wired with `COSMOS_ENDPOINT`,
+  `COSMOS_DATABASE`, `FOUNDRY_ENDPOINT`, `MODEL_ROUTER_DEPLOYMENT`,
+  `EMBEDDING_DEPLOYMENT`, `EMBEDDING_DIMENSIONS`, `BRAVE_SEARCH_*`, **`GAIA_MODE`**
+  (required — see below), `FOUNDRY_API_VERSION`, and the public `GOOGLE_CLIENT_ID`
+  / `GITHUB_CLIENT_ID` sign-in ids;
+- the **managed-identity role assignments** the app needs at runtime (it
+  authenticates with its system-assigned identity, no static keys):
+  **Cosmos DB Built-in Data Contributor** on the account, **Cognitive Services
+  OpenAI User** on the Foundry account (model-router + embeddings), and
+  **AcrPull** on the registry (image pulls).
+
+> **`GAIA_MODE` is required.** The LLM and Cosmos clients stay disabled unless
+> `GAIA_MODE` is `dev` or `local`, so the template defaults it to `dev`. Without
+> it the app starts but silently does nothing.
 
 Template outputs include `tier`, `cosmosEndpoint` (use it for `COSMOS_ENDPOINT`),
 `foundryEndpoint`, `modelRouterDeployment`, `embeddingDeployment`,
-`embeddingDimensions`, and `containerAppFqdn`.
+`embeddingDimensions`, `containerAppFqdn` (the live app URL), and
+`acrLoginServer`.
 
-Key template parameters: `tier` (default `free`), `modelRouterVersion`
-(default `2025-05-19`), `modelRouterSku` (default `auto`: uses `Standard` in
+Key template parameters: `tier` (default `free`), `enableFreeTier` (default
+`true`; see *Reuse* below), `gaiaMode` (default `dev`), `modelRouterVersion`
+(default `2025-11-18`), `modelRouterSku` (default `auto`: uses `Standard` in
 `eastus`, `GlobalStandard` elsewhere), `modelRouterCapacity` (default `0` = use
-the tier default), `deployEmbeddingModel` (default `false`), `embeddingModel`
+the tier default), `deployEmbeddingModel` (default `true`), `embeddingModel`
 (default `text-embedding-3-large`), `embeddingDimensions` (default `1536` — must
-match `COSMOS_VECTOR_DIMS`), `containerImage` (default a hello-world image —
-replace with your own once published).
+match `COSMOS_VECTOR_DIMS`), `deployAcr` (default `true`), `acrName` /`acrSku`
+(default `Basic`), `foundryApiVersion` (default `2024-10-21`), `googleClientId` /
+`githubClientId` (public OAuth ids; the GitHub client *secret* is injected
+separately by CD), and `containerImage` (default a public hello-world image —
+the CD pipeline replaces it with the real one).
+
+### Reuse an existing deployment (no URL changes)
+
+The template is **idempotent**: ARM matches resources by name, so re-deploying
+with the **same resource names** updates them in place instead of creating new
+ones — the Container App FQDN and Cosmos endpoint stay the same. Two rules keep a
+redeploy safe:
+
+- **Pass the existing resource names** (`accountName`, `foundryName`, `acrName`,
+  `containerAppName`) — the defaults derive a fresh `uniqueString`, which would
+  create *new* resources.
+- **Keep `enableFreeTier` at the account's current value.** It is **immutable**
+  on an existing Cosmos account, so flipping it errors. It is deliberately a
+  standalone parameter (not coupled to `tier`) for exactly this reason.
+
+Validate a redeploy with `az deployment group what-if` first and confirm it
+reports *No change* / *Modify* (not *Create* / *Delete*) for the core resources.
+The CD pipeline owns the live image tag and the GitHub client secret, so pass the
+real `containerImage` when redeploying by hand to avoid reverting it.
 
 ## Cost / pricing breakdown
 
@@ -53,12 +92,14 @@ replace with your own once published).
 | **`model-router` deployment** (`modelRouterSku`) | ⚠️ Pay-per-token (no idle cost) | Per 1K input/output tokens (varies by routed model) | Consumption-based; **cannot be made free**, but costs nothing when not called. Capacity is a rate limit (TPM), not a charge. |
 | **Container App** | ✅ Free when scaled to zero | Free monthly grant: 180K vCPU-s + 360K GiB-s + 2M requests, then ~$0.000024/vCPU-s | **Lite** uses `minReplicas: 0` → idles at $0. **Hobby** uses `minReplicas: 1` (always-on) which exceeds the free grant and costs ~$15–30/mo. |
 | **Container Apps managed environment** | ✅ Free | $0 | No charge for the environment itself; you pay only for the apps. |
+| **Azure Container Registry** (`Basic`) | ⚠️ Fixed daily fee | ~$0.167/day (~$5/mo) | Stores the app image. The only resource with a small fixed cost; set `deployAcr=false` to skip it and use a public image instead. |
 | **Log Analytics workspace** (`PerGB2018`) | ✅ First 5 GB/mo free | ~$2.76/GB after 5 GB | Retention is set to **30 days** to stay within Azure's supported workspace limits while keeping logs available for testing. |
 
-**Bottom line:** the **Free / Lite** button has **no fixed monthly cost** while
-idle. The only unavoidable usage-based charges are (1) AI model tokens when the
-`model-router` is actually called, and (2) Cosmos throughput/storage beyond the
-free-tier allowances. Everything else sits within Azure's free grants.
+**Bottom line:** the **Free / Lite** button's only fixed cost is the **~$5/mo
+Container Registry** (set `deployAcr=false` to remove even that and run a public
+image). Everything else idles at **$0**. The only usage-based charges are
+(1) AI model tokens when the `model-router` is actually called, and (2) Cosmos
+throughput/storage beyond the free-tier allowances.
 
 ## cosmos_create.py
 

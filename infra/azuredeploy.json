@@ -24,7 +24,64 @@
       "defaultValue": "free",
       "allowedValues": [ "free", "hobby" ],
       "metadata": {
-        "description": "Cost tier. 'free' minimises idle cost (Cosmos free tier, scale-to-zero Container App, smallest model capacity); 'hobby' is a balanced always-on configuration. See infra/README.md for the full price breakdown."
+        "description": "Compute/throughput tier. 'free' minimises idle cost (scale-to-zero Container App, smallest model capacity); 'hobby' is a balanced always-on configuration. Note: this controls compute only — Cosmos free tier is controlled separately by 'enableFreeTier'. See infra/README.md for the full price breakdown."
+      }
+    },
+    "enableFreeTier": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Enable the Cosmos DB free tier (first 1,000 RU/s + 25 GB free, one account per subscription). Decoupled from 'tier' on purpose: this flag is IMMUTABLE on an existing Cosmos account, so keep it at the account's current value when re-deploying to avoid an error. The live gaia-rg account has it ON."
+      }
+    },
+    "gaiaMode": {
+      "type": "string",
+      "defaultValue": "dev",
+      "metadata": {
+        "description": "Value for the GAIA_MODE env var. REQUIRED for the app to talk to Foundry and Cosmos: the LLM and Cosmos clients are disabled unless GAIA_MODE is 'dev' or 'local'. The live deployment uses 'dev'. Leave as 'dev' unless you know otherwise."
+      }
+    },
+    "foundryApiVersion": {
+      "type": "string",
+      "defaultValue": "2024-10-21",
+      "metadata": {
+        "description": "Azure OpenAI data-plane API version the app uses (FOUNDRY_API_VERSION). Matches the live deployment."
+      }
+    },
+    "googleClientId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Google OAuth web client id for sign-in (GOOGLE_CLIENT_ID). Public identifier; leave empty to disable Google sign-in."
+      }
+    },
+    "githubClientId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "GitHub OAuth App client id for sign-in (GITHUB_CLIENT_ID). Public identifier; leave empty to disable GitHub sign-in. The matching client SECRET is injected separately by the CD workflow as a Container App secret."
+      }
+    },
+    "deployAcr": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Create an Azure Container Registry the CD pipeline pushes the app image to, grant the Container App's managed identity AcrPull, and wire the registry into the app. Set false to use only public images."
+      }
+    },
+    "acrName": {
+      "type": "string",
+      "defaultValue": "[concat('gaiaacr', uniqueString(resourceGroup().id))]",
+      "metadata": {
+        "description": "Globally unique Azure Container Registry name (alphanumeric only). The live registry is 'gaiarobotacr'."
+      }
+    },
+    "acrSku": {
+      "type": "string",
+      "defaultValue": "Basic",
+      "allowedValues": [ "Basic", "Standard", "Premium" ],
+      "metadata": {
+        "description": "Container Registry SKU. 'Basic' matches the live deployment and is the cheapest."
       }
     },
     "databaseName": {
@@ -93,9 +150,9 @@
     },
     "deployEmbeddingModel": {
       "type": "bool",
-      "defaultValue": false,
+      "defaultValue": true,
       "metadata": {
-        "description": "Set to true to deploy the text-embedding model used to populate Cosmos /dataVector. Requires embedding model quota in the chosen region."
+        "description": "Deploy the text-embedding model used to populate Cosmos /dataVector and power semantic search. On by default to match the live deployment; requires embedding model quota in the chosen region. Set to false to skip it."
       }
     },
     "embeddingModel": {
@@ -161,6 +218,15 @@
     "containerEnvName": "[concat('gaia-env-', uniqueString(resourceGroup().id))]",
     "modelRouterDeploymentName": "model-router",
     "embeddingDeploymentName": "text-embedding",
+    "acrLoginServer": "[concat(parameters('acrName'), '.azurecr.io')]",
+    "acrRegistries": [
+      {
+        "server": "[concat(parameters('acrName'), '.azurecr.io')]",
+        "identity": "system"
+      }
+    ],
+    "acrPullRoleId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')]",
+    "openAiUserRoleId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd')]",
     "tierConfig": {
       "free": {
         "cpu": "[json('0.25')]",
@@ -168,8 +234,7 @@
         "minReplicas": 0,
         "maxReplicas": 1,
         "modelCapacity": 10,
-        "embeddingCapacity": 30,
-        "enableFreeTier": true
+        "embeddingCapacity": 30
       },
       "hobby": {
         "cpu": "[json('0.5')]",
@@ -177,8 +242,7 @@
         "minReplicas": 1,
         "maxReplicas": 3,
         "modelCapacity": 50,
-        "embeddingCapacity": 120,
-        "enableFreeTier": false
+        "embeddingCapacity": 120
       }
     },
     "selectedTier": "[variables('tierConfig')[parameters('tier')]]",
@@ -196,7 +260,7 @@
       "kind": "GlobalDocumentDB",
       "properties": {
         "databaseAccountOfferType": "Standard",
-        "enableFreeTier": "[variables('selectedTier').enableFreeTier]",
+        "enableFreeTier": "[parameters('enableFreeTier')]",
         "consistencyPolicy": {
           "defaultConsistencyLevel": "Session"
         },
@@ -253,6 +317,51 @@
         "roleDefinitionId": "[resourceId('Microsoft.DocumentDB/databaseAccounts/sqlRoleDefinitions', parameters('accountName'), '00000000-0000-0000-0000-000000000002')]",
         "principalId": "[reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2024-03-01', 'Full').identity.principalId]",
         "scope": "[resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('accountName'))]"
+      }
+    },
+    {
+      "type": "Microsoft.ContainerRegistry/registries",
+      "apiVersion": "2023-07-01",
+      "name": "[parameters('acrName')]",
+      "condition": "[parameters('deployAcr')]",
+      "comments": "Private registry the CD pipeline builds and pushes the Gaia image to. The Container App pulls from it using its managed identity (AcrPull, below).",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "[parameters('acrSku')]"
+      },
+      "properties": {
+        "adminUserEnabled": false
+      }
+    },
+    {
+      "type": "Microsoft.ContainerRegistry/registries/providers/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[concat(parameters('acrName'), '/Microsoft.Authorization/', guid(resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName')), parameters('containerAppName'), 'acrpull'))]",
+      "condition": "[parameters('deployAcr')]",
+      "comments": "Let the Container App's managed identity pull images from the registry (AcrPull). The bootstrap image is public, so this can be granted after the app is created without blocking the first deployment.",
+      "dependsOn": [
+        "[resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName'))]",
+        "[resourceId('Microsoft.App/containerApps', parameters('containerAppName'))]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[variables('acrPullRoleId')]",
+        "principalId": "[reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2024-03-01', 'Full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      }
+    },
+    {
+      "type": "Microsoft.CognitiveServices/accounts/providers/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[concat(parameters('foundryName'), '/Microsoft.Authorization/', guid(resourceId('Microsoft.CognitiveServices/accounts', parameters('foundryName')), parameters('containerAppName'), 'openai-user'))]",
+      "comments": "Grant the Container App's managed identity Cognitive Services OpenAI User on the Foundry account. This is the production auth path for the model-router and embedding calls — the app mints an AAD token from its SAMI, so no FOUNDRY_API_KEY is needed.",
+      "dependsOn": [
+        "[resourceId('Microsoft.CognitiveServices/accounts', parameters('foundryName'))]",
+        "[resourceId('Microsoft.App/containerApps', parameters('containerAppName'))]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[variables('openAiUserRoleId')]",
+        "principalId": "[reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2024-03-01', 'Full').identity.principalId]",
+        "principalType": "ServicePrincipal"
       }
     },
     {
@@ -370,7 +479,8 @@
         "type": "SystemAssigned"
       },
       "dependsOn": [
-        "[resourceId('Microsoft.App/managedEnvironments', variables('containerEnvName'))]"
+        "[resourceId('Microsoft.App/managedEnvironments', variables('containerEnvName'))]",
+        "[resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName'))]"
       ],
       "properties": {
         "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('containerEnvName'))]",
@@ -379,7 +489,8 @@
             "external": true,
             "targetPort": 80,
             "transport": "auto"
-          }
+          },
+          "registries": "[if(parameters('deployAcr'), variables('acrRegistries'), json('[]'))]"
         },
         "template": {
           "containers": [
@@ -422,6 +533,26 @@
                 {
                   "name": "BRAVE_SEARCH_API_KEY",
                   "value": "[parameters('braveSearchApiKey')]"
+                },
+                {
+                  "name": "GAIA_MODE",
+                  "value": "[parameters('gaiaMode')]"
+                },
+                {
+                  "name": "GAIA_HTTP_PORT",
+                  "value": "80"
+                },
+                {
+                  "name": "FOUNDRY_API_VERSION",
+                  "value": "[parameters('foundryApiVersion')]"
+                },
+                {
+                  "name": "GOOGLE_CLIENT_ID",
+                  "value": "[parameters('googleClientId')]"
+                },
+                {
+                  "name": "GITHUB_CLIENT_ID",
+                  "value": "[parameters('githubClientId')]"
                 }
               ]
             }
@@ -470,6 +601,10 @@
     "containerAppFqdn": {
       "type": "string",
       "value": "[reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName'))).configuration.ingress.fqdn]"
+    },
+    "acrLoginServer": {
+      "type": "string",
+      "value": "[if(parameters('deployAcr'), variables('acrLoginServer'), '')]"
     }
   }
 }

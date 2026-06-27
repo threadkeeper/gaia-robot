@@ -57,6 +57,25 @@ impl HttpResponse {
         }
     }
 
+    /// A response carrying arbitrary bytes with an explicit `Content-Type`.
+    ///
+    /// Used to serve static assets (HTML, JS, images, fonts) for the bundled PWA
+    /// front end, where the body is raw file bytes and the content type is chosen
+    /// from the file extension by the caller.
+    pub fn bytes(
+        status: u16,
+        reason: &'static str,
+        content_type: impl Into<String>,
+        body: impl Into<Vec<u8>>,
+    ) -> Self {
+        HttpResponse {
+            status,
+            reason,
+            headers: vec![("Content-Type".to_string(), content_type.into())],
+            body: body.into(),
+        }
+    }
+
     /// An empty response (no body) with the given status and reason.
     pub fn empty(status: u16, reason: &'static str) -> Self {
         HttpResponse {

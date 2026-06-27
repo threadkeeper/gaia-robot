@@ -216,11 +216,16 @@ jobs:
       - name: Build & push image in ACR
         # ACR Tasks builds the image server-side and pushes it, so the runner
         # needs no Docker. Tag with the commit SHA (immutable) and latest.
+        # The Dockerfile's web stage inlines the VITE_* values at build time, so
+        # the front-end OAuth client ids must be passed as build args here.
         run: |
           az acr build \
             --registry "${{ vars.ACR_NAME }}" \
             --image "${{ vars.IMAGE_NAME }}:${{ github.sha }}" \
             --image "${{ vars.IMAGE_NAME }}:latest" \
+            --build-arg VITE_GITHUB_CLIENT_ID="${{ vars.GH_OAUTH_CLIENT_ID }}" \
+            --build-arg VITE_GOOGLE_CLIENT_ID="${{ vars.VITE_GOOGLE_CLIENT_ID }}" \
+            --build-arg VITE_STREAM_TRANSPORT="${{ vars.VITE_STREAM_TRANSPORT }}" \
             --file Dockerfile .
 
       - name: Deploy image to Container App
