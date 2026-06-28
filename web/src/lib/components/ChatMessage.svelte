@@ -282,36 +282,6 @@
   </div>
 {/if}
 
-{#if $debug && !isUser && !message.error && message.meta?.write}
-  <!-- Cosmos write-back banner for the mandatory persistence step. The same
-       detail is shown in the debug write log, so this is debug-gated and
-       hidden on the normal screen to reduce clutter. -->
-  <div class="row">
-    <div
-      class="bubble write"
-      class:write-err={!message.meta.write.ok}
-      title="Cosmos write-back status for this turn"
-    >
-      <span class="write-head">
-        {message.meta.write.ok ? '✓ Saved to Cosmos' : '⚠ Cosmos write failed'}
-      </span>
-      <span class="write-body">{message.meta.write.detail}</span>
-      {#if message.meta.write.operations && message.meta.write.operations.length}
-        <!-- Real per-operation Cosmos write latency (wall-clock), one chip per
-             write in execution order. Failed writes are flagged in red. -->
-        <div class="write-ops">
-          {#each message.meta.write.operations as op}
-            <span class="write-op" class:write-op-err={!op.ok} title="Wall-clock latency of this Cosmos write">
-              <span>{op.type}</span>
-              <span class="write-op-ms">{op.ms.toFixed(1)} ms</span>
-            </span>
-          {/each}
-        </div>
-      {/if}
-    </div>
-  </div>
-{/if}
-
 <style>
   .row {
     display: flex;
@@ -352,35 +322,6 @@
     opacity: 0.7;
   }
   .actions-body {
-    white-space: pre-wrap;
-  }
-  /* Mandatory write-back banner. Success is a quiet confirmation; failure is
-     loud (red border + tint) per the requirement that write problems be
-     visible to the user rather than silently swallowed. */
-  .bubble.write {
-    background: transparent;
-    border-style: dashed;
-    box-shadow: none;
-    font-size: 0.85em;
-    opacity: 0.9;
-  }
-  .bubble.write.write-err {
-    border-color: var(--danger);
-    border-style: solid;
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
-    opacity: 1;
-  }
-  .write-head {
-    display: block;
-    font-weight: 600;
-    margin-bottom: 2px;
-    opacity: 0.7;
-  }
-  .bubble.write.write-err .write-head {
-    color: var(--danger);
-    opacity: 1;
-  }
-  .write-body {
     white-space: pre-wrap;
   }
   .error-text {
@@ -732,31 +673,5 @@
   .proc-row.proc-error {
     color: var(--danger);
     background: color-mix(in srgb, var(--danger) 10%, transparent);
-  }
-  /* Per-operation Cosmos write latency chips inside the write-back banner. */
-  .write-ops {
-    display: flex;
-    gap: 6px;
-    flex-wrap: wrap;
-    margin-top: 6px;
-  }
-  .write-op {
-    display: inline-flex;
-    gap: 6px;
-    align-items: baseline;
-    font-family: var(--mono);
-    font-size: 0.92em;
-    padding: 2px 8px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background: var(--bg-elev-2);
-  }
-  .write-op.write-op-err {
-    border-color: var(--danger);
-    color: var(--danger);
-    background: color-mix(in srgb, var(--danger) 12%, transparent);
-  }
-  .write-op-ms {
-    color: var(--text-dim);
   }
 </style>
