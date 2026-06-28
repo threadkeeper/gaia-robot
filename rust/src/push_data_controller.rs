@@ -400,9 +400,11 @@ fn canonical_store(target: &str) -> Option<&'static str> {
 
 /// Extract the executable daily-store writes from an audited turn.
 ///
-/// Returns one `(container, data)` pair per `upsert` action LLM Call 2 planned
-/// against a *daily append* writer store — `GaiaKB`, `GaiaDataLake`, or
-/// `GaiaDiary` — pulling the durable text out of the action's `payload.data`.
+/// Returns one `(container, data, salience)` triple per `upsert` action LLM Call
+/// 2 planned against a writer store — `GaiaKB`, `GaiaDataLake`, or `GaiaDiary` —
+/// pulling the durable text out of the action's `payload.data` and the optional
+/// LLM-assigned `payload.salience` (a memory-importance weight in `0.0..=1.0`).
+/// `salience` is `None` when the model did not assign one.
 ///
 /// Two kinds of entries are intentionally dropped so nothing useless reaches
 /// Cosmos:
@@ -415,7 +417,7 @@ fn canonical_store(target: &str) -> Option<&'static str> {
 ///
 /// The caller supplies the partition `entity` (the authenticated user id) and
 /// the timestamp, so this function stays pure and easy to unit-test.
-pub fn planned_store_writes(audit: &ActionAudit) -> Vec<(&'static str, String)> {
+pub fn planned_store_writes(audit: &ActionAudit) -> Vec<(&'static str, String, Option<f32>)> {
     let mut writes = Vec::new();
     for action in &audit.store_actions {
         // Re-derive the canonical container from the raw action so the executed
@@ -441,7 +443,16 @@ pub fn planned_store_writes(audit: &ActionAudit) -> Vec<(&'static str, String)> 
         if data.is_empty() {
             continue;
         }
-        writes.push((store, data));
+        // The optional LLM-assigned salience weights the memory's importance.
+        // Accept only a finite number, clamped to the valid `0.0..=1.0` range;
+        // anything else (absent, non-numeric, NaN) leaves salience unassigned.
+        let salience = action
+            .get("payload")
+            .and_then(|payload| payload.get("salience"))
+            .and_then(Value::as_f64)
+            .filter(|s| s.is_finite())
+            .map(|s| s.clamp(0.0, 1.0) as f32);
+        writes.push((store, data, salience));
     }
     writes
 }
@@ -940,7 +951,7 @@ mod tests {
                 { "id": "a4", "kind": "upsert", "target": "GaiaConnections",
                   "payload": { "entity": "u", "delta": 1, "note": "warmer" } },
                 { "id": "a5", "kind": "upsert", "target": "GaiaKB",
-                  "payload": { "entity": "u", "data": "  prefers tea  " } },
+                  "payload": { "entity": "u", "data": "  prefers tea  ", "salience": 0.8 } },
                 { "id": "a6", "kind": "upsert", "target": "GaiaDataLake",
                   "payload": { "entity": "u", "data": "snapshot of the turn" } },
                 { "id": "a7", "kind": "upsert", "target": "GaiaDiary",
@@ -955,13 +966,14 @@ mod tests {
 
         // GaiaConnections (ledger) and the blank GaiaKB action are excluded;
         // the three daily writer stores remain, in document order, with their
-        // `payload.data` trimmed.
+        // `payload.data` trimmed and the optional `payload.salience` surfaced
+        // (only the GaiaKB action carried one).
         assert_eq!(
             writes,
             vec![
-                ("GaiaKB", "prefers tea".to_string()),
-                ("GaiaDataLake", "snapshot of the turn".to_string()),
-                ("GaiaDiary", "a private reflection".to_string()),
+                ("GaiaKB", "prefers tea".to_string(), Some(0.8_f32)),
+                ("GaiaDataLake", "snapshot of the turn".to_string(), None),
+                ("GaiaDiary", "a private reflection".to_string(), None),
             ]
         );
     }

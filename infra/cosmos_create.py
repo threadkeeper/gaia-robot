@@ -8,12 +8,20 @@ It provisions the Azure Cosmos DB for NoSQL containers below:
 
     Container              Business key field   Business key (uniqueness)
     --------------------   ------------------   -------------------------
-    GaiaKB                 entity               entity + date (yyyy-mm-dd)
+    GaiaKB                 entity               none (one record per fact)
     GaiaDataLake           entity               entity + date (yyyy-mm-dd)
     GaiaDiary              entity               entity + date (yyyy-mm-dd)
     GaiaWebSearchHistory   entity               entity + timestamp (ISO 8601)
     GaiaConnections        entity               entity + timestamp (ISO 8601)
     DataLakeIndex          entity               entity + date (yyyy-mm-dd)
+
+``GaiaKB`` is a knowledge base stored at **per-fact** granularity: every fact
+gets its own record (id ``GaiaKB|{entity}|{instant}|{hash8}``) so its embedding
+and salience describe that one fact, not a whole day's mixture. Because many
+facts share a day, it has **no** per-day unique-key policy; the document ``id``
+(which embeds the fact's instant plus a content hash) guarantees uniqueness.
+GaiaDataLake and GaiaDiary remain daily-snapshot containers (one record per
+entity per day).
 
 ``DataLakeIndex`` is a derived semantic index over ``GaiaDataLake``. Each entry
 stores only routing fields (source id, entity, day, source container) and a
@@ -38,7 +46,9 @@ Each container is configured with:
     is what lets vector and text queries be *filtered* cheaply by entity/user.
   * A unique-key policy on the container's uniqueness field (``/date`` for the
     daily-snapshot containers, ``/timestamp`` for the ledger) so there is at most
-    one record per partition per that field.
+    one record per partition per that field. ``GaiaKB`` is the exception: it is
+    stored per-fact and has **no** unique-key policy (its document id keeps each
+    fact unique), so a partition can hold many facts on the same day.
   * A vector embedding policy on ``/dataVector`` -- the vector representation of
     the record's text content -- plus a DiskANN vector index on that path so
     every container can be searched by similarity.
@@ -123,13 +133,20 @@ def load_env_file(path: str = ".env") -> None:
 # ``unique_field`` is the path made unique *within* a partition; it is "date"
 # for the daily-snapshot containers and "timestamp" for the log/ledger
 # (which need many rows per day, so they key on a full instant, not a day).
+# It is ``None`` for GaiaKB, which stores one record per *fact* and so enforces
+# no per-partition unique key (the document ``id`` guarantees uniqueness).
 @dataclass(frozen=True)
 class TableSpec:
     """Describes one Cosmos container to create."""
 
     name: str                  # container id, e.g. "GaiaKB"
     key_field: str             # business key / partition key field, e.g. "entity"
-    unique_field: str = "date"  # per-partition unique path, e.g. "date" or "timestamp"
+    unique_field: str | None = "date"  # per-partition unique path, or None for per-fact
+    # The field paired with the business key in the composite indexes. Defaults
+    # to ``unique_field`` for the unique-keyed containers; for per-fact GaiaKB
+    # (``unique_field is None``) it falls back to "date" so date-range queries
+    # are still served by a regular index.
+    index_field: str = "date"
     has_data: bool = True       # whether the container stores a "/data" text payload
     # Optional vector overrides. When None, the container uses the shared
     # "/dataVector" path and the account-wide COSMOS_VECTOR_DIMS dimension. The
@@ -139,7 +156,9 @@ class TableSpec:
 
 
 TABLES: list[TableSpec] = [
-    TableSpec(name="GaiaKB", key_field="entity"),
+    # Knowledge base at per-fact granularity: one record per fact, no per-day
+    # unique key (the document id embeds the fact's instant + a content hash).
+    TableSpec(name="GaiaKB", key_field="entity", unique_field=None),
     TableSpec(name="GaiaDataLake", key_field="entity"),
     TableSpec(name="GaiaDiary", key_field="entity"),
     # Append-only log of Gaia's web searches. It stores the query and results
@@ -219,7 +238,7 @@ def build_full_text_policy(key_field: str, include_data: bool = True) -> dict:
 
 
 def build_indexing_policy(
-    key_field: str, unique_field: str, include_data: bool = True,
+    key_field: str, composite_field: str, include_data: bool = True,
     vector_path: str = VECTOR_PATH,
 ) -> dict:
     """Indexing policy combining the standard, vector, full-text, and composite indexes.
@@ -232,7 +251,7 @@ def build_indexing_policy(
     * ``fullTextIndexes`` adds the extra text index on the entity/userId field,
       plus the ``/data`` payload when the container stores one, so keyword and
       full-text queries over the content are served by an index.
-    * ``compositeIndexes`` pairs the business key with the uniqueness field
+    * ``compositeIndexes`` pairs the business key with ``composite_field``
       (``date`` or ``timestamp``) in *both* orders so queries that lead with
       either the business key or the date/timestamp are served by a regular
       index. The default ``/*`` included path also range-indexes each field
@@ -257,17 +276,17 @@ def build_indexing_policy(
         "fullTextIndexes": full_text_indexes,
         "compositeIndexes": [
             # Regular index on (entity|userId, date|timestamp): filter by the
-            # business key, range/order by the uniqueness field.
+            # business key, range/order by the composite field.
             [
                 {"path": f"/{key_field}", "order": "ascending"},
-                {"path": f"/{unique_field}", "order": "ascending"},
+                {"path": f"/{composite_field}", "order": "ascending"},
             ],
             # The reverse order (date|timestamp, entity|userId): filter/range by
-            # the uniqueness field first, then by the business key. Cosmos
+            # the composite field first, then by the business key. Cosmos
             # composite indexes are order-sensitive, so both directions are
             # declared to serve queries that lead with either field.
             [
-                {"path": f"/{unique_field}", "order": "ascending"},
+                {"path": f"/{composite_field}", "order": "ascending"},
                 {"path": f"/{key_field}", "order": "ascending"},
             ],
         ],
@@ -308,18 +327,27 @@ def create_container(database, table: TableSpec, dimensions: int, throughput: in
     # "/indexVector"; every other container uses the shared "/dataVector".
     vector_path = table.vector_path or VECTOR_PATH
     vector_dims = table.vector_dims or dimensions
-    database.create_container_if_not_exists(
+    # Composite indexes pair the business key with this field. For per-fact
+    # GaiaKB (unique_field is None) fall back to "date" so date-range queries
+    # still hit a regular index.
+    composite_field = table.unique_field or table.index_field
+    create_kwargs = dict(
         id=table.name,
         # Partition key = business key field -> enables cheap filtering.
         partition_key=PartitionKey(path=f"/{table.key_field}"),
         indexing_policy=build_indexing_policy(
-            table.key_field, table.unique_field, table.has_data, vector_path
+            table.key_field, composite_field, table.has_data, vector_path
         ),
         vector_embedding_policy=build_vector_embedding_policy(vector_dims, vector_path),
         full_text_policy=build_full_text_policy(table.key_field, table.has_data),
-        unique_key_policy=build_unique_key_policy(table.unique_field),
         offer_throughput=throughput,
     )
+    # Only the unique-keyed containers get a unique-key policy. GaiaKB is
+    # per-fact (unique_field is None), so it is omitted there to allow many
+    # records per (entity, day); the document id keeps each fact unique.
+    if table.unique_field is not None:
+        create_kwargs["unique_key_policy"] = build_unique_key_policy(table.unique_field)
+    database.create_container_if_not_exists(**create_kwargs)
     print(f"  done: '{table.name}'")
 
 

@@ -885,12 +885,15 @@ impl Engine {
     ///
     /// Covers the shared `GaiaKB`, `GaiaDataLake`, and `GaiaDiary` stores (the
     /// friendship ledger `GaiaConnections` is handled separately and excluded by
-    /// [`crate::push_data_controller::planned_store_writes`]). Each write reuses
-    /// the controller's append-and-re-embed [`WriteDataController::upsert_daily`]
-    /// and is scoped to the authenticated `user_id`, which is the `/entity`
-    /// partition key these shared stores are both written and read under. Every
-    /// write is timed, reported live through `reporter`, and a per-store failure
-    /// is reported (and logged) but never aborts the others.
+    /// [`crate::push_data_controller::planned_store_writes`]). `GaiaKB` is a
+    /// knowledge base, so each fact is saved as its own record via
+    /// [`WriteDataController::insert_fact`] (per-fact embedding and salience);
+    /// `GaiaDataLake` and `GaiaDiary` stay per-day appends via
+    /// [`WriteDataController::upsert_daily`]. Each write is scoped to the
+    /// authenticated `user_id`, which is the `/entity` partition key these shared
+    /// stores are both written and read under. Every write is timed, reported
+    /// live through `reporter`, and a per-store failure is reported (and logged)
+    /// but never aborts the others.
     fn persist_planned_stores(
         &self,
         reporter: &mut TurnReporter,
@@ -901,9 +904,16 @@ impl Engine {
     ) -> Vec<(WriteStatus, WriteTiming)> {
         crate::push_data_controller::planned_store_writes(audit)
             .into_iter()
-            .map(|(store, data)| {
+            .map(|(store, data, salience)| {
                 let start = Instant::now();
-                let result = writer.upsert_daily(store, user_id, now_rfc3339, &data);
+                // GaiaKB is a knowledge base: each fact gets its own record so
+                // its embedding and salience describe that one fact. The other
+                // writer stores (GaiaDataLake, GaiaDiary) stay per-day appends.
+                let result = if store == "GaiaKB" {
+                    writer.insert_fact(store, user_id, now_rfc3339, &data, salience)
+                } else {
+                    writer.upsert_daily(store, user_id, now_rfc3339, &data)
+                };
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 let status = match result {
                     Ok(outcome) => {

@@ -466,6 +466,87 @@ impl WriteDataController {
         })
     }
 
+    /// Insert one **fact** as its own record under `(container, entity)` — the
+    /// per-fact granularity used by `GaiaKB`.
+    ///
+    /// Where [`upsert_daily`](WriteDataController::upsert_daily) folds every fact
+    /// of a day into a single record (good for a chronological transcript), a
+    /// knowledge base wants each fact addressable on its own so its embedding and
+    /// salience describe that one fact, not a day's mixture. This method therefore:
+    ///
+    /// * keys the record by [`fact_id`] (`{container}|{entity}|{instant}|{hash8}`),
+    ///   so same-day facts never collide and an identical fact at the same instant
+    ///   is idempotent;
+    /// * embeds **only the fact text** (not a day's worth of text);
+    /// * stamps the Coconut save-time fields (AAKKK packing line, token count, the
+    ///   LLM-assigned `salience`, and `created_at == updated_at == now`);
+    /// * upserts directly with **no read/append/merge** — each fact stands alone.
+    ///
+    /// `now_rfc3339` is the fact's instant as `YYYY-MM-DDTHH:MM:SSZ`.
+    pub fn insert_fact(
+        &self,
+        container: &str,
+        entity: &str,
+        now_rfc3339: &str,
+        fact: &str,
+        salience: Option<f32>,
+    ) -> Result<WriteOutcome, WriteError> {
+        if !is_writer_container(container) {
+            return Err(WriteError::NotWriterContainer(container.to_string()));
+        }
+        // Both clients are required to persist a fresh, embedded record.
+        let (cosmos, embedder) = match (self.cosmos.as_ref(), self.embedder.as_ref()) {
+            (Some(cosmos), Some(embedder)) => (cosmos, embedder),
+            _ => return Err(WriteError::Offline),
+        };
+
+        // The date portion keys the record's `/date` field (kept for date-range
+        // filters and composite indexes); the full instant lives in the id.
+        let (date, _time_marker) = split_rfc3339(now_rfc3339);
+        let id = fact_id(container, entity, now_rfc3339, fact);
+        let hash = content_hash(fact);
+
+        // Embed the fact on its own so the vector describes this single fact
+        // rather than a whole day's mixture of facts.
+        let vector = embedder.embed(fact)?;
+
+        // Coconut save-time fields for this one fact: the dense AAKKK packing line
+        // + its token count, the LLM-assigned salience, and matching
+        // created/updated timestamps (a fact is written once, so both are `now`).
+        let (aakkk, token_count) =
+            crate::coconut::build_save_aakkk(entity, fact, salience, now_rfc3339);
+
+        let record = build_record(
+            container,
+            entity,
+            date,
+            &id,
+            fact,
+            vector.clone(),
+            &hash,
+            CoconutFields {
+                aakkk: &aakkk,
+                token_count,
+                salience: salience.unwrap_or(0.0),
+                created_at: now_rfc3339,
+                updated_at: now_rfc3339,
+            },
+        );
+        cosmos.upsert(container, entity, &record)?;
+
+        Ok(WriteOutcome {
+            container: container.to_string(),
+            id,
+            // Each fact is its own new record; a same-instant identical replay
+            // simply overwrites itself with identical content.
+            action: WriteAction::Created,
+            data_bytes: fact.len(),
+            vector_dims: vector.len(),
+            index_synced: false,
+            index_dims: 0,
+        })
+    }
+
     /// Append one signed-delta entry to the `GaiaConnections` friendship ledger.
     ///
     /// Unlike [`upsert_daily`](WriteDataController::upsert_daily), the ledger is
@@ -560,6 +641,20 @@ pub fn is_writer_container(container: &str) -> bool {
 /// present on the live snapshot rows, so the writer reuses (not replaces) it.
 pub fn daily_id(container: &str, entity: &str, date: &str) -> String {
     format!("{container}|{entity}|{date}")
+}
+
+/// Build the deterministic per-fact id `{container}|{entity}|{instant}|{hash8}`.
+///
+/// Unlike [`daily_id`], which collapses a whole day into one record, this keys a
+/// single fact by its exact instant plus a short content hash, so many facts can
+/// coexist on the same day and an identical fact replayed at the same instant
+/// maps back to the same id (idempotent). `now_rfc3339` is the fact's instant
+/// (`YYYY-MM-DDTHH:MM:SSZ`); the suffix is the first 8 hex chars of the fact's
+/// SHA-1, which disambiguates multiple facts that share the same second.
+pub fn fact_id(container: &str, entity: &str, now_rfc3339: &str, fact: &str) -> String {
+    let hash = content_hash(fact);
+    let hash8 = &hash[..hash.len().min(8)];
+    format!("{container}|{entity}|{now_rfc3339}|{hash8}")
 }
 
 /// Split an RFC-3339 instant `YYYY-MM-DDTHH:MM:SSZ` into its `(date, time)`
@@ -821,6 +916,110 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(a.len(), 40); // 20-byte SHA-1 rendered as hex
+    }
+
+    #[test]
+    fn fact_id_includes_the_instant_and_a_content_hash() {
+        let a = fact_id(
+            "GaiaKB",
+            "threadkeeper",
+            "2026-06-27T09:00:00Z",
+            "likes tea",
+        );
+        // The id is `{container}|{entity}|{instant}|{hash8}`.
+        assert!(a.starts_with("GaiaKB|threadkeeper|2026-06-27T09:00:00Z|"));
+        let suffix = a.rsplit('|').next().unwrap();
+        assert_eq!(suffix.len(), 8); // first 8 hex chars of the fact's SHA-1
+
+        // Same fact at the same instant is idempotent (identical id).
+        let a2 = fact_id(
+            "GaiaKB",
+            "threadkeeper",
+            "2026-06-27T09:00:00Z",
+            "likes tea",
+        );
+        assert_eq!(a, a2);
+
+        // A different fact at the same instant yields a different id, so two
+        // facts written in the same second never collide.
+        let b = fact_id(
+            "GaiaKB",
+            "threadkeeper",
+            "2026-06-27T09:00:00Z",
+            "likes coffee",
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn insert_fact_rejects_non_writer_containers() {
+        let controller = WriteDataController::new(None, None, DEFAULT_INDEX_DIMS);
+        let err = controller
+            .insert_fact(
+                "GaiaConnections",
+                "threadkeeper",
+                "2026-06-27T09:00:00Z",
+                "likes tea",
+                Some(1.0),
+            )
+            .unwrap_err();
+        assert!(matches!(err, WriteError::NotWriterContainer(_)));
+    }
+
+    #[test]
+    fn insert_fact_is_offline_without_clients() {
+        let controller = WriteDataController::new(None, None, DEFAULT_INDEX_DIMS);
+        let err = controller
+            .insert_fact(
+                "GaiaKB",
+                "threadkeeper",
+                "2026-06-27T09:00:00Z",
+                "likes tea",
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, WriteError::Offline));
+    }
+
+    #[test]
+    fn insert_fact_creates_a_standalone_per_fact_record() {
+        // The per-fact path does NOT read/append/merge: it embeds the single
+        // fact, then upserts one record. So the Cosmos client makes exactly one
+        // call (the upsert) and the embedder makes one.
+        let (cosmos_url, cosmos_handle) = crate::test_http::spawn_mock_http_sequence(vec![(
+            "201 Created".to_string(),
+            "{}".to_string(),
+        )]);
+        let (embed_url, embed_handle) = crate::test_http::spawn_mock_http(
+            "200 OK",
+            r#"{"data":[{"index":0,"embedding":[0.1,0.2,0.3,0.4]}]}"#,
+        );
+
+        let cosmos = CosmosClient::new(cosmos_url, "GaiaDB", "token");
+        let embedder = EmbeddingClient::for_test(embed_url);
+        let controller = WriteDataController::new(Some(cosmos), Some(embedder), 2);
+
+        let outcome = controller
+            .insert_fact(
+                "GaiaKB",
+                "threadkeeper",
+                "2026-06-27T09:00:00Z",
+                "likes tea",
+                Some(1.0),
+            )
+            .expect("the per-fact write path succeeds against the mocks");
+
+        // Every fact is its own new record; no DataLake index is synced.
+        assert_eq!(outcome.action, WriteAction::Created);
+        assert!(outcome
+            .id
+            .starts_with("GaiaKB|threadkeeper|2026-06-27T09:00:00Z|"));
+        assert_eq!(outcome.vector_dims, 4);
+        assert!(!outcome.index_synced);
+        assert_eq!(outcome.index_dims, 0);
+
+        cosmos_handle.join().expect("cosmos mock thread joins");
+        embed_handle.join().expect("embed mock thread joins");
     }
 
     #[test]
