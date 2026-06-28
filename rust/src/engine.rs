@@ -203,6 +203,13 @@ impl<'a> TurnReporter<'a> {
         self.emit(phase, "info", message, Some(ms as f64));
     }
 
+    /// Emit a progress marker that closes a timed step, carrying a fractional
+    /// `ms` (used for sub-millisecond retrieval reads whose precise latency
+    /// would be lost by rounding to whole milliseconds).
+    fn timed_f64(&mut self, phase: &str, message: String, ms: f64) {
+        self.emit(phase, "info", message, Some(ms));
+    }
+
     /// Emit a non-fatal warning that closes a timed step.
     fn warn_timed(&mut self, phase: &str, message: String, ms: u64) {
         self.emit(phase, "warn", message, Some(ms as f64));
@@ -575,6 +582,18 @@ impl Engine {
             "turn {thought_id}: context assembled ({} web searches)",
             searches.len()
         );
+        // Break the single "running retrieval" step down into one timed
+        // process-log line per retrieval that actually ran — every Cosmos read
+        // (e.g. `q3 → GaiaKB`) and every web search (`q1 → Web`) — with the
+        // real wall-clock milliseconds it cost, so the debug panel shows where
+        // the retrieval time went instead of a single opaque line.
+        for action in &pull_actions {
+            reporter.timed_f64(
+                "retrieval",
+                format!("Retrieved {}", action.action_type),
+                action.ms,
+            );
+        }
         reporter.info(
             "retrieval",
             format!("Context assembled ({} web searches).", searches.len()),

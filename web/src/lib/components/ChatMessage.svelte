@@ -151,75 +151,6 @@
         {@const toolDebug = message.meta.debug ?? []}
         {@const actions = message.meta.actions ?? []}
         {@const flow = (message.meta.flow ?? []).slice().sort((a, b) => a.seq - b.seq)}
-        {@const pullDebug = message.meta.pullDebug}
-        {@const pushDebug = message.meta.pushDebug}
-        {#if pullDebug || pushDebug}
-          <details class="debug" open>
-            <summary>pass debug (pull/push model · llm time · actions)</summary>
-
-            {#if pullDebug}
-              <div class="round">
-                <div class="round-head">
-                  <strong>Pull pass (LLM Call 1)</strong>
-                  <span class="ready">{pullDebug.llmMs} ms</span>
-                </div>
-                <div class="skills-grid">
-                  <span class="chip skill used" title="Model selected for the pull pass">
-                    <span>model</span>
-                    <span class="kb">{pullDebug.model}</span>
-                  </span>
-                  <span class="chip skill used" title="Time spent in the LLM Call 1 request">
-                    <span>llm time</span>
-                    <span class="kb">{pullDebug.llmMs} ms</span>
-                  </span>
-                </div>
-                {#if pullDebug.actions.length}
-                  <div class="skills-grid">
-                    {#each pullDebug.actions as act}
-                      <span class="chip skill used" title="Retrieval action chosen by Call 1 and the time it took">
-                        <span>{act.type}</span>
-                        <span class="kb">{act.ms.toFixed(2)} ms</span>
-                      </span>
-                    {/each}
-                  </div>
-                {:else}
-                  <div class="planner">No retrieval actions chosen.</div>
-                {/if}
-              </div>
-            {/if}
-
-            {#if pushDebug}
-              <div class="round">
-                <div class="round-head">
-                  <strong>Push pass (LLM Call 2)</strong>
-                  <span class="ready">{pushDebug.llmMs} ms</span>
-                </div>
-                <div class="skills-grid">
-                  <span class="chip skill used" title="Model selected for the push pass">
-                    <span>model</span>
-                    <span class="kb">{pushDebug.model}</span>
-                  </span>
-                  <span class="chip skill used" title="Time spent in the LLM Call 2 request">
-                    <span>llm time</span>
-                    <span class="kb">{pushDebug.llmMs} ms</span>
-                  </span>
-                </div>
-                {#if pushDebug.actions.length}
-                  <div class="skills-grid">
-                    {#each pushDebug.actions as act}
-                      <span class="chip skill used" title="Planned action type and time to process">
-                        <span>{act.type}</span>
-                        <span class="kb">{act.ms.toFixed(2)} ms</span>
-                      </span>
-                    {/each}
-                  </div>
-                {:else}
-                  <div class="planner">No actions planned.</div>
-                {/if}
-              </div>
-            {/if}
-          </details>
-        {/if}
         {#if rounds.length || toolDebug.length || actions.length || flow.length}
           <details class="debug" open>
             <summary>router debug (rounds: {rounds.length}, events: {toolDebug.length})</summary>
@@ -338,9 +269,11 @@
   </div>
 </div>
 
-{#if !isUser && !message.error && message.meta?.actionsSummary}
+{#if $debug && !isUser && !message.error && message.meta?.actionsSummary}
   <!-- A second, lighter bubble summarizing the side effects Gaia performed
-       this turn (WhatsApp / Push / Edwino actuate / data-store write-backs). -->
+       this turn (WhatsApp / Push / Edwino actuate / data-store write-backs).
+       Debug-gated: the same detail is shown in the debug process log, so it
+       is hidden on the normal screen to reduce clutter. -->
   <div class="row">
     <div class="bubble actions" title="Actions Gaia performed this run">
       <span class="actions-head">Actions this run</span>
@@ -349,10 +282,10 @@
   </div>
 {/if}
 
-{#if !isUser && !message.error && message.meta?.write}
-  <!-- Always-visible (not debug-gated) banner for the mandatory Cosmos
-       write-back. A failure here is shown prominently in red so the user
-       knows persistence is broken, even though the answer itself is valid. -->
+{#if $debug && !isUser && !message.error && message.meta?.write}
+  <!-- Cosmos write-back banner for the mandatory persistence step. The same
+       detail is shown in the debug write log, so this is debug-gated and
+       hidden on the normal screen to reduce clutter. -->
   <div class="row">
     <div
       class="bubble write"
