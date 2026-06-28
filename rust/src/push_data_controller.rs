@@ -626,9 +626,14 @@ You MUST emit ONE of EACH of these records EVERY turn (seven actions minimum):
               blue=thinking, yellow=investigating).
 - Upserts   : add ONE record to EACH of the four data stores, scoped to this user:
    { \"id\":\"a4\", \"kind\":\"upsert\", \"target\":\"GaiaConnections\", \"payload\":{ \"entity\":\"<this user>\", \"delta\":<signed int>, \"note\":\"<why the friendship balance changed>\" }, \"reason\":\"<why>\" }
-   { \"id\":\"a5\", \"kind\":\"upsert\", \"target\":\"GaiaKB\",          \"payload\":{ \"entity\":\"<this user>\", \"data\":\"<a durable fact to remember>\" }, \"reason\":\"<why>\" }
+   { \"id\":\"a5\", \"kind\":\"upsert\", \"target\":\"GaiaKB\",          \"payload\":{ \"entity\":\"<this user>\", \"data\":\"<a durable fact to remember>\", \"salience\":<0.00..1.00> }, \"reason\":\"<why>\" }
    { \"id\":\"a6\", \"kind\":\"upsert\", \"target\":\"GaiaDataLake\",    \"payload\":{ \"entity\":\"<this user>\", \"data\":\"<a snapshot of this turn>\" }, \"reason\":\"<why>\" }
-   { \"id\":\"a7\", \"kind\":\"upsert\", \"target\":\"GaiaDiary\",       \"payload\":{ \"entity\":\"<this user>\", \"data\":\"<Gaia's private reflection on this turn>\" }, \"reason\":\"<why>\" }";
+   { \"id\":\"a7\", \"kind\":\"upsert\", \"target\":\"GaiaDiary\",       \"payload\":{ \"entity\":\"<this user>\", \"data\":\"<Gaia's private reflection on this turn>\" }, \"reason\":\"<why>\" }
+   For the GaiaKB fact you MUST set `salience`: a 0.00..1.00 weight for how
+   important this single fact is to remember long-term (0.00 = trivial or
+   ephemeral, 1.00 = defining or critical). It scales the fact in future memory
+   ranking (final_rank = salience x similarity), so score it deliberately —
+   do NOT default every fact to 1.00.";
 
 /// Everything the push pass produced from one LLM Call 2 reply.
 ///
@@ -1074,6 +1079,9 @@ mod tests {
         assert!(prompt.system.contains("WhatsApp"));
         assert!(prompt.system.contains("Edwino"));
         assert!(prompt.system.contains("GaiaConnections"));
+        // The GaiaKB upsert rule must require a salience weight so LLM Call 2
+        // scores each remembered fact (consumed by `planned_store_writes`).
+        assert!(prompt.system.contains("salience"));
         // User carries the question, the time, and the grounding context.
         assert!(prompt.user.contains("What do you know about me?"));
         assert!(prompt.user.contains("2026-06-21T00:00:00Z"));

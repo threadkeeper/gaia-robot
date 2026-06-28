@@ -81,7 +81,7 @@ const DOCUMENT_SPEC: &str = "\
 const TOOL_SPEC: &str = "\
 - Web             (search)     : public web search; results are logged to the Gaia Search History. NO query field.
 - GaiaDataLake    (container)  : Gaia's data lake, full conversation histories; partition=/entity.
-- GaiaKB          (container)  : Gaia's knowledge base, facts; partition=/entity.
+- GaiaKB          (container)  : Gaia's knowledge base, facts; partition=/entity. Retrieved every turn; the runtime auto-ranks the rows by salience×similarity (Coconut) and caps them to a token budget before the answer step, so query it freely.
 - GaiaDiary       (container)  : Gaia's diary / private inner thoughts regarding experiences; partition=/entity.
 - GaiaConnections (container)  : Per user emotional-bank-account ledger; partition=/entity; ledger rows, NO /data field.
 STRICT IDENTITY RULE: every query action MUST include both `user_id` and
@@ -142,7 +142,7 @@ Hard rules for every authored `query` (Web excepted):
       action.user_id == action.entity, binds @pk to that value, and pins one
       partition, so do not query across partitions.
   3. It MUST start with `SELECT TOP <top>` using the action's `top` (which you
-     sized from the user's input, default 3) so the result set stays small
+     sized from the user's input, default 3 except for GaiaKB) so the result set stays small
      enough for the next reasoning step.
   4. Project only what is needed:
      `SELECT TOP 3 c.id, c.entity, c.date, c.data`.
@@ -156,6 +156,7 @@ Hard rules for every authored `query` (Web excepted):
              vector array; always use the placeholder `@queryVector`.
          - `auto`: choose when either mode is acceptable; runtime will use semantic
              if `filters.semantic` is present, else keyword.
+         - `coconut`: default for GaiaKB reads, returns the most important records from the kb using the coconut algorithm.  
     6. Prefer recent first in keyword mode: end with `ORDER BY c.date DESC`.
     7. GaiaConnections has NO c.data and NO vector retrieval path in runtime:
          query ledger rows using c.notes (keyword) or recency-only and
@@ -167,7 +168,7 @@ Worked examples:
     AND (CONTAINS(LOWER(c.data), 'tree') OR CONTAINS(LOWER(c.data), 'forest'))
     ORDER BY c.date DESC
     - GaiaKB semantic retrieval for ownership concepts:
-        SELECT TOP 3 c.id, c.entity, c.date, c.data, c.dataVector,
+        SELECT c.id, c.entity, c.date, c.data, c.dataVector,
         VectorDistance(c.dataVector, @queryVector, false, {distanceFunction:'Cosine',dataType:'Float32',searchListSizeMultiplier:10,filterPriority:0.75}) AS similarityScore
         FROM c WHERE c.entity = @pk AND IS_DEFINED(c.dataVector)
         ORDER BY VectorDistance(c.dataVector, @queryVector, false, {distanceFunction:'Cosine',dataType:'Float32',searchListSizeMultiplier:10,filterPriority:0.75})

@@ -263,8 +263,10 @@ fn plan_to_keyword_query(action: &ActionPlan) -> Result<PlannedQuery, String> {
 
     // `TOP` takes an integer literal (program-owned, so safe to interpolate);
     // every user-supplied value above is bound as a parameter instead.
+    // The Coconut fields (salience, aakkk, tokenCount) are projected so the
+    // query-time KB reduction can rank by salience and pack by stored tokens.
     let sql = format!(
-        "SELECT TOP {top} c.id, c.entity, c.userId, c.date, c.data, c.dataVector \
+        "SELECT TOP {top} c.id, c.entity, c.userId, c.date, c.data, c.dataVector, c.salience, c.aakkk, c.tokenCount \
          FROM c WHERE {where_clause} ORDER BY c.date DESC",
         top = action.effective_top(),
         where_clause = predicates.join(" AND "),
@@ -301,8 +303,11 @@ fn plan_to_semantic_query(
     let distance_expr =
         format!("VectorDistance(c.dataVector, @queryVector, false, {VECTOR_DISTANCE_OPTIONS})");
 
+    // Project the Coconut fields (salience, aakkk, tokenCount) alongside the
+    // Cosmos-computed similarityScore so the KB reduction can rank by the full
+    // salience × similarity formula and pack by stored token counts.
     let sql = format!(
-        "SELECT TOP {top} c.id, c.entity, c.userId, c.date, c.data, c.dataVector, {distance_expr} AS similarityScore \
+        "SELECT TOP {top} c.id, c.entity, c.userId, c.date, c.data, c.dataVector, c.salience, c.aakkk, c.tokenCount, {distance_expr} AS similarityScore \
          FROM c WHERE {where_clause} ORDER BY {distance_expr}",
         top = action.effective_top(),
         where_clause = predicates.join(" AND "),

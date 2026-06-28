@@ -336,10 +336,27 @@ impl<'a> PullDataController<'a> {
             });
             match &outcome.result {
                 Ok(records) => {
-                    let values: Vec<serde_json::Value> = records
+                    // For GaiaKB, apply the Coconut query-time reduction before
+                    // the rows enter LLM Call 2's context: rank by salience ×
+                    // similarity (Cosmos projects the similarity on semantic
+                    // queries) and keep only the highest-ranked facts that fit
+                    // the KB token budget, so Call 2 sees Gaia's most relevant
+                    // core knowledge without flooding the context window. Every
+                    // other container passes through unchanged.
+                    let values: Vec<serde_json::Value> = if target.eq_ignore_ascii_case("GaiaKB") {
+                        crate::coconut::kb_context_records(
+                            records,
+                            crate::coconut::KB_CONTEXT_TOKEN_BUDGET,
+                        )
                         .iter()
                         .filter_map(|r| serde_json::to_value(r).ok())
-                        .collect();
+                        .collect()
+                    } else {
+                        records
+                            .iter()
+                            .filter_map(|r| serde_json::to_value(r).ok())
+                            .collect()
+                    };
                     groups.push(RetrievalGroup {
                         action_id: action_id.clone(),
                         container: target.clone(),
@@ -718,6 +735,56 @@ mod tests {
         let labels: Vec<&str> = ordered.iter().map(|t| t.action_type.as_str()).collect();
         // Plan order first (q1 then q2), then any unmatched timing.
         assert_eq!(labels, vec!["q1 → Web", "q2 → GaiaKB", "qX → Unknown"]);
+    }
+
+    #[test]
+    fn execute_reduces_and_reranks_the_gaiakb_group_by_coconut() {
+        // The authored q1 targets GaiaKB and returns two facts: the low-salience
+        // row first, the high-salience row second. The Coconut KB reduction must
+        // re-rank them so the high-salience fact leads in the assembled context.
+        let kb_doc = r#"{"Documents":[
+            {"id":"GaiaKB|alice|low","entity":"alice","date":"2026-05-10","data":"low salience fact","salience":0.1},
+            {"id":"GaiaKB|alice|high","entity":"alice","date":"2026-05-11","data":"high salience fact","salience":0.9}
+        ]}"#;
+        let empty = r#"{"Documents":[]}"#;
+        // Plan order: authored q1 (GaiaKB), then the two remaining forced core-user
+        // queries (GaiaDiary, GaiaConnections). The core GaiaKB query is deduped
+        // away because the user already authored a GaiaKB read.
+        let (cosmos_endpoint, cosmos_handle) = crate::test_http::spawn_mock_http_sequence(vec![
+            ("200 OK".to_string(), kb_doc.to_string()),
+            ("200 OK".to_string(), empty.to_string()),
+            ("200 OK".to_string(), empty.to_string()),
+        ]);
+        let cosmos = CosmosClient::new(cosmos_endpoint, "gaia", "tok");
+
+        let controller = PullDataController::new(Some(&cosmos), None, None);
+        let reply = r#"[
+          { "version": "1.0",
+            "session": { "user_id": "alice", "requested_at": "2026-06-21T00:00:00Z" },
+            "actions": [
+              { "id": "q1", "kind": "query", "target": "GaiaKB", "user_id": "alice", "entity": "alice", "intent": "what do we know", "top": 3, "filters": {} }
+            ] }
+        ]"#;
+
+        let result = controller.execute("alice", "what?", "2026-06-21T00:00:00Z", reply, false);
+
+        assert!(result.all_ok, "notes: {:?}", result.notes);
+        // The GaiaKB group keeps both rows (well under the token budget) but the
+        // high-salience fact is now ranked ahead of the low-salience one.
+        let high = result
+            .context
+            .find("high salience fact")
+            .expect("high-salience fact rendered");
+        let low = result
+            .context
+            .find("low salience fact")
+            .expect("low-salience fact rendered");
+        assert!(
+            high < low,
+            "Coconut reduction should rank the high-salience fact first"
+        );
+
+        cosmos_handle.join().expect("cosmos mock thread joins");
     }
 
     #[test]

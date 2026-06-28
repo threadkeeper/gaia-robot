@@ -37,7 +37,9 @@ use serde_json::Value;
 
 use crate::llm::LlmClient;
 use crate::prompt::now_rfc3339;
-use crate::push_data_controller::{urgency_in_range, ActionAudit, PushDataController};
+use crate::push_data_controller::{
+    planned_store_writes, urgency_in_range, ActionAudit, PushDataController,
+};
 
 /// The user every turn is scoped to. Matches the `threadkeeper` exports under
 /// `migrations/` and the retrieval probe, so the context lines up with real
@@ -66,6 +68,11 @@ pub struct TurnMetrics {
     pub actuate_ok: bool,
     /// How many of the four stores received an upsert this turn.
     pub stores_covered: usize,
+    /// Whether the `GaiaKB` upsert carried an LLM-assigned salience that
+    /// survives the persistence handoff ([`planned_store_writes`]).
+    pub salience_ok: bool,
+    /// The salience LLM Call 2 assigned to the `GaiaKB` fact, when present.
+    pub kb_salience: Option<f32>,
     /// Whether the reply carried multi-modal media.
     pub multimodal: bool,
     /// Overall pass/fail for this turn.
@@ -264,12 +271,13 @@ impl DataExecutionProbe {
             }
             writeln!(
                 out,
-                "      => {} | WhatsApp {} | Push {} | Actuate {} | stores {}/4{}",
+                "      => {} | WhatsApp {} | Push {} | Actuate {} | stores {}/4 | salience {}{}",
                 if metrics.success { "PASS" } else { "FAIL" },
                 if metrics.whatsapp_ok { "ok" } else { "—" },
                 if metrics.push_ok { "ok" } else { "—" },
                 if metrics.actuate_ok { "ok" } else { "—" },
                 metrics.stores_covered,
+                salience_cell(&metrics),
                 if metrics.multimodal {
                     " | multimodal"
                 } else {
@@ -308,6 +316,8 @@ impl DataExecutionProbe {
             push_ok: false,
             actuate_ok: false,
             stores_covered: 0,
+            salience_ok: false,
+            kb_salience: None,
             multimodal: false,
             success: false,
             notes: Vec::new(),
@@ -420,11 +430,29 @@ impl DataExecutionProbe {
                 .push(format!("missing store write-backs: {}", missing.join(", ")));
         }
 
+        // Salience: LLM Call 2 must assign a salience to the GaiaKB fact, and it
+        // must survive the persistence handoff. `planned_store_writes` is the
+        // exact function the live engine calls to feed `insert_fact`, so reading
+        // its output proves the score the model emitted actually reaches the
+        // write layer (not just that it appeared in the raw JSON).
+        let kb_salience = planned_store_writes(audit)
+            .into_iter()
+            .find(|(store, _, _)| *store == "GaiaKB")
+            .and_then(|(_, _, salience)| salience);
+        metrics.kb_salience = kb_salience;
+        metrics.salience_ok = kb_salience.is_some();
+        if !metrics.salience_ok {
+            metrics
+                .notes
+                .push("GaiaKB upsert carried no LLM-assigned salience".to_string());
+        }
+
         metrics.success = metrics.llm_ok
             && metrics.response_ok
             && metrics.whatsapp_ok
             && metrics.push_ok
             && metrics.actuate_ok
+            && metrics.salience_ok
             && missing.is_empty();
 
         artifacts.audit = push.audit.clone();
@@ -464,16 +492,17 @@ fn pretty_or_raw(reply: &str) -> String {
 /// Render the per-turn results as an aligned text table.
 fn format_metrics_table(all: &[TurnMetrics]) -> String {
     let mut out = String::new();
-    out.push_str("Turn  WhatsApp  Push  Actuate  Stores  Multimodal  Result\n");
-    out.push_str("----  --------  ----  -------  ------  ----------  ------\n");
+    out.push_str("Turn  WhatsApp  Push  Actuate  Stores  Salience  Multimodal  Result\n");
+    out.push_str("----  --------  ----  -------  ------  --------  ----------  ------\n");
     for m in all {
         out.push_str(&format!(
-            "{:<4}  {:<8}  {:<4}  {:<7}  {:<6}  {:<10}  {}\n",
+            "{:<4}  {:<8}  {:<4}  {:<7}  {:<6}  {:<8}  {:<10}  {}\n",
             m.folder,
             yes_no(m.whatsapp_ok),
             yes_no(m.push_ok),
             yes_no(m.actuate_ok),
             format!("{}/4", m.stores_covered),
+            salience_cell(m),
             yes_no(m.multimodal),
             if m.success { "PASS" } else { "FAIL" },
         ));
@@ -490,6 +519,16 @@ fn yes_no(value: bool) -> &'static str {
     }
 }
 
+/// The salience column: the LLM-assigned `GaiaKB` salience (e.g. `0.80`), or a
+/// dash when LLM Call 2 did not assign one (so the column doubles as the
+/// pass/fail signal for the salience check).
+fn salience_cell(m: &TurnMetrics) -> String {
+    match m.kb_salience {
+        Some(value) => format!("{value:.2}"),
+        None => "—".to_string(),
+    }
+}
+
 /// Write a markdown summary table for the run, mirroring `tests/LLM1/TestSummary.md`.
 fn write_summary_md(dir: &Path, all: &[TurnMetrics], pass: bool) -> io::Result<()> {
     let mut md = String::new();
@@ -499,15 +538,15 @@ fn write_summary_md(dir: &Path, all: &[TurnMetrics], pass: bool) -> io::Result<(
         if pass { "PASS ✅" } else { "FAIL ❌" }
     ));
     md.push_str(
-        "| # | Question | LLM | WhatsApp | Push | Actuate | Stores | Multimodal | Result |\n",
+        "| # | Question | LLM | WhatsApp | Push | Actuate | Stores | Salience | Multimodal | Result |\n",
     );
     md.push_str(
-        "|---|----------|-----|----------|------|---------|--------|------------|--------|\n",
+        "|---|----------|-----|----------|------|---------|--------|----------|------------|--------|\n",
     );
     for (i, m) in all.iter().enumerate() {
         let question = truncate(&m.question, 60);
         md.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {}/4 | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {}/4 | {} | {} | {} |\n",
             i + 1,
             question,
             if m.llm_ok { "ok" } else { "fail" },
@@ -515,6 +554,7 @@ fn write_summary_md(dir: &Path, all: &[TurnMetrics], pass: bool) -> io::Result<(
             yes_no(m.push_ok),
             yes_no(m.actuate_ok),
             m.stores_covered,
+            salience_cell(m),
             yes_no(m.multimodal),
             if m.success { "PASS ✅" } else { "FAIL ❌" },
         ));
@@ -565,6 +605,8 @@ mod tests {
             push_ok: success,
             actuate_ok: success,
             stores_covered: if success { 4 } else { 2 },
+            salience_ok: success,
+            kb_salience: if success { Some(0.8) } else { None },
             multimodal: false,
             success,
             notes: Vec::new(),
@@ -604,13 +646,18 @@ mod tests {
     #[test]
     fn format_metrics_table_has_a_header_and_one_row_per_turn() {
         let table = format_metrics_table(&[metrics("t1", true), metrics("t2", false)]);
-        assert!(table.contains("Turn  WhatsApp  Push  Actuate  Stores  Multimodal  Result"));
+        assert!(
+            table.contains("Turn  WhatsApp  Push  Actuate  Stores  Salience  Multimodal  Result")
+        );
         assert!(table.contains("t1"));
         assert!(table.contains("PASS"));
         assert!(table.contains("t2"));
         assert!(table.contains("FAIL"));
         // The stores column renders as "n/4".
         assert!(table.contains("4/4"));
+        // A passing turn shows its salience; a failing one shows a dash.
+        assert!(table.contains("0.80"));
+        assert!(table.contains("—"));
     }
 
     #[test]

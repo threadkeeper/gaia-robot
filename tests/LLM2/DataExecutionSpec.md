@@ -99,7 +99,7 @@ the reply is plain text.
       "reason": "<why>" },
 
     { "id": "a5", "kind": "upsert",  "target": "GaiaKB",
-      "payload": { "entity": "threadkeeper", "data": "<durable fact>" }, "reason": "<why>" },
+      "payload": { "entity": "threadkeeper", "data": "<durable fact>", "salience": 0.80 }, "reason": "<why>" },
 
     { "id": "a6", "kind": "upsert",  "target": "GaiaDataLake",
       "payload": { "entity": "threadkeeper", "data": "<conversation snapshot>" }, "reason": "<why>" },
@@ -156,7 +156,7 @@ Gaia adds a record to **each** of the four stores **every turn**:
 | Target | Meaning |
 |---|---|
 | `GaiaConnections` | emotional-bank-account ledger update for this user (`delta` + `note`) |
-| `GaiaKB` | a durable fact worth remembering |
+| `GaiaKB` | a durable fact worth remembering, with an LLM-assigned `salience` (0.00–1.00) weighting its long-term importance |
 | `GaiaDataLake` | a snapshot of this conversation turn |
 | `GaiaDiary` | Gaia's private reflection on the turn |
 
@@ -202,6 +202,9 @@ A turn **passes** only when **all** of the following hold:
    - an Edwino `actuate` whose `instruction` is a standardized object;
    - an `upsert` to **each** of `GaiaConnections`, `GaiaKB`, `GaiaDataLake`,
      and `GaiaDiary`.
+4. The `GaiaKB` upsert carries an LLM-assigned `salience` (a finite number)
+   that survives the persistence handoff (`planned_store_writes`), proving the
+   score the model emitted actually reaches `insert_fact`.
 
 The overall self-test passes only when **every** executed turn passes; the
 subcommand maps that boolean to its process exit code so it can gate CI.

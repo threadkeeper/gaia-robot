@@ -17,9 +17,7 @@
 //!    record whose token count still fits the budget, rendering every selected
 //!    record the **same canonical way** (its AAKKK line) every time.
 //!
-//! [`coconut`] wires the two together. Every query logs its ranking and packing
-//! decisions (step 9) so that when the output looks wrong, the truth is in the
-//! logs first.
+//! [`coconut`] wires the two together.
 
 // The Coconut surface is being scaffolded incrementally; not every public item
 // is wired into the engine yet. Mirrors `crate::storage` / `write_data_controller`.
@@ -99,7 +97,7 @@ pub struct PackResult {
 ///
 /// The ordering is **deterministic** for fixed inputs: ties on `final_rank` are
 /// broken by ascending record id, so the same candidates always yield the same
-/// order. Each record's score is logged (step 9).
+/// order.
 pub fn rank(records: &[Record]) -> Vec<ScoredRecord<'_>> {
     let mut scored: Vec<ScoredRecord<'_>> = records
         .iter()
@@ -107,10 +105,6 @@ pub fn rank(records: &[Record]) -> Vec<ScoredRecord<'_>> {
             // Similarity comes from Cosmos (VectorDistance), not the backend.
             let similarity = record.similarity_score;
             let final_rank = record.salience * similarity;
-            eprintln!(
-                "coconut rank: id={} salience={:.4} similarity={:.4} final_rank={:.4}",
-                record.record_id, record.salience, similarity, final_rank
-            );
             ScoredRecord {
                 record,
                 similarity,
@@ -135,8 +129,7 @@ pub fn rank(records: &[Record]) -> Vec<ScoredRecord<'_>> {
 /// Walks top-to-bottom; a record is included when its token count still fits the
 /// remaining budget, otherwise it is **skipped** (and packing continues, so a
 /// smaller lower-ranked record can still fill the tail of the budget). The
-/// packed output never exceeds `max_tokens`. Every include/skip decision is
-/// logged (step 9).
+/// packed output never exceeds `max_tokens`.
 pub fn pack(scored: &[ScoredRecord<'_>], max_tokens: usize) -> PackResult {
     let mut rendered_lines: Vec<&str> = Vec::new();
     let mut included_ids: Vec<String> = Vec::new();
@@ -150,15 +143,6 @@ pub fn pack(scored: &[ScoredRecord<'_>], max_tokens: usize) -> PackResult {
             included_ids.push(item.record.record_id.clone());
             used_tokens += tokens;
             total_salience += item.record.salience;
-            eprintln!(
-                "coconut pack: id={} INCLUDED used_tokens={}",
-                item.record.record_id, used_tokens
-            );
-        } else {
-            eprintln!(
-                "coconut pack: id={} SKIPPED (needs {} tokens, used_tokens={}, budget={})",
-                item.record.record_id, tokens, used_tokens, max_tokens
-            );
         }
     }
 
@@ -209,6 +193,167 @@ pub fn build_save_aakkk(
         .render();
     let tokens = count_tokens(&line) as u32;
     (line, tokens)
+}
+
+/// The canonical AAKKK line for a record: the stored `aakkk` field when present,
+/// otherwise one rebuilt on the fly from the record's fields (so pre-Coconut KB
+/// rows, which never stored an `aakkk`, still produce a knowledge line).
+///
+/// The rebuilt line uses the record's `salience` (omitted when zero), and the
+/// freshest available timestamp (`updated_at`, else `created_at`, else `date`).
+fn aakkk_line_for(record: &Record) -> String {
+    if !record.aakkk.is_empty() {
+        return record.aakkk.clone();
+    }
+    // A zero salience means "none assigned", so drop it from the rebuilt line.
+    let salience = (record.salience != 0.0).then_some(record.salience);
+    let timestamp = if !record.updated_at.is_empty() {
+        record.updated_at.as_str()
+    } else if !record.created_at.is_empty() {
+        record.created_at.as_str()
+    } else {
+        record.date.as_str()
+    };
+    build_save_aakkk(&record.entity_id, &record.data, salience, timestamp).0
+}
+
+/// The **knowledge part** of a record for a KB summary: its AAKKK line with the
+/// knowledge-free `A:entity=…` attribute and the `A:text=` field label stripped,
+/// leaving just the (escaped) knowledge text followed by its `K:` metadata keys.
+///
+/// For example the stored line
+/// `A:entity=github:259026842|A:text=Jonty -> status -> sleepy|K:salience=0.2000|K:ts=2026-06-27T17:44:15Z`
+/// renders as
+/// `Jonty -> status -> sleepy|K:salience=0.2000|K:ts=2026-06-27T17:44:15Z`.
+///
+/// The entity is the same for every record in one account's KB and carries no
+/// knowledge, so it is dropped; the text value keeps its `\|` escaping so the
+/// summary stays a parseable AAKKK fragment.
+pub fn knowledge_part(record: &Record) -> String {
+    let line = aakkk_line_for(record);
+    // Drop a leading `A:entity=…|` attribute. Entity values never contain a raw
+    // `|`, so the first unescaped `|` ends the attribute.
+    let without_entity = match line.split_once('|') {
+        Some((head, rest)) if head.starts_with("A:entity=") => rest,
+        _ => line.as_str(),
+    };
+    // Drop the `A:text=` label, keeping just its (still-escaped) value + K: keys.
+    without_entity
+        .strip_prefix("A:text=")
+        .unwrap_or(without_entity)
+        .to_string()
+}
+
+/// Pack an account's most important KB records into one pipe-delimited knowledge
+/// summary that stays within `max_token_total` tokens.
+///
+/// This is the query-less KB-summary form of Coconut. The full formula is
+/// `final_rank = salience × similarity`, but with **no query** there is no
+/// similarity term, so ranking reduces to **salience descending** (tie-broken by
+/// id ascending for determinism, matching [`rank`]). Walking that order
+/// top-to-bottom, each record's [`knowledge_part`] is included while the running
+/// token total would still stay at or below `max_token_total`; a record that
+/// would exceed the budget is skipped and packing continues (a smaller, lower
+/// record can still fill the tail). Tokens are measured on the exact text packed
+/// (the knowledge part), so the count reflects what the summary actually emits.
+///
+/// The included parts are joined with `|` into [`PackResult::rendered`], the
+/// same struct [`pack`] returns, so callers get the rendered block plus the
+/// included ids, the used token count, and the summed salience.
+pub fn knowledge_summary(records: &[Record], max_token_total: usize) -> PackResult {
+    // Rank by salience DESC, id ASC. (Not `rank`, which multiplies by the
+    // per-query similarity score — that is zero here with no query and would
+    // flatten the ordering.)
+    let mut ordered: Vec<&Record> = records.iter().collect();
+    ordered.sort_by(|a, b| {
+        b.salience
+            .partial_cmp(&a.salience)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.record_id.cmp(&b.record_id))
+    });
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut included_ids: Vec<String> = Vec::new();
+    let mut used_tokens = 0usize;
+    let mut total_salience = 0.0f32;
+
+    for record in ordered {
+        let part = knowledge_part(record);
+        let tokens = count_tokens(&part);
+        if used_tokens + tokens <= max_token_total {
+            used_tokens += tokens;
+            total_salience += record.salience;
+            included_ids.push(record.record_id.clone());
+            parts.push(part);
+        }
+    }
+
+    PackResult {
+        rendered: parts.join("|"),
+        included_ids,
+        used_tokens,
+        total_salience,
+    }
+}
+
+/// The per-turn token budget for the GaiaKB knowledge handed to LLM Call 2 —
+/// the "threshold allowed for KB" in the Coconut design.
+///
+/// Gaia's full grounding context drawn from Cosmos is large (see `flow.rs`), but
+/// the knowledge base is only one of several sources feeding LLM Call 2, so its
+/// share is capped here. The cap keeps the most salient, most relevant facts
+/// while bounding how much of the context window the KB can consume as the
+/// account's knowledge grows. Tune this as the overall context budget is
+/// formalised.
+pub const KB_CONTEXT_TOKEN_BUDGET: usize = 2048;
+
+/// Reduce the GaiaKB rows retrieved this turn to the subset LLM Call 2 should
+/// see: rank by the Coconut formula and keep the highest-ranked records that
+/// fit `max_token_total`, returned (cloned) in ranked order.
+///
+/// This is the query-time wiring of Coconut into the pull → push hand-off. The
+/// full formula is `final_rank = salience × similarity`: when the KB query ran
+/// semantically, Cosmos has projected a `similarity_score` onto every row, so
+/// the product orders them. When no similarity is present (a keyword / most-
+/// recent KB query — e.g. the forced core-user query), every product would
+/// collapse to zero and flatten the order, so ranking falls back to **salience
+/// descending** instead (matching [`knowledge_summary`]). Ties are broken by
+/// ascending record id for determinism.
+///
+/// Walking that order top-to-bottom, each record is kept while the running token
+/// total (measured with [`effective_token_count`]) still fits `max_token_total`;
+/// a record that would overflow is skipped and packing continues, so a smaller
+/// lower-ranked record can still fill the tail of the budget.
+pub fn kb_context_records(records: &[Record], max_token_total: usize) -> Vec<Record> {
+    // Use salience × similarity only when Cosmos projected real similarities this
+    // turn; otherwise rank by salience alone so the order stays meaningful.
+    let has_similarity = records.iter().any(|record| record.similarity_score != 0.0);
+    let score = |record: &&Record| -> f32 {
+        if has_similarity {
+            record.salience * record.similarity_score
+        } else {
+            record.salience
+        }
+    };
+
+    let mut ordered: Vec<&Record> = records.iter().collect();
+    ordered.sort_by(|a, b| {
+        score(b)
+            .partial_cmp(&score(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.record_id.cmp(&b.record_id))
+    });
+
+    let mut selected: Vec<Record> = Vec::new();
+    let mut used_tokens = 0usize;
+    for record in ordered {
+        let tokens = effective_token_count(record);
+        if used_tokens + tokens <= max_token_total {
+            used_tokens += tokens;
+            selected.push(record.clone());
+        }
+    }
+    selected
 }
 
 #[cfg(test)]
@@ -360,5 +505,155 @@ mod tests {
         let a = build_save_aakkk("rust", "same text here", Some(0.5), "t");
         let b = build_save_aakkk("rust", "same text here", Some(0.5), "t");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn knowledge_part_strips_entity_and_text_label_keeping_metadata() {
+        // Mirrors the live KB shape: entity attr + escaped text + K: keys.
+        let line = "A:entity=github:259026842|A:text=Jonty -> status -> sleepy|K:salience=0.2000|K:ts=2026-06-27T17:44:15Z";
+        let r = record("id1", 0.0, line, 0, 0.2);
+        assert_eq!(
+            knowledge_part(&r),
+            "Jonty -> status -> sleepy|K:salience=0.2000|K:ts=2026-06-27T17:44:15Z"
+        );
+    }
+
+    #[test]
+    fn knowledge_part_preserves_escaped_inner_pipes_in_the_text() {
+        // The text value carries `\|`-escaped internal pipes; those must survive.
+        let line = "A:entity=e|A:text=a \\| b \\| c|K:salience=0.5000|K:ts=t";
+        let r = record("id2", 0.0, line, 0, 0.5);
+        assert_eq!(knowledge_part(&r), "a \\| b \\| c|K:salience=0.5000|K:ts=t");
+    }
+
+    #[test]
+    fn knowledge_part_rebuilds_when_no_aakkk_is_stored() {
+        // A pre-Coconut record (no aakkk): the line is rebuilt from its fields,
+        // then the entity + A:text= label are stripped the same way.
+        let mut r = Record::new(
+            "id3",
+            "Jonty",
+            "",
+            "2026-06-16",
+            RecordKind::KnowledgeBase,
+            "Jonty is an engineer",
+            Vec::new(),
+        );
+        r.salience = 0.8;
+        let part = knowledge_part(&r);
+        // Entity dropped, "is"/"an" filler stripped from the text, salience kept.
+        assert_eq!(part, "Jonty engineer|K:salience=0.8000|K:ts=2026-06-16");
+    }
+
+    #[test]
+    fn knowledge_summary_packs_by_salience_within_the_token_budget() {
+        // Three records of differing salience; salience decides inclusion order.
+        let high = record("a", 0.0, "A:entity=e|A:text=high", 0, 0.9);
+        let mid = record("b", 0.0, "A:entity=e|A:text=mid", 0, 0.5);
+        let low = record("c", 0.0, "A:entity=e|A:text=low", 0, 0.1);
+        let records = vec![low, high, mid]; // unsorted on purpose
+
+        let high_part = knowledge_part(&records[1]);
+        let mid_part = knowledge_part(&records[2]);
+        // Budget for exactly the top two by salience (high then mid).
+        let budget = count_tokens(&high_part) + count_tokens(&mid_part);
+        let summary = knowledge_summary(&records, budget);
+
+        assert_eq!(summary.included_ids, vec!["a".to_string(), "b".to_string()]);
+        assert!(summary.used_tokens <= budget);
+        // Rendered is the two knowledge parts joined by a single `|`.
+        assert_eq!(summary.rendered, format!("{high_part}|{mid_part}"));
+        assert!((summary.total_salience - 1.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn knowledge_summary_skips_an_oversized_record_and_keeps_filling() {
+        let big = record(
+            "a",
+            0.0,
+            "A:entity=e|A:text=this is a much longer knowledge fact about something",
+            0,
+            0.9,
+        );
+        let small = record("b", 0.0, "A:entity=e|A:text=short", 0, 0.8);
+        let records = vec![big, small];
+
+        let small_part = knowledge_part(&records[1]);
+        let small_tokens = count_tokens(&small_part);
+        // Budget fits only the small record; the bigger top-salience one is skipped.
+        let summary = knowledge_summary(&records, small_tokens);
+
+        assert_eq!(summary.included_ids, vec!["b".to_string()]);
+        assert_eq!(summary.used_tokens, small_tokens);
+        assert_eq!(summary.rendered, small_part);
+    }
+
+    #[test]
+    fn knowledge_summary_with_zero_budget_is_empty() {
+        let records = vec![record("a", 0.0, "A:entity=e|A:text=anything", 0, 0.9)];
+        let summary = knowledge_summary(&records, 0);
+        assert!(summary.included_ids.is_empty());
+        assert_eq!(summary.used_tokens, 0);
+        assert_eq!(summary.rendered, "");
+    }
+
+    #[test]
+    fn knowledge_summary_is_deterministic_with_id_tiebreak() {
+        // Equal salience -> ordered by ascending id, so "a" precedes "z".
+        let z = record("z", 0.0, "A:entity=e|A:text=zeta", 0, 0.5);
+        let a = record("a", 0.0, "A:entity=e|A:text=alpha", 0, 0.5);
+        let records = vec![z, a];
+        let summary = knowledge_summary(&records, 1000);
+        assert_eq!(summary.included_ids, vec!["a".to_string(), "z".to_string()]);
+    }
+
+    #[test]
+    fn kb_context_records_ranks_by_salience_times_similarity_when_present() {
+        // With Cosmos-projected similarities, the full Coconut formula orders the
+        // rows: b (0.9*0.707) > a (0.2*1.0) > c (1.0*0.0).
+        let records = vec![
+            record("a", 1.0, "A:e=a", 1, 0.2),
+            record("b", 0.707, "A:e=b", 1, 0.9),
+            record("c", 0.0, "A:e=c", 1, 1.0),
+        ];
+        let selected = kb_context_records(&records, 1000);
+        let order: Vec<&str> = selected.iter().map(|r| r.record_id.as_str()).collect();
+        assert_eq!(order, vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn kb_context_records_falls_back_to_salience_when_no_similarity() {
+        // A keyword / most-recent query projects no similarity (all zero), so the
+        // product would flatten the order; ranking must fall back to salience.
+        let records = vec![
+            record("low", 0.0, "A:e=low", 1, 0.1),
+            record("high", 0.0, "A:e=high", 1, 0.9),
+            record("mid", 0.0, "A:e=mid", 1, 0.5),
+        ];
+        let selected = kb_context_records(&records, 1000);
+        let order: Vec<&str> = selected.iter().map(|r| r.record_id.as_str()).collect();
+        assert_eq!(order, vec!["high", "mid", "low"]);
+    }
+
+    #[test]
+    fn kb_context_records_caps_at_the_token_budget_and_keeps_filling() {
+        // Ranked a(3), b(5), c(2) by salience; budget 5 keeps a then skips the
+        // oversized b and still fits c in the tail -> total 5 tokens, never over.
+        let records = vec![
+            record("a", 0.0, "A:e=a", 3, 0.9),
+            record("b", 0.0, "A:e=b", 5, 0.8),
+            record("c", 0.0, "A:e=c", 2, 0.7),
+        ];
+        let selected = kb_context_records(&records, 5);
+        let order: Vec<&str> = selected.iter().map(|r| r.record_id.as_str()).collect();
+        assert_eq!(order, vec!["a", "c"]);
+        let used: usize = selected.iter().map(effective_token_count).sum();
+        assert_eq!(used, 5);
+    }
+
+    #[test]
+    fn kb_context_records_with_zero_budget_selects_nothing() {
+        let records = vec![record("a", 1.0, "A:e=a", 1, 0.9)];
+        assert!(kb_context_records(&records, 0).is_empty());
     }
 }
