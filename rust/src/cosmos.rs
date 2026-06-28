@@ -1,8 +1,7 @@
 #![allow(dead_code)]
 
 //! The [`CosmosClient`] type: a tiny, dependency-light client for Gaia's Azure
-//! Cosmos DB for NoSQL containers (`GaiaKB`, `GaiaDiary`, `UsersKB`,
-//! `UsersDataLake`, `GaiaDataLake`).
+//! Cosmos DB for NoSQL containers (`GaiaKB`, `GaiaDiary`, `GaiaDataLake`).
 //!
 //! Like [`crate::llm::LlmClient`], this client is **opt-in** and reuses the same
 //! dev/local switch (`GAIA_MODE=dev`/`local`). When it is not configured,
@@ -1175,11 +1174,11 @@ mod tests {
         let url = docs_url(
             "https://acct.documents.azure.com:443/",
             "gaia",
-            "UsersDataLake",
+            "GaiaDataLake",
         );
         assert_eq!(
             url,
-            "https://acct.documents.azure.com:443/dbs/gaia/colls/UsersDataLake/docs"
+            "https://acct.documents.azure.com:443/dbs/gaia/colls/GaiaDataLake/docs"
         );
     }
 

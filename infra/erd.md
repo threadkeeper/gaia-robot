@@ -40,24 +40,6 @@ erDiagram
         object metadata "free-form, optional"
     }
 
-    UsersKB {
-        string id "system /id"
-        string userId PK "partition key; composite + full-text"
-        string date UK "unique per partition; composite"
-        string data "full-text + source of /dataVector"
-        float_array dataVector "DiskANN vector index"
-        object metadata "free-form, optional"
-    }
-
-    UsersDataLake {
-        string id "system /id"
-        string userId PK "partition key; composite + full-text"
-        string date UK "unique per partition; composite"
-        string data "full-text + source of /dataVector"
-        float_array dataVector "DiskANN vector index"
-        object metadata "free-form, optional"
-    }
-
     GaiaDiary {
         string id "system /id"
         string entity PK "partition key; composite + full-text"
@@ -94,8 +76,6 @@ erDiagram
 |------------------------|---------------|----------------------------|------------------------------|-------------------------------------------|----------------------------|
 | `GaiaKB`               | `/entity`     | `/date` (yyyy-mm-dd)       | ✅ DiskANN                    | `(entity, date)` and `(date, entity)`     | `/entity`, `/data`         |
 | `GaiaDataLake`         | `/entity`     | `/date` (yyyy-mm-dd)       | ✅ DiskANN                    | `(entity, date)` and `(date, entity)`     | `/entity`, `/data`         |
-| `UsersKB`              | `/userId`     | `/date` (yyyy-mm-dd)       | ✅ DiskANN                    | `(userId, date)` and `(date, userId)`     | `/userId`, `/data`         |
-| `UsersDataLake`        | `/userId`     | `/date` (yyyy-mm-dd)       | ✅ DiskANN                    | `(userId, date)` and `(date, userId)`     | `/userId`, `/data`         |
 | `GaiaDiary`            | `/entity`     | `/date` (yyyy-mm-dd)       | ✅ DiskANN                    | `(entity, date)` and `(date, entity)`     | `/entity`, `/data`         |
 | `GaiaWebSearchHistory` | `/entity`     | `/timestamp` (ISO 8601)    | ✅ DiskANN                    | `(entity, timestamp)` and `(timestamp, entity)` | `/entity` only       |
 | `GaiaConnections`      | `/entity`     | `/timestamp` (ISO 8601)    | ✅ DiskANN                    | `(entity, timestamp)` and `(timestamp, entity)` | `/entity` only       |

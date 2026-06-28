@@ -723,15 +723,15 @@ mod tests {
     #[test]
     fn execute_runs_cosmos_and_web_actions_against_their_clients() {
         // Drive the full pull pass with live (mock) Cosmos and Brave clients: the
-        // authored UsersKB keyword query and the Web search both succeed, and the
+        // authored GaiaDataLake keyword query and the Web search both succeed, and the
         // three guaranteed core-user queries (GaiaKB, GaiaDiary, GaiaConnections)
         // also run (returning nothing here). Their records are folded into the
         // context and the issued web query is recorded.
         let kb_doc = r#"{"Documents":[
-            {"id":"UsersKB|alice|2026-05-10","userId":"alice","date":"2026-05-10","data":"prefers tea"}
+            {"id":"GaiaDataLake|alice|2026-05-10","entity":"alice","date":"2026-05-10","data":"prefers tea"}
         ]}"#;
         let empty = r#"{"Documents":[]}"#;
-        // One response per Cosmos call, in plan order: the authored q1 (UsersKB)
+        // One response per Cosmos call, in plan order: the authored q1 (GaiaDataLake)
         // first, then the three forced core-user queries.
         let (cosmos_endpoint, cosmos_handle) = crate::test_http::spawn_mock_http_sequence(vec![
             ("200 OK".to_string(), kb_doc.to_string()),
@@ -753,14 +753,14 @@ mod tests {
           { "version": "1.0",
             "session": { "user_id": "alice", "requested_at": "2026-06-21T00:00:00Z" },
             "actions": [
-              { "id": "q1", "kind": "query", "target": "UsersKB", "user_id": "alice", "entity": "alice", "intent": "past notes", "top": 3, "filters": {} },
+              { "id": "q1", "kind": "query", "target": "GaiaDataLake", "user_id": "alice", "entity": "alice", "intent": "past notes", "top": 3, "filters": {} },
               { "id": "q2", "kind": "query", "target": "Web", "user_id": "alice", "entity": "alice", "intent": "mars news", "top": 3, "filters": {} }
             ] }
         ]"#;
 
         let result = controller.execute("alice", "mars?", "2026-06-21T00:00:00Z", reply, false);
 
-        // The authored UsersKB query plus the three forced core-user queries.
+        // The authored GaiaDataLake query plus the three forced core-user queries.
         assert_eq!(result.cosmos_actions, 4);
         assert_eq!(result.web_actions, 1);
         assert!(result.all_ok, "notes: {:?}", result.notes);
@@ -776,7 +776,7 @@ mod tests {
 
     #[test]
     fn execute_notes_a_cosmos_failure_but_still_completes() {
-        // Cosmos returns an error status for every read (the authored UsersKB
+        // Cosmos returns an error status for every read (the authored GaiaDataLake
         // query and the three forced core-user queries): each is recorded as
         // failed and all_ok flips, yet the context is still fully assembled.
         let denied = (
@@ -796,7 +796,7 @@ mod tests {
           { "version": "1.0",
             "session": { "user_id": "alice", "requested_at": "2026-06-21T00:00:00Z" },
             "actions": [
-              { "id": "q1", "kind": "query", "target": "UsersKB", "user_id": "alice", "entity": "alice", "intent": "past notes", "top": 3, "filters": {} }
+              { "id": "q1", "kind": "query", "target": "GaiaDataLake", "user_id": "alice", "entity": "alice", "intent": "past notes", "top": 3, "filters": {} }
             ] }
         ]"#;
 

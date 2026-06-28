@@ -108,7 +108,7 @@ export interface PushDebug {
 
 /** The real wall-clock latency of one Cosmos write this turn. */
 export interface WriteTiming {
-  /** Short label, e.g. `UsersDataLake`, `Upsert GaiaDiary`, `GaiaConnections delta`. */
+  /** Short label, e.g. `GaiaDataLake`, `Upsert GaiaDiary`, `GaiaConnections delta`. */
   type: string;
   /** Wall-clock milliseconds the write took (may be fractional). */
   ms: number;

@@ -103,7 +103,7 @@ throughput/storage beyond the free-tier allowances.
 
 ## cosmos_create.py
 
-Provisions the seven Cosmos DB for NoSQL containers from the Gaia physical
+Provisions the five Cosmos DB for NoSQL containers from the Gaia physical
 architecture diagram. The script is idempotent (safe to re-run): it creates the
 database and each container only if they do not already exist.
 
@@ -111,8 +111,6 @@ database and each container only if they do not already exist.
 |------------------------|--------------------------|---------------------------|
 | `GaiaKB`               | `entity`                 | entity + date             |
 | `GaiaDataLake`         | `entity`                 | entity + date             |
-| `UsersKB`              | `userId`                 | userId + date             |
-| `UsersDataLake`        | `userId`                 | userId + date             |
 | `GaiaDiary`            | `entity`                 | entity + date             |
 | `GaiaWebSearchHistory` | `entity`                 | entity + timestamp        |
 | `GaiaConnections`      | `entity`                 | entity + timestamp        |

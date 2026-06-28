@@ -74,10 +74,10 @@ const DOCUMENT_SPEC: &str = "\
 /// The retrieval tools Call 1 may target through `actions.json`.
 ///
 /// Each line names a target source, how it is partitioned, and whether a
-/// `user_id` is mandatory. The seven sources match the GET block of the
-/// physical architecture exactly (q1..q7) and their names are the real Cosmos
-/// container ids (except `Web`). `Users*` targets are per-user and must be
-/// scoped to the current user only, which is how user isolation is enforced.
+/// `user_id` is mandatory. The sources match the GET block of the physical
+/// architecture exactly and their names are the real Cosmos container ids
+/// (except `Web`). Every query is scoped to the current user (`entity ==
+/// user_id`), which is how user isolation is enforced.
 const TOOL_SPEC: &str = "\
 - Web             (search)     : public web search; results are logged to the Gaia Search History. NO query field.
 - GaiaDataLake    (container)  : Gaia's data lake, full conversation histories; partition=/entity.
@@ -104,14 +104,13 @@ For EACH query set filters.mode to one of:
 /// cheap), and the hard rules every authored query must follow so it stays a
 /// safe, single-partition, bounded read. Concrete worked examples follow.
 const COSMOS_SCHEMA_SPEC: &str = "\
-All six database targets are Azure Cosmos DB for NoSQL containers in database
+All of these database targets are Azure Cosmos DB for NoSQL containers in database
 'gaia'. Every document has this shape (the alias `c` is the document):
   - c.id        (string)  unique document id.
-  - c.entity    (string)  partition key for Gaia* containers (the subject/user).
-  - c.userId    (string)  partition key for Users* containers.
+  - c.entity    (string)  the partition key (the subject/user).
   - c.date      (string)  'YYYY-MM-DD' day of the record; the per-partition
-                 UNIQUE key on the snapshot containers (UsersDataLake, GaiaKB,
-                 GaiaDataLake, GaiaKB, GaiaDiary).
+                 UNIQUE key on the snapshot containers (GaiaKB,
+                 GaiaDataLake, GaiaDiary).
   - c.timestamp (string)  ISO-8601 instant; the per-partition UNIQUE key on
                  GaiaConnections (the ledger). Order by this, not c.date, there.
   - c.data      (string)  the record's text body. NOT present on GaiaConnections.
@@ -129,7 +128,7 @@ ledger fields:
   - c.notes           (string)  why the balance changed this turn.
 
 Indexes available (what is cheap to query):
-  - Partition key (/entity or /userId): equality. EVERY query MUST filter on it.
+  - Partition key (/entity): equality. EVERY query MUST filter on it.
   - /date: range index -> date filters and `ORDER BY c.date DESC`.
   - /data: keyword search with `CONTAINS(LOWER(c.data), '<lowercase term>')`
            (case-insensitive substring match).
@@ -139,14 +138,14 @@ Indexes available (what is cheap to query):
 Hard rules for every authored `query` (Web excepted):
   1. It MUST be a SINGLE read-only SELECT (no ';', no writes).
   2. It MUST filter on the partition key using the placeholder `@pk`, e.g.
-      `WHERE c.entity = @pk` for Gaia* targets. Runtime strictly enforces that
+      `WHERE c.entity = @pk`. Runtime strictly enforces that
       action.user_id == action.entity, binds @pk to that value, and pins one
       partition, so do not query across partitions.
   3. It MUST start with `SELECT TOP <top>` using the action's `top` (which you
      sized from the user's input, default 3) so the result set stays small
      enough for the next reasoning step.
   4. Project only what is needed:
-     `SELECT TOP 3 c.id, c.entity, c.userId, c.date, c.data`.
+     `SELECT TOP 3 c.id, c.entity, c.date, c.data`.
     5. Choose retrieval mode PER query and set `filters.mode` accordingly:
          - `keyword`: author a keyword query using `CONTAINS(LOWER(c.data), '<term>')`
              (or `CONTAINS(LOWER(c.notes), '<term>')` for GaiaConnections).
@@ -258,8 +257,8 @@ const CALL2_DOCUMENT_SPEC: &str = "\
      \"actions\": [
        { \"id\": \"a1\",
          \"kind\": \"upsert|send|actuate|connection\",
-         \"target\": \"GaiaKB|UsersDataLake|GaiaKB|GaiaDiary|GaiaDataLake|WhatsApp|Push|Actuator|GaiaConnections\",
-         \"user_id\": \"<required for Users* targets, otherwise null>\",
+         \"target\": \"GaiaKB|GaiaDiary|GaiaDataLake|WhatsApp|Push|Actuator|GaiaConnections\",
+         \"user_id\": \"<this user; must equal entity>\",
          \"payload\": { \"<effect-specific fields>\": \"<value>\" },
          \"reason\": \"<why this side effect is justified by the context>\" }
      ] }";
@@ -268,11 +267,11 @@ const CALL2_DOCUMENT_SPEC: &str = "\
 ///
 /// Unlike Call 1's read-only retrieval tools, every effect here changes state:
 /// it writes a memory, sends a message, moves an actuator, or adjusts the
-/// friendship ledger. `Users*` write-backs must stay scoped to the current user.
+/// friendship ledger. All write-backs stay scoped to the current user.
 const CALL2_ACTION_SPEC: &str = "\
-- upsert  -> GaiaKB|UsersDataLake|GaiaKB|GaiaDiary|GaiaDataLake : write/update a
+- upsert  -> GaiaKB|GaiaDiary|GaiaDataLake : write/update a
              memory record. payload = { \"id\": \"<optional>\", \"entity\": \"<subject>\",
-             \"data\": \"<text>\" }. Users* writes REQUIRE user_id (this user only).
+             \"data\": \"<text>\" }.
 - send    -> WhatsApp|Push : deliver a message to the user. payload =
              { \"text\": \"<message>\" }.
 - actuate -> Actuator : drive a physical/robot output. payload =
@@ -458,6 +457,10 @@ mod tests {
         assert!(!prompt.system.contains("GaiaCosmos"));
         assert!(!prompt.system.contains("GaiaLH"));
         assert!(!prompt.system.contains("UsersDL"));
+        // The deprecated user-side containers are fully merged into the Gaia*
+        // containers, so they must never be offered to the model as a target.
+        assert!(!prompt.system.contains("UsersDataLake"));
+        assert!(!prompt.system.contains("UsersKB"));
     }
 
     #[test]
@@ -473,7 +476,6 @@ mod tests {
         for field in [
             "c.id",
             "c.entity",
-            "c.userId",
             "c.date",
             "c.timestamp",
             "c.data",

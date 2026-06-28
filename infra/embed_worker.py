@@ -57,8 +57,6 @@ from embeddings import EmbeddingClient, TEXT_FIELD, VECTOR_FIELD
 CONTAINERS: dict[str, str] = {
     "GaiaKB": "entity",
     "GaiaDataLake": "entity",
-    "UsersKB": "userId",
-    "UsersDataLake": "userId",
     "GaiaDiary": "entity",
 }
 

@@ -1,4 +1,4 @@
-"""Create the seven Gaia Cosmos DB containers described in the architecture diagram.
+"""Create the six Gaia Cosmos DB containers described in the architecture diagram.
 
 This is an infrastructure provisioning *script* (not part of the Rust program).
 Running it is idempotent: it creates the database and each container only if they
@@ -10,8 +10,6 @@ It provisions the Azure Cosmos DB for NoSQL containers below:
     --------------------   ------------------   -------------------------
     GaiaKB                 entity               entity + date (yyyy-mm-dd)
     GaiaDataLake           entity               entity + date (yyyy-mm-dd)
-    UsersKB                userId               userId + date (yyyy-mm-dd)
-    UsersDataLake          userId               userId + date (yyyy-mm-dd)
     GaiaDiary              entity               entity + date (yyyy-mm-dd)
     GaiaWebSearchHistory   entity               entity + timestamp (ISO 8601)
     GaiaConnections        entity               entity + timestamp (ISO 8601)
@@ -119,9 +117,9 @@ def load_env_file(path: str = ".env") -> None:
 # --- Configuration -----------------------------------------------------------
 
 
-# The seven core containers from the diagram plus the derived DataLakeIndex.
+# The five core containers from the diagram plus the derived DataLakeIndex.
 # ``key_field`` is the business/partition
-# key: the entity tables key on "entity", the user tables key on "userId".
+# key: the entity tables key on "entity".
 # ``unique_field`` is the path made unique *within* a partition; it is "date"
 # for the daily-snapshot containers and "timestamp" for the log/ledger
 # (which need many rows per day, so they key on a full instant, not a day).
@@ -143,8 +141,6 @@ class TableSpec:
 TABLES: list[TableSpec] = [
     TableSpec(name="GaiaKB", key_field="entity"),
     TableSpec(name="GaiaDataLake", key_field="entity"),
-    TableSpec(name="UsersKB", key_field="userId"),
-    TableSpec(name="UsersDataLake", key_field="userId"),
     TableSpec(name="GaiaDiary", key_field="entity"),
     # Append-only log of Gaia's web searches. It stores the query and results
     # rather than a "/data" text payload, so it has a vector index over its

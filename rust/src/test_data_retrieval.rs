@@ -47,7 +47,7 @@ const PROBE_QUESTIONS: [&str; 6] = [
     // 1. Double-barrelled: GaiaKB facts + GaiaDataLake conversation recall.
     "What do you know about Jonty's hobbies and interests and can you look up what you told \
      me about hiking recently?",
-    // 2. Medium, personal recall (UsersDataLake / GaiaDataLake territory).
+    // 2. Medium, personal recall (GaiaDataLake conversation-history territory).
     "Remind me what we talked about regarding the robot's adventures in the forest recently.",
     // 3. Long, multi-topic personal synthesis (facts + history).
     "Can you summarise everything you know about my interests in music, books, and the \

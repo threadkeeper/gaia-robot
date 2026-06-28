@@ -37,7 +37,7 @@ pub struct ActionPlan {
     pub id: String,
     /// The action family; today this should be `query`.
     pub kind: String,
-    /// The target container, such as `UsersKB` or `GaiaKB`.
+    /// The target container, such as `GaiaKB` or `GaiaDataLake`.
     pub target: String,
     /// The user id that scopes this query.
     ///
@@ -252,7 +252,7 @@ mod tests {
         let action = ActionPlan {
             id: "q1".to_string(),
             kind: "query".to_string(),
-            target: "UsersKB".to_string(),
+            target: "GaiaKB".to_string(),
             user_id: Some("user-1".to_string()),
             entity: Some("user-1".to_string()),
             intent: "Recent notes".to_string(),
@@ -270,7 +270,7 @@ mod tests {
         let action = ActionPlan {
             id: "q2".to_string(),
             kind: "query".to_string(),
-            target: "UsersDataLake".to_string(),
+            target: "GaiaKB".to_string(),
             user_id: None,
             entity: Some("user-1".to_string()),
             intent: "Recent activity".to_string(),
@@ -308,12 +308,12 @@ mod tests {
                 {
                     "id": "q1",
                     "kind": "query",
-                    "target": "UsersKB",
+                    "target": "GaiaKB",
                     "user_id": "user-123",
                     "entity": "user-123",
                     "intent": "Recent notes for this user",
                     "top": 3,
-                    "query": "SELECT TOP 3 c.id, c.userId, c.date, c.data FROM c WHERE c.userId = @pk AND CONTAINS(LOWER(c.data), 'notes') ORDER BY c.date DESC",
+                    "query": "SELECT TOP 3 c.id, c.entity, c.date, c.data FROM c WHERE c.entity = @pk AND CONTAINS(LOWER(c.data), 'notes') ORDER BY c.date DESC",
                     "filters": {"from_date": "2026-06-01", "to_date": "2026-06-16"}
                 }
             ]
@@ -329,7 +329,7 @@ mod tests {
         assert_eq!(
             parsed.actions[0].authored_query(),
             Some(
-                "SELECT TOP 3 c.id, c.userId, c.date, c.data FROM c WHERE c.userId = @pk \
+                "SELECT TOP 3 c.id, c.entity, c.date, c.data FROM c WHERE c.entity = @pk \
                  AND CONTAINS(LOWER(c.data), 'notes') ORDER BY c.date DESC"
             )
         );

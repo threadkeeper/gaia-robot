@@ -3,7 +3,6 @@
 This folder contains the prompt/skill definitions that guide the LLM to translate natural-language requests into Cosmos DB NoSQL queries.
 
 ## Included skills
-- `users-kb-query` — `UsersKB`, user-isolated, `TOP 3` by default.
 - `users-dl-query` — `UsersDL`, user-isolated, `TOP 3` by default.
 - `gaia-kb-query` — `GaiaKB`, entity-aware, `TOP 3` by default.
 - `gaia-lh-query` — `GaiaLH`, entity-aware, `TOP 3` by default.

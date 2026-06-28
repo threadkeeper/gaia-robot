@@ -1,3 +1,6 @@
 # Migration data (large data dumps — not tracked in git)
 migrations/
 logs/
+
+# Local-only testing artifacts that may embed secrets (auth tokens, sessions)
+.local/

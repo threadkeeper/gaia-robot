@@ -512,12 +512,9 @@ fn partition_for(action: &ActionPlan) -> Result<(&'static str, String), String> 
         ));
     }
 
-    // `Users*` containers partition on userId; all others on entity.
-    if action.target.starts_with("Users") {
-        Ok(("userId", user_id.to_string()))
-    } else {
-        Ok(("entity", entity.to_string()))
-    }
+    // Every container partitions on /entity (and user_id == entity is enforced
+    // above), so each query is pinned to the user's own partition.
+    Ok(("entity", entity.to_string()))
 }
 
 /// Return the trimmed string slice if a value is present and non-blank.
@@ -550,8 +547,8 @@ mod tests {
     }
 
     #[test]
-    fn users_action_partitions_on_user_id_with_default_top() {
-        let mut act = action("UsersKB");
+    fn entity_action_partitions_on_entity_with_default_top() {
+        let mut act = action("GaiaKB");
         act.user_id = Some("user-1".to_string());
         act.entity = Some("user-1".to_string());
 
@@ -559,7 +556,7 @@ mod tests {
 
         assert_eq!(planned.partition_value, "user-1");
         assert!(planned.sql.contains("SELECT TOP 3 "));
-        assert!(planned.sql.contains("c.userId = @key"));
+        assert!(planned.sql.contains("c.entity = @key"));
         assert!(planned.sql.contains("ORDER BY c.date DESC"));
         assert_eq!(planned.params, vec![QueryParam::new("@key", "user-1")]);
     }
@@ -596,8 +593,8 @@ mod tests {
     }
 
     #[test]
-    fn users_action_without_user_id_is_an_error() {
-        let mut act = action("UsersDataLake");
+    fn action_without_user_id_is_an_error() {
+        let mut act = action("GaiaKB");
         act.entity = Some("user-1".to_string());
         let err = plan_to_query(&act, None).unwrap_err();
         assert!(err.contains("no user_id"));
@@ -622,7 +619,7 @@ mod tests {
 
     #[test]
     fn blank_filters_are_dropped() {
-        let mut act = action("UsersKB");
+        let mut act = action("GaiaKB");
         act.user_id = Some("user-1".to_string());
         act.entity = Some("user-1".to_string());
         act.filters.text = Some("   ".to_string());
@@ -671,13 +668,13 @@ mod tests {
 
     #[test]
     fn plan_for_falls_back_to_the_built_query_when_none_is_authored() {
-        let mut act = action("UsersKB");
+        let mut act = action("GaiaKB");
         act.user_id = Some("user-1".to_string());
         act.entity = Some("user-1".to_string());
         // No authored query -> the structured-field builder is used.
         let planned = plan_for(&act, None).unwrap();
         assert!(planned.sql.contains("SELECT TOP 3 "));
-        assert!(planned.sql.contains("c.userId = @key"));
+        assert!(planned.sql.contains("c.entity = @key"));
     }
 
     #[test]

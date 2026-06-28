@@ -24,6 +24,11 @@
 //! [`DailyLog::to_transcript`], so vectors and grounding text stay clean,
 //! human-readable conversation rather than JSON syntax.
 
+// The daily-log surface is being scaffolded incrementally; the parse/merge/
+// to_json helpers are not wired into the write path yet. Mirrors the
+// `#![allow(dead_code)]` already used in `crate::storage` / `write_data_controller`.
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 

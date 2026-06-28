@@ -24,7 +24,7 @@ records and a small **`DataLakeIndex`** container for cheap semantic search.
 - **Two-tier DataLake retrieval:** vector search over the small `DataLakeIndex`
   returns `id`s → fetch the full raw rows from the DataLake **SQL endpoint**
   (Synapse/Fabric), which is **stubbed** this phase.
-- **Containers covered:** `GaiaKB`, `UsersKB`, `GaiaDataLake`, `UsersDataLake`,
+- **Containers covered:** `GaiaKB`, `GaiaDataLake`,
   `GaiaDiary`. Excluded: `GaiaConnections` (ledger), `GaiaWebSearchHistory`
   (audit log).
 - **Wiring:** the writer is connected into the engine push pass now (the path
@@ -71,8 +71,6 @@ therefore yields both sizes, at the cost of one tiny pure function
 | `GaiaKB` | `/entity` | 3 | `GaiaKB\|threadkeeper\|2026-06-16` | ✅ in-place 1536-d |
 | `GaiaDataLake` | `/entity` | 31 | `GaiaDataLake\|threadkeeper\|2026-06-14` | ✅ 1536-d + 768-d index |
 | `GaiaWebSearchHistory` | `/entity` | 0 | — | ❌ audit log |
-| `UsersDataLake` | `/userId` | 31 | `UsersDataLake\|threadkeeper\|2026-06-14` | ✅ 1536-d (index later) |
-| `UsersKB` | `/userId` | 0 | — | ✅ in-place 1536-d |
 | `GaiaDiary` | `/entity` | 9 | `GaiaDiary\|threadkeeper\|2026-05-31` | ✅ in-place 1536-d |
 | `GaiaConnections` | `/entity` | 4 | `...\|2026-04-27T19:09:59Z` | ❌ ledger |
 
@@ -193,7 +191,7 @@ only a small semantic index, offload raw retrieval to the DataLake SQL endpoint
 ### 5.2 Container definition
 - **Name:** `DataLakeIndex`
 - **Partition key:** `/entity` — identical to `GaiaDataLake` (Decision Q3).
-- **Fed from:** `GaiaDataLake` (`source` field leaves room for `UsersDataLake`).
+- **Fed from:** `GaiaDataLake` (`source` field leaves room for other DataLake sources).
 - **Document shape:**
   ```jsonc
   {

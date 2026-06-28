@@ -54,9 +54,60 @@ pub struct Record {
     /// `/dataVector`. Empty until an embedding has been computed.
     #[serde(rename = "dataVector", default, skip_serializing_if = "Vec::is_empty")]
     pub data_vector: Vec<f32>,
+    /// Coconut: the dense, canonical **AAKKK** form of `data` used for
+    /// token-budget packing at query time (Cosmos `/aakkk`). Computed once at
+    /// save time; empty on records written before Coconut existed.
+    #[serde(rename = "aakkk", default, skip_serializing_if = "String::is_empty")]
+    pub aakkk: String,
+    /// Coconut: the token count of the exact text that will be packed (the
+    /// `aakkk` line), measured at save time (Cosmos `/tokenCount`). Zero when
+    /// not yet computed.
+    #[serde(rename = "tokenCount", default, skip_serializing_if = "is_zero_u32")]
+    pub token_count: u32,
+    /// Coconut: the memory's standalone **salience**, a property of the record
+    /// independent of any query (Cosmos `/salience`). Assigned by the model
+    /// during LLM Call 1 / Call 2 (not computed in the backend). Zero when no
+    /// salience has been assigned yet.
+    #[serde(rename = "salience", default, skip_serializing_if = "is_zero_f32")]
+    pub salience: f32,
+    /// Coconut: when this record was first created, as `YYYY-MM-DDTHH:MM:SSZ`
+    /// (Cosmos `/createdAt`). Empty on pre-Coconut records.
+    #[serde(
+        rename = "createdAt",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub created_at: String,
+    /// Coconut: when this record was last written, as `YYYY-MM-DDTHH:MM:SSZ`
+    /// (Cosmos `/updatedAt`). Empty on pre-Coconut records.
+    #[serde(
+        rename = "updatedAt",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub updated_at: String,
+    /// Coconut (transient, **never persisted**): the per-query similarity score
+    /// Cosmos computes with `VectorDistance(...)` over the DiskANN cosine index,
+    /// projected as `similarityScore` in semantic queries. Read off query
+    /// results so Coconut can rank by `salience × similarity`; always skipped on
+    /// serialize so it can never be written back into a stored document.
+    #[serde(rename = "similarityScore", default, skip_serializing)]
+    pub similarity_score: f32,
     /// Optional free-form metadata; omitted from the document when empty.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
+}
+
+/// Serde `skip_serializing_if` helper: true when a `u32` is zero, so an
+/// unmeasured `token_count` is omitted from the Cosmos document entirely.
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+/// Serde `skip_serializing_if` helper: true when an `f32` is exactly zero, so an
+/// uncomputed `salience` is omitted from the Cosmos document entirely.
+fn is_zero_f32(value: &f32) -> bool {
+    *value == 0.0
 }
 
 /// Describes the index shape that a table should expose for retrieval.
@@ -75,7 +126,7 @@ pub struct IndexSpec {
 /// Describes the logical layout of a KB or DL container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSchema {
-    /// Container name, such as `GaiaKB` or `UsersDataLake`.
+    /// Container name, such as `GaiaKB` or `GaiaDataLake`.
     pub name: &'static str,
     /// The logical family: knowledge base or data lake.
     pub kind: RecordKind,
@@ -147,8 +198,37 @@ impl Record {
             kind,
             data: data.into(),
             data_vector,
+            aakkk: String::new(),
+            token_count: 0,
+            salience: 0.0,
+            created_at: String::new(),
+            updated_at: String::new(),
+            similarity_score: 0.0,
             metadata: BTreeMap::new(),
         }
+    }
+
+    /// Attach the Coconut save-time fields to this record (builder style).
+    ///
+    /// These are the values the Coconut save pipeline computes once per write —
+    /// the dense `aakkk` packing form, its `token_count`, the memory's
+    /// `salience`, and the `created_at` / `updated_at` timestamps. Kept separate
+    /// from [`Record::new`] so existing callers that do not yet compute Coconut
+    /// fields stay unchanged; they simply leave these at their defaults.
+    pub fn with_coconut_fields(
+        mut self,
+        aakkk: impl Into<String>,
+        token_count: u32,
+        salience: f32,
+        created_at: impl Into<String>,
+        updated_at: impl Into<String>,
+    ) -> Self {
+        self.aakkk = aakkk.into();
+        self.token_count = token_count;
+        self.salience = salience;
+        self.created_at = created_at.into();
+        self.updated_at = updated_at.into();
+        self
     }
 
     /// Return the business partition key used for filtering by user or entity.
@@ -300,11 +380,11 @@ mod tests {
         );
         kb.upsert(&mut repo, kb_record);
 
-        let dl = DataLakeTable::new("UsersDataLake", "userId");
+        let dl = DataLakeTable::new("GaiaDataLake", "entity");
         let dl_record = Record::new(
             "dl-1",
+            "entity-1",
             "",
-            "user-1",
             "2026-06-16",
             RecordKind::DataLake,
             "a note",
@@ -322,7 +402,7 @@ mod tests {
     #[test]
     fn kb_and_dl_tables_expose_standard_indexes() {
         let kb = KnowledgeBaseTable::new("GaiaKB", "entity");
-        let dl = DataLakeTable::new("UsersDataLake", "userId");
+        let dl = DataLakeTable::new("GaiaDataLake", "entity");
 
         assert_eq!(kb.schema().kind, RecordKind::KnowledgeBase);
         assert_eq!(dl.schema().kind, RecordKind::DataLake);
@@ -345,7 +425,7 @@ mod tests {
             .schema()
             .indexes
             .iter()
-            .any(|index| index.fields.contains(&"userId")));
+            .any(|index| index.fields.contains(&"entity")));
     }
 
     #[test]
@@ -387,27 +467,27 @@ mod tests {
 
     #[test]
     fn record_serializes_to_the_cosmos_document_shape() {
-        // A user-partitioned record should map onto the on-disk field names and
-        // omit the empty/derived fields (entity, kind, metadata).
+        // An entity-partitioned record should map onto the on-disk field names
+        // and omit the empty/derived fields (userId, kind, metadata).
         let record = Record::new(
-            "UsersDataLake_user-1_2026-06-16",
+            "GaiaKB_rust_2026-06-16",
+            "rust",
             "",
-            "user-1",
             "2026-06-16",
-            RecordKind::DataLake,
+            RecordKind::KnowledgeBase,
             "hello",
             vec![0.5, 0.25],
         );
 
         let value = serde_json::to_value(&record).unwrap();
 
-        assert_eq!(value["id"], "UsersDataLake_user-1_2026-06-16");
-        assert_eq!(value["userId"], "user-1");
+        assert_eq!(value["id"], "GaiaKB_rust_2026-06-16");
+        assert_eq!(value["entity"], "rust");
         assert_eq!(value["date"], "2026-06-16");
         assert_eq!(value["data"], "hello");
         assert_eq!(value["dataVector"], serde_json::json!([0.5, 0.25]));
-        // Empty entity, derived kind, and empty metadata are not written.
-        assert!(value.get("entity").is_none());
+        // Empty userId, derived kind, and empty metadata are not written.
+        assert!(value.get("userId").is_none());
         assert!(value.get("kind").is_none());
         assert!(value.get("metadata").is_none());
     }
@@ -440,5 +520,112 @@ mod tests {
         assert_eq!(record.data_vector, vec![0.1, 0.2, 0.3]);
         // `kind` is not stored, so it falls back to the default.
         assert_eq!(record.kind, RecordKind::default());
+    }
+
+    #[test]
+    fn coconut_fields_default_to_empty_and_are_omitted_from_the_document() {
+        // A record built without Coconut fields keeps them at their zero values
+        // and never serializes them, so existing writers stay byte-compatible.
+        let record = Record::new(
+            "GaiaKB_rust_2026-06-16",
+            "rust",
+            "",
+            "2026-06-16",
+            RecordKind::KnowledgeBase,
+            "facts",
+            vec![0.1],
+        );
+
+        assert_eq!(record.aakkk, "");
+        assert_eq!(record.token_count, 0);
+        assert_eq!(record.salience, 0.0);
+        assert_eq!(record.created_at, "");
+        assert_eq!(record.updated_at, "");
+
+        let value = serde_json::to_value(&record).unwrap();
+        assert!(value.get("aakkk").is_none());
+        assert!(value.get("tokenCount").is_none());
+        assert!(value.get("salience").is_none());
+        assert!(value.get("createdAt").is_none());
+        assert!(value.get("updatedAt").is_none());
+    }
+
+    #[test]
+    fn with_coconut_fields_sets_and_serializes_every_field() {
+        let record = Record::new(
+            "GaiaKB_rust_2026-06-16",
+            "rust",
+            "",
+            "2026-06-16",
+            RecordKind::KnowledgeBase,
+            "facts",
+            vec![0.1],
+        )
+        .with_coconut_fields(
+            "A:entity=rust|K:tokens=3",
+            3,
+            0.85,
+            "2026-06-16T04:58:00Z",
+            "2026-06-28T09:00:00Z",
+        );
+
+        assert_eq!(record.aakkk, "A:entity=rust|K:tokens=3");
+        assert_eq!(record.token_count, 3);
+        assert_eq!(record.salience, 0.85);
+
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["aakkk"], "A:entity=rust|K:tokens=3");
+        assert_eq!(value["tokenCount"], 3);
+        // `salience` is an f32, so compare as a number within tolerance rather
+        // than against an exact f64 literal.
+        assert!((value["salience"].as_f64().unwrap() - 0.85).abs() < 1e-6);
+        assert_eq!(value["createdAt"], "2026-06-16T04:58:00Z");
+        assert_eq!(value["updatedAt"], "2026-06-28T09:00:00Z");
+        // The transient similarity score is never serialized.
+        assert!(value.get("similarityScore").is_none());
+    }
+
+    #[test]
+    fn coconut_fields_round_trip_and_tolerate_pre_coconut_documents() {
+        // A pre-Coconut document (no Coconut fields) must still deserialize,
+        // leaving the new fields at their defaults.
+        let raw = r#"{
+            "id": "GaiaKB_rust_2026-06-16",
+            "entity": "rust",
+            "date": "2026-06-16",
+            "data": "facts",
+            "dataVector": [0.1, 0.2]
+        }"#;
+        let record: Record = serde_json::from_str(raw).unwrap();
+        assert_eq!(record.aakkk, "");
+        assert_eq!(record.token_count, 0);
+        assert_eq!(record.salience, 0.0);
+
+        // A Coconut document round-trips losslessly.
+        let full = record.with_coconut_fields("A:entity=rust", 7, 0.42, "t0", "t1");
+        let json = serde_json::to_string(&full).unwrap();
+        let back: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, full);
+    }
+
+    #[test]
+    fn similarity_score_is_read_from_queries_but_never_written_back() {
+        // A semantic query result projects `similarityScore` (from Cosmos
+        // VectorDistance); it must deserialize onto the record...
+        let raw = r#"{
+            "id": "GaiaKB_rust_2026-06-16",
+            "entity": "rust",
+            "date": "2026-06-16",
+            "data": "facts",
+            "dataVector": [0.1, 0.2],
+            "similarityScore": 0.73
+        }"#;
+        let record: Record = serde_json::from_str(raw).unwrap();
+        assert!((record.similarity_score - 0.73).abs() < 1e-6);
+
+        // ...but it is transient: serializing the record never emits it, so a
+        // per-query score can never be persisted into a stored document.
+        let value = serde_json::to_value(&record).unwrap();
+        assert!(value.get("similarityScore").is_none());
     }
 }

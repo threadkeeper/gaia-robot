@@ -55,9 +55,11 @@
 //! The loop runs until the user presses Esc (or input reaches end-of-file).
 
 // Each module holds exactly one primary type plus its tests.
+mod aakkk;
 mod actions;
 mod auth;
 mod base64;
+mod coconut;
 mod connection;
 mod cosmos;
 mod daily_log;
@@ -1369,7 +1371,7 @@ thanks"#;
             actions: vec![
                 action("q1", "Web", None),
                 action("q2", "GaiaDiary", None),
-                action("q3", "UsersDataLake", None),
+                action("q3", "GaiaDataLake", None),
             ],
         };
 
