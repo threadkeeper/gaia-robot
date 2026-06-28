@@ -4,7 +4,7 @@ This is an infrastructure provisioning *script* (not part of the Rust program).
 Running it is idempotent: it creates the database and each container only if they
 do not already exist, so it is safe to re-run.
 
-It provisions seven Azure Cosmos DB for NoSQL containers:
+It provisions the Azure Cosmos DB for NoSQL containers below:
 
     Container              Business key field   Business key (uniqueness)
     --------------------   ------------------   -------------------------
@@ -15,6 +15,13 @@ It provisions seven Azure Cosmos DB for NoSQL containers:
     GaiaDiary              entity               entity + date (yyyy-mm-dd)
     GaiaWebSearchHistory   entity               entity + timestamp (ISO 8601)
     GaiaConnections        entity               entity + timestamp (ISO 8601)
+    DataLakeIndex          entity               entity + date (yyyy-mm-dd)
+
+``DataLakeIndex`` is a derived semantic index over ``GaiaDataLake``. Each entry
+stores only routing fields (source id, entity, day, source container) and a
+*half-size* 768-dimension vector at ``/indexVector`` -- not the shared
+``/dataVector`` -- with no ``/data`` payload. The Rust write path recreates it on
+first write if it is missing; provisioning it here keeps a fresh account whole.
 
 ``GaiaWebSearchHistory`` is an append-only *log* of Gaia's web searches: it
 stores the search query and its results rather than a ``/data`` text payload, so
@@ -112,7 +119,8 @@ def load_env_file(path: str = ".env") -> None:
 # --- Configuration -----------------------------------------------------------
 
 
-# The seven containers from the diagram. ``key_field`` is the business/partition
+# The seven core containers from the diagram plus the derived DataLakeIndex.
+# ``key_field`` is the business/partition
 # key: the entity tables key on "entity", the user tables key on "userId".
 # ``unique_field`` is the path made unique *within* a partition; it is "date"
 # for the daily-snapshot containers and "timestamp" for the log/ledger
@@ -125,6 +133,11 @@ class TableSpec:
     key_field: str             # business key / partition key field, e.g. "entity"
     unique_field: str = "date"  # per-partition unique path, e.g. "date" or "timestamp"
     has_data: bool = True       # whether the container stores a "/data" text payload
+    # Optional vector overrides. When None, the container uses the shared
+    # "/dataVector" path and the account-wide COSMOS_VECTOR_DIMS dimension. The
+    # derived DataLakeIndex sets these to index its half-size "/indexVector".
+    vector_path: str | None = None
+    vector_dims: int | None = None
 
 
 TABLES: list[TableSpec] = [
@@ -152,6 +165,19 @@ TABLES: list[TableSpec] = [
         unique_field="timestamp",
         has_data=False,
     ),
+    # Derived semantic index over GaiaDataLake. Each entry stores only the
+    # source id, partition, day, source container, and a *half-size* (768-d)
+    # vector at "/indexVector" -- not "/dataVector" and no "/data" payload. The
+    # Rust write path (write_data_controller) creates this on first write if it
+    # is missing; provisioning it here keeps a fresh account self-consistent.
+    TableSpec(
+        name="DataLakeIndex",
+        key_field="entity",
+        unique_field="date",
+        has_data=False,
+        vector_path="/indexVector",
+        vector_dims=768,
+    ),
 ]
 
 # Path of the vector field. Every container stores the embedding of its text
@@ -163,15 +189,15 @@ VECTOR_PATH = "/dataVector"
 # These are small pure functions so each policy is easy to read and test.
 
 
-def build_vector_embedding_policy(dimensions: int) -> dict:
-    """Vector embedding policy: declares ``/dataVector`` as the data's embedding.
+def build_vector_embedding_policy(dimensions: int, path: str = VECTOR_PATH) -> dict:
+    """Vector embedding policy: declares ``path`` as the data's embedding.
 
     Cosine distance is the usual choice for text-embedding similarity.
     """
     return {
         "vectorEmbeddings": [
             {
-                "path": VECTOR_PATH,
+                "path": path,
                 "dataType": "float32",
                 "distanceFunction": "cosine",
                 "dimensions": dimensions,
@@ -197,7 +223,8 @@ def build_full_text_policy(key_field: str, include_data: bool = True) -> dict:
 
 
 def build_indexing_policy(
-    key_field: str, unique_field: str, include_data: bool = True
+    key_field: str, unique_field: str, include_data: bool = True,
+    vector_path: str = VECTOR_PATH,
 ) -> dict:
     """Indexing policy combining the standard, vector, full-text, and composite indexes.
 
@@ -225,11 +252,11 @@ def build_indexing_policy(
         "excludedPaths": [
             # Vectors are served only by the DiskANN vector index below, so keep
             # the raw vector out of the normal range index.
-            {"path": f"{VECTOR_PATH}/*"},
+            {"path": f"{vector_path}/*"},
             {"path": '/"_etag"/?'},
         ],
         "vectorIndexes": [
-            {"path": VECTOR_PATH, "type": "diskANN"},
+            {"path": vector_path, "type": "diskANN"},
         ],
         "fullTextIndexes": full_text_indexes,
         "compositeIndexes": [
@@ -281,14 +308,18 @@ def get_client(endpoint: str) -> CosmosClient:
 def create_container(database, table: TableSpec, dimensions: int, throughput: int) -> None:
     """Create one container (if it does not already exist) with all policies."""
     print(f"  creating container '{table.name}' (key: {table.key_field}) ...")
+    # Per-table vector overrides: the derived DataLakeIndex indexes a half-size
+    # "/indexVector"; every other container uses the shared "/dataVector".
+    vector_path = table.vector_path or VECTOR_PATH
+    vector_dims = table.vector_dims or dimensions
     database.create_container_if_not_exists(
         id=table.name,
         # Partition key = business key field -> enables cheap filtering.
         partition_key=PartitionKey(path=f"/{table.key_field}"),
         indexing_policy=build_indexing_policy(
-            table.key_field, table.unique_field, table.has_data
+            table.key_field, table.unique_field, table.has_data, vector_path
         ),
-        vector_embedding_policy=build_vector_embedding_policy(dimensions),
+        vector_embedding_policy=build_vector_embedding_policy(vector_dims, vector_path),
         full_text_policy=build_full_text_policy(table.key_field, table.has_data),
         unique_key_policy=build_unique_key_policy(table.unique_field),
         offer_throughput=throughput,
@@ -300,7 +331,7 @@ def create_container(database, table: TableSpec, dimensions: int, throughput: in
 
 
 def main() -> int:
-    """Provision the database and all seven containers. Returns a process exit code."""
+    """Provision the database and all containers. Returns a process exit code."""
     # 0. Load .env (if present) so local config is picked up automatically.
     load_env_file()
 

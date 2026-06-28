@@ -32,7 +32,7 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
-use crate::cosmos::{CosmosClient, CosmosError, QueryParam};
+use crate::cosmos::{ContainerSpec, CosmosClient, CosmosError, QueryParam};
 use crate::embeddings::{EmbeddingClient, EmbeddingError};
 use crate::storage::{Record, RecordKind};
 
@@ -313,13 +313,20 @@ impl WriteDataController {
         }))
     }
 
-    /// Append `chunk` to today's record for `(container, entity)`, refresh its
+    /// Merge `chunk` into today's record for `(container, entity)`, refresh its
     /// embedding, and write it back — creating the record on the first write of
     /// the day. For `GaiaDataLake`, also sync the `DataLakeIndex` entry.
     ///
+    /// DataLake containers store a merge-friendly JSON
+    /// [`crate::daily_log::DailyLog`]: the chunk is merged in as a keyed turn, so
+    /// re-sending the same turn never duplicates it within the day. The embedding
+    /// (and the text shown to the LLM) is taken from the log's readable
+    /// transcript, not the JSON. Every other writer store keeps the simple
+    /// append-and-embed flat-text body.
+    ///
     /// `now_rfc3339` is the current instant as `YYYY-MM-DDTHH:MM:SSZ` (pass
     /// [`crate::prompt::now_rfc3339`] in production; a fixed value in tests). The
-    /// date portion keys the record; the time portion stamps the appended line.
+    /// date portion keys the record; the time portion stamps the merged turn.
     pub fn upsert_daily(
         &self,
         container: &str,
@@ -350,11 +357,37 @@ impl WriteDataController {
             .and_then(|r| r.metadata.get(CONTENT_HASH_KEY).cloned());
         let created = existing.is_none();
 
-        // 2. Append the new chunk to the day's plain-text log.
-        let new_data = append_timestamped(&previous_data, chunk, time_marker);
+        // 2. Build the day's new body and the text to embed.
+        //
+        // DataLake records (e.g. `GaiaDataLake`) store a merge-friendly JSON
+        // daily log so a turn can be merged in without ever duplicating one: the
+        // log dedups by content key, and the *stored* form is JSON while the
+        // *embedded* (and displayed) form is the readable transcript. Every
+        // other writer store keeps the simple append-and-embed flat-text body.
+        let (new_data, embed_text) = if is_datalake_container(container) {
+            let mut log = crate::daily_log::DailyLog::parse(&previous_data);
+            // A duplicate turn changes nothing: skip the embed and the write
+            // entirely so the day's record is never rewritten for a replay.
+            if !log.merge(time_marker, chunk) {
+                return Ok(WriteOutcome {
+                    container: container.to_string(),
+                    id,
+                    action: WriteAction::Unchanged,
+                    data_bytes: previous_data.len(),
+                    vector_dims: 0,
+                    index_synced: false,
+                    index_dims: 0,
+                });
+            }
+            (log.to_json(), log.to_transcript())
+        } else {
+            let appended = append_timestamped(&previous_data, chunk, time_marker);
+            // Flat-text stores embed exactly what they store.
+            (appended.clone(), appended)
+        };
         let new_hash = content_hash(&new_data);
 
-        // M1: idempotent replay — identical content, nothing to do.
+        // M1: idempotent replay — identical stored content, nothing to do.
         if Some(&new_hash) == previous_hash.as_ref() {
             return Ok(WriteOutcome {
                 container: container.to_string(),
@@ -367,8 +400,8 @@ impl WriteDataController {
             });
         }
 
-        // 3. Re-embed the whole day's text once (1536-d).
-        let full_vector = embedder.embed(&new_data)?;
+        // 3. Re-embed the day once over its readable transcript (1536-d).
+        let full_vector = embedder.embed(&embed_text)?;
 
         // 4. Write the record back with the refreshed vector + content hash.
         let record = build_record(
@@ -397,12 +430,18 @@ impl WriteDataController {
             };
             // The DataLakeIndex container is derived (not provisioned alongside
             // the seven primary stores), so create it on first write if missing
-            // rather than failing the turn's persistence with a 404.
+            // rather than failing the turn's persistence with a 404. The spec
+            // mirrors how `infra/cosmos_create.py` would provision it: an
+            // `/entity` partition, a per-day unique key, and a DiskANN vector
+            // index over the half-size `/indexVector`.
+            let index_spec = ContainerSpec::new(DATALAKE_INDEX_PARTITION_PATH)
+                .with_unique_key("/date")
+                .with_vector("/indexVector", self.index_dims);
             cosmos.upsert_doc_creating_container(
                 DATALAKE_INDEX_CONTAINER,
                 entity,
                 &index_doc,
-                DATALAKE_INDEX_PARTITION_PATH,
+                &index_spec,
             )?;
             index_synced = true;
         }
@@ -508,6 +547,12 @@ const CONTENT_HASH_KEY: &str = "contentHash";
 /// `true` when `container` is one of the append-and-re-embed [`WRITER_CONTAINERS`].
 pub fn is_writer_container(container: &str) -> bool {
     WRITER_CONTAINERS.contains(&container)
+}
+
+/// `true` for the DataLake snapshot containers, whose daily records are stored
+/// as a merge-friendly JSON [`crate::daily_log::DailyLog`] rather than flat text.
+pub fn is_datalake_container(container: &str) -> bool {
+    container.contains("DataLake")
 }
 
 /// `true` for the user-partitioned (`/userId`) snapshot containers.
@@ -919,15 +964,15 @@ mod tests {
         // When re-running today's write would reproduce byte-identical content,
         // the stored content hash matches and the controller short-circuits as
         // Unchanged — making only the single point-read call (no embed, no
-        // upsert). We seed an existing record whose stored hash equals the hash
-        // of the text the append will produce.
+        // upsert). We seed an existing flat-text store (GaiaKB) whose stored hash
+        // equals the hash of the text the append will produce.
         let chunk = "User: hi\nGaia: hello";
         // The append seeds an empty log, so replaying yields exactly this text.
         let final_data = append_timestamped("", chunk, "09:00:00Z");
         let hash = content_hash(&final_data);
         let existing = serde_json::json!({
-            "id": "UsersDataLake|threadkeeper|2026-06-27",
-            "userId": "threadkeeper",
+            "id": "GaiaKB|threadkeeper|2026-06-27",
+            "entity": "threadkeeper",
             "date": "2026-06-27",
             "data": "",
             "metadata": { "contentHash": hash },
@@ -943,18 +988,97 @@ mod tests {
         let controller = WriteDataController::new(Some(cosmos), Some(embedder), 4);
 
         let outcome = controller
-            .upsert_daily(
-                "UsersDataLake",
-                "threadkeeper",
-                "2026-06-27T09:00:00Z",
-                chunk,
-            )
+            .upsert_daily("GaiaKB", "threadkeeper", "2026-06-27T09:00:00Z", chunk)
             .expect("the replay path succeeds without writing");
 
         assert_eq!(outcome.action, WriteAction::Unchanged);
         assert_eq!(outcome.vector_dims, 0);
         assert!(!outcome.index_synced);
         cosmos_handle.join().expect("cosmos mock thread joins");
+    }
+
+    #[test]
+    fn upsert_daily_skips_a_duplicate_datalake_turn_without_writing() {
+        // A GaiaDataLake day already contains this exact turn. Merging it again
+        // must dedup it to a no-op: only the point read happens (no embed, no
+        // upsert), and the outcome is Unchanged. This proves the JSON daily log
+        // never duplicates a conversation turn within the day.
+        let mut log = crate::daily_log::DailyLog::default();
+        log.merge("09:00:00Z", "User: hi\nGaia: hello");
+        let existing = serde_json::json!({
+            "id": "GaiaDataLake|threadkeeper|2026-06-27",
+            "entity": "threadkeeper",
+            "date": "2026-06-27",
+            "data": log.to_json(),
+            "metadata": { "contentHash": "any-prior-hash" },
+        })
+        .to_string();
+        // The duplicate path reads once and returns; no embed, no upsert.
+        let (cosmos_url, cosmos_handle) =
+            crate::test_http::spawn_mock_http_sequence(vec![("200 OK".to_string(), existing)]);
+        let cosmos = CosmosClient::new(cosmos_url, "GaiaDB", "token");
+        // An unroutable embedder proves it is never called for a duplicate.
+        let embedder = EmbeddingClient::for_test("http://127.0.0.1:9/".to_string());
+        let controller = WriteDataController::new(Some(cosmos), Some(embedder), 4);
+
+        let outcome = controller
+            .upsert_daily(
+                DATALAKE_CONTAINER,
+                "threadkeeper",
+                "2026-06-27T10:00:00Z",
+                "User: hi\nGaia: hello",
+            )
+            .expect("the duplicate path succeeds without writing");
+
+        assert_eq!(outcome.action, WriteAction::Unchanged);
+        assert_eq!(outcome.vector_dims, 0);
+        assert!(!outcome.index_synced);
+        cosmos_handle.join().expect("cosmos mock thread joins");
+    }
+
+    #[test]
+    fn upsert_daily_merges_a_new_datalake_turn_into_the_day() {
+        // A GaiaDataLake day already holds one turn; a *different* turn merges in
+        // (Appended), re-embeds the day's transcript, and re-syncs the index.
+        // Cosmos serves read -> upsert -> index; the embedder serves one vector.
+        let mut log = crate::daily_log::DailyLog::default();
+        log.merge("09:00:00Z", "User: hi\nGaia: hello");
+        let existing = serde_json::json!({
+            "id": "GaiaDataLake|threadkeeper|2026-06-27",
+            "entity": "threadkeeper",
+            "date": "2026-06-27",
+            "data": log.to_json(),
+            "metadata": { "contentHash": "stale-hash" },
+        })
+        .to_string();
+        let (cosmos_url, cosmos_handle) = crate::test_http::spawn_mock_http_sequence(vec![
+            ("200 OK".to_string(), existing),
+            ("200 OK".to_string(), "{}".to_string()),
+            ("201 Created".to_string(), "{}".to_string()),
+        ]);
+        let (embed_url, embed_handle) = crate::test_http::spawn_mock_http(
+            "200 OK",
+            r#"{"data":[{"index":0,"embedding":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}]}"#,
+        );
+        let cosmos = CosmosClient::new(cosmos_url, "GaiaDB", "token");
+        let embedder = EmbeddingClient::for_test(embed_url);
+        let controller = WriteDataController::new(Some(cosmos), Some(embedder), 4);
+
+        let outcome = controller
+            .upsert_daily(
+                DATALAKE_CONTAINER,
+                "threadkeeper",
+                "2026-06-27T09:05:00Z",
+                "User: bye\nGaia: see you",
+            )
+            .expect("the merge path succeeds against the mocks");
+
+        assert_eq!(outcome.action, WriteAction::Appended);
+        assert_eq!(outcome.vector_dims, 8);
+        assert!(outcome.index_synced);
+        assert_eq!(outcome.index_dims, 4);
+        cosmos_handle.join().expect("cosmos mock thread joins");
+        embed_handle.join().expect("embed mock thread joins");
     }
 
     #[test]

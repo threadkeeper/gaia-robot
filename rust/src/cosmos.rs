@@ -118,6 +118,21 @@ impl QueryParam {
 /// that (45 minutes) guarantees an in-flight request never uses a dead token.
 const MANAGED_IDENTITY_TTL_SECS: u64 = 45 * 60;
 
+/// Default ARM endpoint. Overridable (via `COSMOS_ARM_ENDPOINT`) so tests can
+/// point control-plane calls at a local mock instead of the real cloud.
+const DEFAULT_ARM_ENDPOINT: &str = "https://management.azure.com";
+
+/// API version for the Cosmos DB control-plane (ARM) container PUT. `2024-11-15`
+/// supports vector-search and full-text container policies.
+const ARM_API_VERSION: &str = "2024-11-15";
+
+/// How many times [`CosmosClient::upsert_doc_creating_container`] retries the
+/// upsert after creating a container, to absorb brief async control-plane delay.
+const CREATE_RETRY_ATTEMPTS: u32 = 8;
+
+/// Pause between create-then-upsert retries.
+const CREATE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// A managed-identity token plus the instant after which it must be re-minted.
 #[derive(Clone)]
 struct CachedToken {
@@ -200,6 +215,69 @@ impl Credential {
     }
 }
 
+/// Control-plane (Azure Resource Manager) configuration that lets the client
+/// **create containers** on demand.
+///
+/// Cosmos's *data-plane* REST API rejects container creation for any AAD token
+/// (there is no data-plane RBAC action for it), so a missing container can only
+/// be created through ARM. When this is present, [`CosmosClient`] issues a
+/// management PUT (authenticated with a `management.azure.com` token) instead of
+/// the data-plane `POST /colls`, which the host's managed identity is allowed to
+/// do once it holds a control-plane role such as *Cosmos DB Operator*.
+#[derive(Clone)]
+struct ArmConfig {
+    /// Full ARM resource id of the Cosmos account, e.g.
+    /// `/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.DocumentDB/databaseAccounts/<acct>`.
+    account_resource_id: String,
+    /// ARM base URL (defaults to [`DEFAULT_ARM_ENDPOINT`]; overridable for tests).
+    endpoint: String,
+    /// Per-container throughput (RU/s) to request when creating a container.
+    throughput: u32,
+    /// Optional pre-minted management token. When absent, a token is minted from
+    /// the host's managed identity at call time. Used by tests/dev to avoid IMDS.
+    token_override: Option<String>,
+}
+
+/// Describes the shape of a container the client may create on first write.
+///
+/// Mirrors the policies `infra/cosmos_create.py` provisions so an
+/// auto-created container is indistinguishable from a pre-provisioned one:
+/// the partition key, an optional per-partition unique key, and an optional
+/// vector index over a named path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContainerSpec {
+    /// Partition-key path, e.g. `/entity`.
+    pub partition_key_path: String,
+    /// Optional per-partition unique-key path, e.g. `/date`.
+    pub unique_key_path: Option<String>,
+    /// Optional `(vector_path, dimensions)` for a DiskANN vector index, e.g.
+    /// (`/indexVector`, 768).
+    pub vector: Option<(String, usize)>,
+}
+
+impl ContainerSpec {
+    /// A minimal spec with just a partition key (no unique key, no vector index).
+    pub fn new(partition_key_path: impl Into<String>) -> Self {
+        Self {
+            partition_key_path: partition_key_path.into(),
+            unique_key_path: None,
+            vector: None,
+        }
+    }
+
+    /// Add a per-partition unique-key path (e.g. `/date`).
+    pub fn with_unique_key(mut self, path: impl Into<String>) -> Self {
+        self.unique_key_path = Some(path.into());
+        self
+    }
+
+    /// Add a DiskANN vector index over `path` with `dims` dimensions.
+    pub fn with_vector(mut self, path: impl Into<String>, dims: usize) -> Self {
+        self.vector = Some((path.into(), dims));
+        self
+    }
+}
+
 /// A minimal, immutable client bound to one Cosmos account + database.
 ///
 /// Construct with [`CosmosClient::from_env`] and call [`CosmosClient::query`],
@@ -213,6 +291,11 @@ pub struct CosmosClient {
     database: String,
     /// How the client authenticates to the Cosmos data plane.
     cred: Credential,
+    /// Control-plane config enabling on-demand container creation via ARM.
+    /// `None` when no `COSMOS_ACCOUNT_RESOURCE_ID` is configured (the client then
+    /// falls back to the data-plane create path, which only works with a master
+    /// key in local dev).
+    arm: Option<ArmConfig>,
 }
 
 // Hand-written so the bearer token (a secret) is never printed in logs or
@@ -244,6 +327,7 @@ impl CosmosClient {
             endpoint: normalise_endpoint(endpoint.into()),
             database: database.into(),
             cred: Credential::Static(token.into()),
+            arm: None,
         }
     }
 
@@ -263,6 +347,7 @@ impl CosmosClient {
                 resource: resource.into(),
                 cache: Arc::new(Mutex::new(None)),
             },
+            arm: None,
         }
     }
 
@@ -300,17 +385,50 @@ impl CosmosClient {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "gaia".to_string());
 
-        match resolve_env("COSMOS_AAD_TOKEN").filter(|token| !token.is_empty()) {
+        let client = match resolve_env("COSMOS_AAD_TOKEN").filter(|token| !token.is_empty()) {
             // A pre-minted token was supplied (local dev): use it directly.
-            Some(token) => Ok(Some(Self::new(endpoint, database, token))),
+            Some(token) => Self::new(endpoint, database, token),
             // No token: authenticate with the host's managed identity (SAMI).
             None => {
                 let resource = cosmos_token_resource(&endpoint);
-                Ok(Some(Self::with_managed_identity(
-                    endpoint, database, resource,
-                )))
+                Self::with_managed_identity(endpoint, database, resource)
             }
+        };
+
+        // Attach control-plane (ARM) config when a Cosmos account resource id is
+        // configured. This is what lets the app create a missing container on
+        // first write: with it, creation goes through ARM (which the managed
+        // identity can do once granted a control-plane role) rather than the
+        // data plane (which rejects container creation for any AAD token).
+        Ok(Some(client.with_arm_from_env()))
+    }
+
+    /// Attach ARM control-plane config read from the environment, when present.
+    ///
+    /// Reads `COSMOS_ACCOUNT_RESOURCE_ID` (the account's full ARM resource id).
+    /// Without it the client keeps `arm = None` and falls back to the data-plane
+    /// create path. Optional overrides: `COSMOS_ARM_ENDPOINT` (ARM base URL),
+    /// `COSMOS_THROUGHPUT` (RU/s for created containers, default 400), and
+    /// `COSMOS_ARM_TOKEN` (a pre-minted management token for dev/test).
+    fn with_arm_from_env(mut self) -> Self {
+        if let Some(account_resource_id) =
+            resolve_env("COSMOS_ACCOUNT_RESOURCE_ID").filter(|value| !value.is_empty())
+        {
+            let endpoint = resolve_env("COSMOS_ARM_ENDPOINT")
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| DEFAULT_ARM_ENDPOINT.to_string());
+            let throughput = resolve_env("COSMOS_THROUGHPUT")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(400);
+            let token_override = resolve_env("COSMOS_ARM_TOKEN").filter(|value| !value.is_empty());
+            self.arm = Some(ArmConfig {
+                account_resource_id: account_resource_id.trim_end_matches('/').to_string(),
+                endpoint: endpoint.trim_end_matches('/').to_string(),
+                throughput,
+                token_override,
+            });
         }
+        self
     }
 
     /// The database this client targets.
@@ -474,33 +592,122 @@ impl CosmosClient {
     /// not exist yet.
     ///
     /// Behaves exactly like [`upsert_doc`](CosmosClient::upsert_doc), but when
-    /// the upsert fails because the target *container* is missing (HTTP 404),
-    /// it creates the container with a Hash partition key on `partition_key_path`
-    /// and retries the upsert once. This makes the write self-healing for derived
-    /// containers (such as `DataLakeIndex`) that may not have been provisioned
-    /// ahead of time, so the first write of their lifetime creates them rather
-    /// than failing the whole turn's persistence.
+    /// the upsert fails because the target *container* is missing (HTTP 404), it
+    /// creates the container from `spec` and retries the upsert. This makes the
+    /// write self-healing for derived containers (such as `DataLakeIndex`) that
+    /// may not have been provisioned ahead of time, so the first write of their
+    /// lifetime creates them rather than failing the whole turn's persistence.
+    ///
+    /// Creation goes through the **control plane** (ARM) when the client is
+    /// configured with an account resource id ([`with_arm_from_env`]); the
+    /// host's managed identity can do this once it holds a control-plane role
+    /// such as *Cosmos DB Operator*. Without ARM config it falls back to the
+    /// data-plane create path (which only works with a master key in dev).
     ///
     /// `partition_value` must equal the document's partition field, and
-    /// `partition_key_path` is the leading-slash path that field lives at
+    /// `spec.partition_key_path` is the leading-slash path that field lives at
     /// (e.g. `/entity`); the two must agree for Cosmos to accept the write.
+    ///
+    /// [`with_arm_from_env`]: CosmosClient::with_arm_from_env
     pub fn upsert_doc_creating_container<T: Serialize>(
         &self,
         container: &str,
         partition_value: &str,
         doc: &T,
-        partition_key_path: &str,
+        spec: &ContainerSpec,
     ) -> Result<(), CosmosError> {
         match self.upsert_doc(container, partition_value, doc) {
             Ok(()) => Ok(()),
             // A 404 from an *upsert* means the container is absent (a missing
-            // document would simply be inserted). Create it, then retry once.
+            // document would simply be inserted). Create it, then retry.
             Err(err) if err.is_not_found() => {
-                self.create_container_if_missing(container, partition_key_path)?;
-                self.upsert_doc(container, partition_value, doc)
+                self.ensure_container(container, spec)?;
+                // Control-plane creation can be briefly asynchronous: the PUT may
+                // return before the container is queryable. Retry the upsert a
+                // few times, pausing between attempts, so a freshly created
+                // container is written on this same turn ("first try").
+                let mut last = err;
+                for attempt in 0..CREATE_RETRY_ATTEMPTS {
+                    if attempt > 0 {
+                        std::thread::sleep(CREATE_RETRY_DELAY);
+                    }
+                    match self.upsert_doc(container, partition_value, doc) {
+                        Ok(()) => return Ok(()),
+                        Err(e) if e.is_not_found() => last = e,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(last)
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// Create `container` from `spec`, choosing the control-plane (ARM) path when
+    /// configured and otherwise the data-plane path.
+    fn ensure_container(&self, container: &str, spec: &ContainerSpec) -> Result<(), CosmosError> {
+        match &self.arm {
+            Some(arm) => self.create_container_via_arm(arm, container, spec),
+            None => self.create_container_if_missing(container, &spec.partition_key_path),
+        }
+    }
+
+    /// Create `container` through the Azure Resource Manager control plane.
+    ///
+    /// Issues `PUT {arm}/{account}/sqlDatabases/{db}/containers/{name}` with the
+    /// partition key, optional unique key, and optional DiskANN vector index
+    /// from `spec`. Authentication uses a `management.azure.com` bearer token
+    /// (the managed identity must hold a control-plane role such as *Cosmos DB
+    /// Operator*). Creation is idempotent: a `409 Conflict` (the container
+    /// already exists) is treated as success, as is `200/201/202`.
+    fn create_container_via_arm(
+        &self,
+        arm: &ArmConfig,
+        container: &str,
+        spec: &ContainerSpec,
+    ) -> Result<(), CosmosError> {
+        let url = arm_container_url(
+            &arm.endpoint,
+            &arm.account_resource_id,
+            &self.database,
+            container,
+        );
+        let body = serde_json::to_vec(&arm_container_body(container, spec, arm.throughput))
+            .map_err(|e| CosmosError::Decode(e.to_string()))?;
+        let token = self.arm_token(arm)?;
+
+        let result = ureq::request("PUT", &url)
+            .timeout(crate::llm::HTTP_TIMEOUT)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Content-Type", "application/json")
+            .send_bytes(&body);
+
+        match result {
+            // 200/201 = created, 202 = accepted (async). All mean "creation is
+            // underway or done"; the caller's retry loop absorbs async delay.
+            Ok(_) => Ok(()),
+            // The container already exists — exactly the state we want.
+            Err(ureq::Error::Status(409, _)) => Ok(()),
+            Err(err) => Err(map_ureq_error(err)),
+        }
+    }
+
+    /// Resolve a `management.azure.com` bearer token for control-plane calls.
+    ///
+    /// Prefers an explicit `token_override` (set from `COSMOS_ARM_TOKEN` for
+    /// dev/test), otherwise mints one from the host's managed identity.
+    fn arm_token(&self, arm: &ArmConfig) -> Result<String, CosmosError> {
+        if let Some(token) = &arm.token_override {
+            return Ok(token.clone());
+        }
+        crate::llm::managed_identity_token("https://management.azure.com/").ok_or_else(|| {
+            CosmosError::Token(
+                "could not obtain a management (ARM) token to create a Cosmos container \
+                 (is the host's managed identity granted a control-plane role such as \
+                 'Cosmos DB Operator' on the account?)"
+                    .to_string(),
+            )
+        })
     }
 
     /// Create `container` in the target database if it does not already exist.
@@ -637,6 +844,69 @@ impl CosmosClient {
 fn docs_url(endpoint: &str, database: &str, container: &str) -> String {
     // `endpoint` is guaranteed to end with '/' by `CosmosClient::new`.
     format!("{endpoint}dbs/{database}/colls/{container}/docs")
+}
+
+/// Build the ARM control-plane URL for creating/updating one SQL container.
+///
+/// `arm_endpoint` and `account_resource_id` must have no trailing slash (the
+/// constructor trims them). Produces, e.g.
+/// `https://management.azure.com/subscriptions/.../databaseAccounts/acct/sqlDatabases/gaia/containers/DataLakeIndex?api-version=2024-11-15`.
+fn arm_container_url(
+    arm_endpoint: &str,
+    account_resource_id: &str,
+    database: &str,
+    container: &str,
+) -> String {
+    format!(
+        "{arm_endpoint}{account_resource_id}/sqlDatabases/{database}/containers/{container}?api-version={ARM_API_VERSION}"
+    )
+}
+
+/// Build the ARM request body for creating a SQL container from a [`ContainerSpec`].
+///
+/// Mirrors the policies `infra/cosmos_create.py` provisions: a Hash partition
+/// key, an optional per-partition unique key, and an optional DiskANN vector
+/// index (with the vector path excluded from the normal range index). Kept a
+/// pure function so the JSON shape is unit-testable without a network call.
+fn arm_container_body(container: &str, spec: &ContainerSpec, throughput: u32) -> serde_json::Value {
+    // Range-index everything except the vector path (served only by DiskANN).
+    let mut excluded_paths = vec![serde_json::json!({ "path": "/\"_etag\"/?" })];
+    let mut indexing = serde_json::json!({
+        "indexingMode": "consistent",
+        "automatic": true,
+        "includedPaths": [{ "path": "/*" }],
+    });
+
+    let mut resource = serde_json::json!({
+        "id": container,
+        "partitionKey": { "paths": [spec.partition_key_path], "kind": "Hash" },
+    });
+
+    if let Some((vector_path, dims)) = &spec.vector {
+        resource["vectorEmbeddingPolicy"] = serde_json::json!({
+            "vectorEmbeddings": [{
+                "path": vector_path,
+                "dataType": "float32",
+                "distanceFunction": "cosine",
+                "dimensions": dims,
+            }]
+        });
+        excluded_paths.push(serde_json::json!({ "path": format!("{vector_path}/*") }));
+        indexing["vectorIndexes"] = serde_json::json!([{ "path": vector_path, "type": "diskANN" }]);
+    }
+    indexing["excludedPaths"] = serde_json::Value::Array(excluded_paths);
+    resource["indexingPolicy"] = indexing;
+
+    if let Some(unique) = &spec.unique_key_path {
+        resource["uniqueKeyPolicy"] = serde_json::json!({ "uniqueKeys": [{ "paths": [unique] }] });
+    }
+
+    serde_json::json!({
+        "properties": {
+            "resource": resource,
+            "options": { "throughput": throughput },
+        }
+    })
 }
 
 /// Normalise a Cosmos account URL to end with exactly one `/`.
@@ -1258,7 +1528,7 @@ mod tests {
                 "DataLakeIndex",
                 "e",
                 &serde_json::json!({ "id": "DataLakeIndex|e|2026-06-27", "entity": "e" }),
-                "/entity",
+                &ContainerSpec::new("/entity"),
             )
             .expect("upsert succeeds when the container already exists");
         handle.join().expect("mock server thread joins");
@@ -1280,7 +1550,7 @@ mod tests {
                 "DataLakeIndex",
                 "e",
                 &serde_json::json!({ "id": "DataLakeIndex|e|2026-06-27", "entity": "e" }),
-                "/entity",
+                &ContainerSpec::new("/entity"),
             )
             .expect("a missing container is created and the upsert retried");
         handle.join().expect("mock server thread joins");
@@ -1295,6 +1565,124 @@ mod tests {
         client
             .create_container_if_missing("DataLakeIndex", "/entity")
             .expect("an existing container (409) is treated as success");
+        handle.join().expect("mock server thread joins");
+    }
+
+    /// Build a client whose ARM (control-plane) endpoint points at `base`, with a
+    /// pre-minted token override so no managed-identity endpoint is needed.
+    fn arm_client(base: &str) -> CosmosClient {
+        let mut client = CosmosClient::new(base, "gaia", "tok");
+        client.arm = Some(ArmConfig {
+            account_resource_id:
+                "/subscriptions/s/resourceGroups/r/providers/Microsoft.DocumentDB/databaseAccounts/a"
+                    .to_string(),
+            endpoint: base.trim_end_matches('/').to_string(),
+            throughput: 400,
+            token_override: Some("mgmt-tok".to_string()),
+        });
+        client
+    }
+
+    #[test]
+    fn arm_container_url_builds_the_management_path() {
+        let url = arm_container_url(
+            "https://management.azure.com",
+            "/subscriptions/s/resourceGroups/r/providers/Microsoft.DocumentDB/databaseAccounts/a",
+            "gaia",
+            "DataLakeIndex",
+        );
+        assert_eq!(
+            url,
+            "https://management.azure.com/subscriptions/s/resourceGroups/r/providers/\
+             Microsoft.DocumentDB/databaseAccounts/a/sqlDatabases/gaia/containers/\
+             DataLakeIndex?api-version=2024-11-15"
+        );
+    }
+
+    #[test]
+    fn arm_container_body_includes_vector_unique_key_and_throughput() {
+        let spec = ContainerSpec::new("/entity")
+            .with_unique_key("/date")
+            .with_vector("/indexVector", 768);
+        let body = arm_container_body("DataLakeIndex", &spec, 400);
+        let resource = &body["properties"]["resource"];
+
+        assert_eq!(resource["id"], "DataLakeIndex");
+        assert_eq!(resource["partitionKey"]["paths"][0], "/entity");
+        assert_eq!(
+            resource["uniqueKeyPolicy"]["uniqueKeys"][0]["paths"][0],
+            "/date"
+        );
+        let embedding = &resource["vectorEmbeddingPolicy"]["vectorEmbeddings"][0];
+        assert_eq!(embedding["path"], "/indexVector");
+        assert_eq!(embedding["dimensions"], 768);
+        assert_eq!(
+            resource["indexingPolicy"]["vectorIndexes"][0]["path"],
+            "/indexVector"
+        );
+        // The vector path is excluded from the normal range index.
+        let excluded = resource["indexingPolicy"]["excludedPaths"]
+            .as_array()
+            .expect("excludedPaths array");
+        assert!(excluded
+            .iter()
+            .any(|entry| entry["path"] == "/indexVector/*"));
+        assert_eq!(body["properties"]["options"]["throughput"], 400);
+    }
+
+    #[test]
+    fn arm_container_body_minimal_omits_vector_and_unique_key() {
+        let body = arm_container_body("Plain", &ContainerSpec::new("/entity"), 400);
+        let resource = &body["properties"]["resource"];
+        assert_eq!(resource["partitionKey"]["paths"][0], "/entity");
+        assert!(resource.get("vectorEmbeddingPolicy").is_none());
+        assert!(resource.get("uniqueKeyPolicy").is_none());
+        assert!(resource["indexingPolicy"].get("vectorIndexes").is_none());
+    }
+
+    #[test]
+    fn create_container_via_arm_treats_201_as_success() {
+        let (base, handle) = spawn_mock_cosmos("201 Created", "{}");
+        let client = arm_client(&base);
+        let arm = client.arm.clone().expect("arm configured");
+
+        client
+            .create_container_via_arm(&arm, "DataLakeIndex", &ContainerSpec::new("/entity"))
+            .expect("a 201 from ARM means the container was created");
+        handle.join().expect("mock server thread joins");
+    }
+
+    #[test]
+    fn create_container_via_arm_treats_409_as_success() {
+        let (base, handle) = spawn_mock_cosmos("409 Conflict", "{\"code\":\"Conflict\"}");
+        let client = arm_client(&base);
+        let arm = client.arm.clone().expect("arm configured");
+
+        client
+            .create_container_via_arm(&arm, "DataLakeIndex", &ContainerSpec::new("/entity"))
+            .expect("an existing container (409) is treated as success");
+        handle.join().expect("mock server thread joins");
+    }
+
+    #[test]
+    fn upsert_doc_creating_container_uses_arm_when_configured() {
+        // 1) upsert → 404 (missing); 2) ARM PUT create → 201; 3) retry upsert →
+        // 201. With ARM configured the create goes through the control plane.
+        let (base, handle) = spawn_mock_cosmos_sequence(vec![
+            ("404 Not Found", "{\"code\":\"NotFound\"}"),
+            ("201 Created", "{}"),
+            ("201 Created", "{}"),
+        ]);
+        let client = arm_client(&base);
+
+        client
+            .upsert_doc_creating_container(
+                "DataLakeIndex",
+                "e",
+                &serde_json::json!({ "id": "DataLakeIndex|e|2026-06-27", "entity": "e" }),
+                &ContainerSpec::new("/entity").with_vector("/indexVector", 768),
+            )
+            .expect("a missing container is created via ARM and the upsert retried");
         handle.join().expect("mock server thread joins");
     }
 

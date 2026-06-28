@@ -271,7 +271,16 @@ fn render_one_record(md: &mut String, record: &Value) {
             let primary_key = primary.as_ref().map(|(key, _)| *key).unwrap_or("");
             match &primary {
                 Some((_, text)) => {
-                    let _ = writeln!(md, "- {}", collapse_ws(text));
+                    // `GaiaDataLake` rows store a JSON daily log; render its
+                    // readable transcript rather than leaking JSON syntax into
+                    // the grounding context. Any non-daily-log body is untouched.
+                    let rendered = if primary_key == "data" {
+                        crate::daily_log::transcript_if_daily_log(text)
+                            .unwrap_or_else(|| text.clone())
+                    } else {
+                        text.clone()
+                    };
+                    let _ = writeln!(md, "- {}", collapse_ws(&rendered));
                 }
                 None => {
                     let _ = writeln!(md, "- (no text payload)");

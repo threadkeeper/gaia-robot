@@ -60,6 +60,7 @@ mod auth;
 mod base64;
 mod connection;
 mod cosmos;
+mod daily_log;
 mod diary;
 mod embeddings;
 mod engine;

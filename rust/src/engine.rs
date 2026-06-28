@@ -126,7 +126,7 @@ pub struct WriteStatus {
     /// size), or the underlying error on failure.
     pub detail: String,
     /// Per-operation write latency — one [`WriteTiming`] for every Cosmos write
-    /// this turn (the `UsersDataLake` exchange record, each planned store
+    /// this turn (the `GaiaDataLake` exchange record, each planned store
     /// upsert, and each connection-ledger delta), in execution order, with the
     /// actual wall-clock milliseconds it took. Lets the UI show the real latency
     /// of every write rather than a single aggregate. Omitted when empty.
@@ -141,7 +141,7 @@ pub struct WriteStatus {
 /// this measures the real network round-trip of the write itself.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WriteTiming {
-    /// A short label for the write, e.g. `UsersDataLake`, `Upsert GaiaDiary`,
+    /// A short label for the write, e.g. `GaiaDataLake`, `Upsert GaiaDiary`,
     /// or `GaiaConnections delta`.
     #[serde(rename = "type")]
     pub label: String,
@@ -617,8 +617,8 @@ impl Engine {
                     .as_ref()
                     .map(crate::push_data_controller::time_actions)
                     .unwrap_or_default();
-                // Persist this completed exchange to the user's personal data
-                // lake (append-and-re-embed). Writes are mandatory: the returned
+                // Persist this completed exchange to Gaia's shared data
+                // lake (merge-and-re-embed). Writes are mandatory: the returned
                 // status is surfaced to the user so a Cosmos connection or write
                 // failure is visible rather than silently dropped. Each write is
                 // timed and reported live through the same reporter.
@@ -733,14 +733,15 @@ impl Engine {
         (result.context, result.searches, actions)
     }
 
-    /// Persist a completed exchange to the user's personal data lake, returning
-    /// a [`WriteStatus`] the caller surfaces to the user.
+    /// Persist a completed exchange to Gaia's shared data lake, returning a
+    /// [`WriteStatus`] the caller surfaces to the user.
     ///
-    /// Appends a single `User: … / Gaia: …` chunk to today's `UsersDataLake`
+    /// Merges a single `User: … / Gaia: …` chunk into today's `GaiaDataLake`
     /// record for `user_id` through the shared [`WriteDataController`], which
-    /// reads the day's record, appends, re-embeds the whole day once, and writes
+    /// reads the day's JSON daily log, merges the turn (deduping by content so a
+    /// replay never duplicates), re-embeds the day's transcript once, and writes
     /// it back (creating it on the first turn of the day). `user_id` is the
-    /// `/userId` partition, so every write stays scoped to its owner.
+    /// `/entity` partition, so every write stays scoped to its owner.
     ///
     /// Writes are **mandatory**: unlike the rest of the engine's best-effort
     /// degradation, a missing/offline writer or a Cosmos read/write failure is
@@ -785,10 +786,10 @@ impl Engine {
         reporter.info("persist", "Persisting turn to Cosmos…".to_string());
 
         // One readable line capturing both sides of the exchange. The controller
-        // timestamps and appends it under today's record.
+        // timestamps and merges it into today's record.
         let chunk = format!("User: {input}\nGaia: {reply}");
         let users_start = Instant::now();
-        let users_result = writer.upsert_daily("UsersDataLake", user_id, now_rfc3339, &chunk);
+        let users_result = writer.upsert_daily("GaiaDataLake", user_id, now_rfc3339, &chunk);
         let users_ms = users_start.elapsed().as_secs_f64() * 1000.0;
         let users_status = match users_result {
             Ok(outcome) => {
@@ -805,7 +806,7 @@ impl Engine {
                 WriteStatus {
                     ok: true,
                     detail: format!(
-                        "saved to Cosmos UsersDataLake: {} ({}, {} bytes, {:.1} ms)",
+                        "saved to Cosmos GaiaDataLake: {} ({}, {} bytes, {:.1} ms)",
                         outcome.id,
                         outcome.action.label(),
                         outcome.data_bytes,
@@ -828,7 +829,7 @@ impl Engine {
         // live process-log shows it the moment it lands (or fails).
         reporter.persist_write(&users_status, users_ms);
 
-        // The personal data lake is the always-on record of the exchange. If it
+        // The shared data lake is the always-on record of the exchange. If it
         // failed (typically a connection problem), the shared-store upserts would
         // fail the same way, so report that one error rather than piling on — but
         // still carry its measured latency so the UI shows the failed write.
@@ -837,7 +838,7 @@ impl Engine {
                 ok: false,
                 detail: users_status.detail,
                 operations: vec![WriteTiming {
-                    label: "UsersDataLake".to_string(),
+                    label: "GaiaDataLake".to_string(),
                     ms: users_ms,
                     ok: false,
                 }],
@@ -854,7 +855,7 @@ impl Engine {
         let mut ops: Vec<(WriteStatus, WriteTiming)> = vec![(
             users_status,
             WriteTiming {
-                label: "UsersDataLake".to_string(),
+                label: "GaiaDataLake".to_string(),
                 ms: users_ms,
                 ok: true,
             },

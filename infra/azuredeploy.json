@@ -228,6 +228,7 @@
     "acrPullRoleId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')]",
     "openAiUserRoleId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd')]",
     "contributorRoleId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b24988ac-6180-42a0-ab88-20f7382dd24c')]",
+    "cosmosOperatorRoleId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '230815da-be43-4aae-9cb4-875f7bd000aa')]",
     "tierConfig": {
       "free": {
         "cpu": "[json('0.25')]",
@@ -333,6 +334,21 @@
         "roleDefinitionId": "[resourceId('Microsoft.DocumentDB/databaseAccounts/sqlRoleDefinitions', parameters('accountName'), '00000000-0000-0000-0000-000000000002')]",
         "principalId": "[reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2024-03-01', 'Full').identity.principalId]",
         "scope": "[resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('accountName'))]"
+      }
+    },
+    {
+      "type": "Microsoft.DocumentDB/databaseAccounts/providers/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[concat(parameters('accountName'), '/Microsoft.Authorization/', guid(resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('accountName')), parameters('containerAppName'), 'cosmos-operator'))]",
+      "comments": "Grant the Container App's system-assigned managed identity the control-plane 'Cosmos DB Operator' role on the account. Cosmos's data plane rejects container creation for any AAD token (there is no data-plane RBAC action for it), so the app self-creates a missing container (e.g. the derived DataLakeIndex) through ARM, which this role authorizes. Cosmos DB Operator can manage databases/containers but cannot read account keys or data, keeping the grant least-privilege.",
+      "dependsOn": [
+        "[resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('accountName'))]",
+        "[resourceId('Microsoft.App/containerApps', parameters('containerAppName'))]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[variables('cosmosOperatorRoleId')]",
+        "principalId": "[reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2024-03-01', 'Full').identity.principalId]",
+        "principalType": "ServicePrincipal"
       }
     },
     {
@@ -525,6 +541,10 @@
                 {
                   "name": "COSMOS_DATABASE",
                   "value": "[parameters('databaseName')]"
+                },
+                {
+                  "name": "COSMOS_ACCOUNT_RESOURCE_ID",
+                  "value": "[resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('accountName'))]"
                 },
                 {
                   "name": "FOUNDRY_ENDPOINT",
