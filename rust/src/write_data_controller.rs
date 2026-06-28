@@ -321,6 +321,27 @@ impl WriteDataController {
         now_rfc3339: &str,
         chunk: &str,
     ) -> Result<WriteOutcome, WriteError> {
+        // Salience is assigned by the LLM (Call 1 / Call 2). When none is
+        // supplied the record is still saved with its other Coconut fields (the
+        // AAKKK packing line, token count, and timestamps) and an unset salience.
+        self.upsert_daily_salient(container, entity, now_rfc3339, chunk, None)
+    }
+
+    /// Like [`upsert_daily`](WriteDataController::upsert_daily) but stamps the
+    /// LLM-assigned **salience** onto the saved record (Coconut).
+    ///
+    /// Salience is a property of the *memory* and is decided by the model during
+    /// LLM Call 1 / Call 2, not computed here; this method simply persists it
+    /// alongside the always-computed AAKKK packing line, token count, and the
+    /// created/updated timestamps.
+    pub fn upsert_daily_salient(
+        &self,
+        container: &str,
+        entity: &str,
+        now_rfc3339: &str,
+        chunk: &str,
+        salience: Option<f32>,
+    ) -> Result<WriteOutcome, WriteError> {
         if !is_writer_container(container) {
             return Err(WriteError::NotWriterContainer(container.to_string()));
         }
@@ -342,6 +363,12 @@ impl WriteDataController {
         let previous_hash = existing
             .as_ref()
             .and_then(|r| r.metadata.get(CONTENT_HASH_KEY).cloned());
+        // Coconut: preserve the original creation timestamp across appends; only
+        // the first write of a record stamps `created_at`.
+        let previous_created_at = existing
+            .as_ref()
+            .map(|r| r.created_at.clone())
+            .filter(|s| !s.is_empty());
         let created = existing.is_none();
 
         // 2. Append the new chunk to the day's plain-text log.
@@ -364,6 +391,16 @@ impl WriteDataController {
         // 3. Re-embed the whole day's text once (1536-d).
         let full_vector = embedder.embed(&new_data)?;
 
+        // 3b. Coconut save-time fields, computed once here so query time stays
+        // cheap: the dense AAKKK packing line + its token count (measured on the
+        // exact line that will be packed), the LLM-assigned salience, and the
+        // created/updated timestamps. The full day's text remains the record's
+        // `data`; the AAKKK line is the compressed packing form.
+        let (aakkk, token_count) =
+            crate::coconut::build_save_aakkk(entity, &new_data, salience, now_rfc3339);
+        let created_at = previous_created_at.unwrap_or_else(|| now_rfc3339.to_string());
+        let updated_at = now_rfc3339.to_string();
+
         // 4. Write the record back with the refreshed vector + content hash.
         let record = build_record(
             container,
@@ -373,6 +410,13 @@ impl WriteDataController {
             &new_data,
             full_vector.clone(),
             &new_hash,
+            CoconutFields {
+                aakkk: &aakkk,
+                token_count,
+                salience: salience.unwrap_or(0.0),
+                created_at: &created_at,
+                updated_at: &updated_at,
+            },
         );
         cosmos.upsert(container, entity, &record)?;
 
@@ -574,8 +618,30 @@ fn content_hash(data: &str) -> String {
     hex
 }
 
+/// The Coconut save-time fields stamped onto a record by [`build_record`].
+///
+/// Grouped into one struct so [`build_record`] keeps a readable signature rather
+/// than a long list of positional string/number arguments.
+struct CoconutFields<'a> {
+    /// The dense canonical AAKKK packing line.
+    aakkk: &'a str,
+    /// The token count measured on `aakkk` (the exact text packed at query time).
+    token_count: u32,
+    /// The LLM-assigned salience (`0.0` when none was supplied).
+    salience: f32,
+    /// When the record was first created (`YYYY-MM-DDTHH:MM:SSZ`).
+    created_at: &'a str,
+    /// When the record was last written (`YYYY-MM-DDTHH:MM:SSZ`).
+    updated_at: &'a str,
+}
+
 /// Build the [`Record`] to upsert for a daily write, placing the business key in
-/// the `/entity` partition field and stamping the content hash into `metadata`.
+/// the `/entity` partition field, stamping the content hash into `metadata`, and
+/// attaching the Coconut save-time fields.
+// The arguments are all distinct daily-record components (ids, text, vector,
+// hash, Coconut fields); grouping them further would obscure rather than clarify
+// the write, so the lint is allowed here with this justification.
+#[allow(clippy::too_many_arguments)]
 fn build_record(
     container: &str,
     entity: &str,
@@ -584,6 +650,7 @@ fn build_record(
     data: &str,
     data_vector: Vec<f32>,
     content_hash: &str,
+    coconut: CoconutFields<'_>,
 ) -> Record {
     let kind = if container.contains("DataLake") {
         RecordKind::DataLake
@@ -592,7 +659,14 @@ fn build_record(
     };
     // Every writer container partitions on `/entity`, so the business key always
     // lands in the entity field and `user_id` stays empty.
-    let mut record = Record::new(id, entity, "", date, kind, data, data_vector);
+    let mut record = Record::new(id, entity, "", date, kind, data, data_vector)
+        .with_coconut_fields(
+            coconut.aakkk,
+            coconut.token_count,
+            coconut.salience,
+            coconut.created_at,
+            coconut.updated_at,
+        );
     record
         .metadata
         .insert(CONTENT_HASH_KEY.to_string(), content_hash.to_string());
@@ -760,6 +834,14 @@ mod tests {
 
     #[test]
     fn build_record_places_the_key_in_the_entity_partition_field() {
+        // A reusable set of Coconut fields for both build_record calls.
+        let coconut = || CoconutFields {
+            aakkk: "A:entity=threadkeeper",
+            token_count: 2,
+            salience: 0.5,
+            created_at: "2026-06-27T09:00:00Z",
+            updated_at: "2026-06-27T09:00:00Z",
+        };
         let gaia = build_record(
             "GaiaKB",
             "threadkeeper",
@@ -768,9 +850,16 @@ mod tests {
             "body",
             vec![0.1, 0.2],
             "hash123",
+            coconut(),
         );
         assert_eq!(gaia.entity_id, "threadkeeper");
         assert_eq!(gaia.user_id, "");
+        // The Coconut save-time fields are stamped onto the record.
+        assert_eq!(gaia.aakkk, "A:entity=threadkeeper");
+        assert_eq!(gaia.token_count, 2);
+        assert_eq!(gaia.salience, 0.5);
+        assert_eq!(gaia.created_at, "2026-06-27T09:00:00Z");
+        assert_eq!(gaia.updated_at, "2026-06-27T09:00:00Z");
         assert_eq!(
             gaia.metadata.get("contentHash").map(String::as_str),
             Some("hash123")
@@ -786,6 +875,7 @@ mod tests {
             "body",
             vec![0.1, 0.2],
             "hash123",
+            coconut(),
         );
         assert_eq!(lake.entity_id, "threadkeeper");
         assert_eq!(lake.user_id, "");
